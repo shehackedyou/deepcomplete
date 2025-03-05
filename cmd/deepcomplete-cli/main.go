@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/briandowns/spinner"
-	"github.com/shehackedyou/deepcomplete/internal/ollama"
-	"github.com/shehackedyou/deepcomplete/pkg/config"       // Import history package
-	"github.com/shehackedyou/deepcomplete/pkg/promptformat" // Import promptformat package for prompt formatting
+	"github.com/shehackedyou/deepcomplete/config" // Import history package
+	"github.com/shehackedyou/deepcomplete/ollama"
+	"github.com/shehackedyou/deepcomplete/promptformat" // Import promptformat package for prompt formatting
 )
 
 // Define emojis for status messages

@@ -19,7 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shirou/gopsutil/process"
+	"github.com/shirou/gopsutil/host"
+	process "github.com/shirou/gopsutil/process"
 )
 
 // OllamaClient manages the Ollama process, HTTP communication, output scanning, and resource monitoring.
