@@ -119,6 +119,7 @@ type AstContextInfo struct {
 	CallExpr           *ast.CallExpr           // Call expression active at cursor (e.g., myFunc(|))
 	CallExprFuncType   *types.Signature        // Type signature of the function being called
 	CallArgIndex       int                     // Index of the argument the cursor is likely in (0-based)
+	ExpectedArgType    types.Type              // Expected type of the current argument in a call expression
 	VariablesInScope   map[string]types.Object // Map variable name to its type object
 	PromptPreamble     string                  // Formatted context for the LLM prompt
 	AnalysisErrors     []error                 // Non-fatal errors encountered during analysis
@@ -147,6 +148,21 @@ type OllamaResponse struct {
 	Done     bool   `json:"done"`
 	Error    string `json:"error,omitempty"` // Check this field in the stream
 }
+
+// =============================================================================
+// Exported Errors
+// =============================================================================
+
+var (
+	// ErrAnalysisFailed indicates a non-recoverable error during code analysis.
+	ErrAnalysisFailed = errors.New("code analysis failed")
+	// ErrOllamaUnavailable indicates the Ollama API was unreachable or returned a server error.
+	ErrOllamaUnavailable = errors.New("ollama API unavailable or returned server error")
+	// ErrStreamProcessing indicates an error occurred while reading or processing the LLM stream.
+	ErrStreamProcessing = errors.New("error processing LLM stream")
+	// ErrConfig indicates an error loading or writing the configuration file.
+	ErrConfig = errors.New("configuration error")
+)
 
 // =============================================================================
 // Interfaces for Components
@@ -274,7 +290,12 @@ func LoadConfig() (Config, error) {
 		cfg.FimTemplate = fimPromptTemplate
 	}
 
-	return cfg, errors.Join(loadErrors...) // Return loaded/default config and combined non-fatal errors
+	// Return a wrapped error if any loading/writing issues occurred
+	if len(loadErrors) > 0 {
+		return cfg, fmt.Errorf("%w: %w", ErrConfig, errors.Join(loadErrors...))
+	}
+
+	return cfg, nil
 }
 
 // getConfigPaths determines the primary (XDG) and secondary (~/.local/share) config paths.
@@ -454,13 +475,17 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 				bodyString = ollamaErrResp.Error
 			}
 		}
+		// Wrap specific Ollama errors
 		if resp.StatusCode == http.StatusNotFound {
-			return nil, &OllamaError{Message: fmt.Sprintf("Ollama API endpoint not found or model '%s' not available: %s", config.Model, bodyString), Status: resp.StatusCode}
+			err = &OllamaError{Message: fmt.Sprintf("Ollama API endpoint not found or model '%s' not available: %s", config.Model, bodyString), Status: resp.StatusCode}
+			return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
-			return nil, &OllamaError{Message: fmt.Sprintf("Ollama service unavailable or busy: %s", bodyString), Status: resp.StatusCode}
+			err = &OllamaError{Message: fmt.Sprintf("Ollama service unavailable or busy: %s", bodyString), Status: resp.StatusCode}
+			return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err) // Considered unavailable
 		}
-		return nil, &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
+		err = &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
+		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err) // Treat other errors as unavailable too? Or a different category?
 	}
 	return resp.Body, nil
 }
@@ -520,7 +545,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 		if err != nil {
 			addAnalysisError(info, err)
 			analysisErr = errors.Join(info.AnalysisErrors...)
-			return info, analysisErr
+			return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr)
 		} // Cannot proceed
 		if targetFileAST.Name != nil {
 			info.PackageName = targetFileAST.Name.Name
@@ -560,7 +585,11 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 	logAnalysisErrors(info.AnalysisErrors) // Log all collected non-fatal errors
 
 	analysisErr = errors.Join(info.AnalysisErrors...)
-	return info, analysisErr
+	// Return specific error if analysis had issues, even non-fatal ones
+	if analysisErr != nil {
+		return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr)
+	}
+	return info, nil
 }
 
 // performAnalysisSteps encapsulates the core analysis logic after loading/parsing. (unexported helper)
@@ -587,8 +616,7 @@ func (a *GoPackagesAnalyzer) performAnalysisSteps(
 	// --- Find Path & Context Nodes ---
 	path := findEnclosingPath(targetFileAST, info.CursorPos, info) // Pass info to store non-fatal errors
 	if path != nil {
-		// **FIX:** Call findContextNodes correctly (it modifies info directly now)
-		findContextNodes(path, info.CursorPos, targetPkg, info)
+		findContextNodes(path, info.CursorPos, targetPkg, info) // Modifies info, adds non-fatal errors
 	}
 
 	// --- Gather Scope Context ---
@@ -668,11 +696,10 @@ type DeepCompleter struct {
 // It loads configuration from standard locations and applies defaults. Exported.
 func NewDeepCompleter() (*DeepCompleter, error) {
 	cfg, err := LoadConfig() // Load defaults + file config
+	// err from LoadConfig is now non-fatal warnings combined
 	if err != nil {
-		// Log error but potentially continue with defaults
-		log.Printf("Warning: Error loading initial config: %v", err)
-		// In case of error, ensure cfg is still usable (defaults)
-		cfg = DefaultConfig // Use the package-level DefaultConfig var
+		log.Printf("Warning during config load: %v", err)
+		// Continue with potentially default/partially loaded config
 	}
 
 	return &DeepCompleter{
@@ -680,7 +707,7 @@ func NewDeepCompleter() (*DeepCompleter, error) {
 		analyzer:  NewGoPackagesAnalyzer(), // Use exported constructor
 		formatter: newTemplateFormatter(),  // Use unexported constructor
 		config:    cfg,
-	}, nil
+	}, nil // Return nil error even if config loading had warnings
 }
 
 // NewDeepCompleterWithConfig creates a new DeepCompleter service with provided config
@@ -712,6 +739,11 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 
 	reader, err := dc.client.GenerateStream(ctx, prompt, dc.config)
 	if err != nil {
+		// Wrap Ollama specific errors
+		var ollamaErr *OllamaError
+		if errors.As(err, &ollamaErr) {
+			return "", fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
+		}
 		return "", fmt.Errorf("failed to call Ollama API for basic prompt: %w", err)
 	}
 
@@ -720,7 +752,8 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 	defer cancelStream()
 	// Use the package-level streamCompletion helper
 	if streamErr := streamCompletion(streamCtx, reader, &buffer); streamErr != nil {
-		return "", fmt.Errorf("error processing stream for basic prompt: %w", streamErr)
+		// Wrap stream processing errors
+		return "", fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
 	}
 	return buffer.String(), nil
 }
@@ -737,11 +770,13 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filena
 		var analysisInfo *AstContextInfo
 		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, filename, row, col) // Use analyzer component
 		cancelAnalysis()
+		// analysisErr now holds combined non-fatal errors from Analyze
 		if analysisInfo != nil && analysisInfo.PromptPreamble != "" {
 			contextPreamble = analysisInfo.PromptPreamble
 		} else {
 			contextPreamble += "// Warning: AST analysis returned no specific context.\n"
 		}
+		// Log analysis errors regardless of whether preamble was generated
 		if analysisErr != nil {
 			logAnalysisErrors([]error{analysisErr})
 		} // Log non-fatal errors
@@ -765,20 +800,22 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filena
 		defer cancelApi()
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, dc.config) // Use client component
 		if apiErr != nil {
-			if analysisErr != nil {
-				log.Printf("API error (%v) potentially related to prior analysis errors (%v)", apiErr, analysisErr)
+			// Let retry logic handle check for OllamaError, wrap others
+			var ollamaErr *OllamaError
+			if errors.As(apiErr, &ollamaErr) {
+				return apiErr // Return original error for retry check
 			}
-			return apiErr
-		} // Let retry handle check
+			// Wrap non-retryable API errors
+			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, apiErr)
+		}
+
 		PrettyPrint(ColorGreen, "Completion:\n") // Use exported PrettyPrint
 		// Use the package-level streamCompletion helper
 		streamErr := streamCompletion(apiCtx, reader, w)
 		fmt.Fprintln(w) // Final newline
 		if streamErr != nil {
-			if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
-				return streamErr
-			}
-			return fmt.Errorf("error during completion streaming: %w", streamErr)
+			// Wrap stream processing errors
+			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
 		}
 		log.Println("Completion stream finished successfully for this attempt.")
 		return nil
@@ -786,8 +823,13 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filena
 
 	err = retry(ctx, apiCallFunc, maxRetries, retryDelay) // Use retry helper defined below
 	if err != nil {
-		return fmt.Errorf("failed to get completion stream after retries: %w", err)
-	} // Fatal if retries fail
+		// Check if the final error was due to analysis issues propagated
+		if analysisErr != nil && errors.Is(err, ErrOllamaUnavailable) {
+			log.Printf("Warning: Ollama call failed after retries, potentially due to analysis errors: %v", analysisErr)
+			// Return the analysis error instead? Or combined? Let's return the API error for now.
+		}
+		return fmt.Errorf("failed to get completion stream after retries: %w", err) // Fatal if retries fail
+	}
 
 	// Log analysis errors again as a final warning, even if completion succeeded
 	if analysisErr != nil {
@@ -874,6 +916,9 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 		}
 		var ollamaErr *OllamaError
 		isRetryable := errors.As(err, &ollamaErr) && (ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests)
+		// Also check if the error wraps ErrOllamaUnavailable explicitly
+		isRetryable = isRetryable || errors.Is(err, ErrOllamaUnavailable)
+
 		if !isRetryable {
 			log.Printf("Non-retryable error encountered: %v", err)
 			return err
@@ -1042,9 +1087,23 @@ func buildPreamble(info *AstContextInfo, targetPkg *packages.Package) string {
 	var preamble strings.Builder
 	qualifier := types.RelativeTo(targetPkg.Types)
 	preamble.WriteString(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), info.PackageName))
+	formatImportsSection(&preamble, info)
+	formatEnclosingFuncSection(&preamble, info, qualifier)
+	formatCommentsSection(&preamble, info)
+	formatCursorContextSection(&preamble, info, targetPkg, qualifier)
+	formatScopeSection(&preamble, info, qualifier)
+	return preamble.String()
+}
+
+// formatImportsSection adds import info to the preamble.
+func formatImportsSection(preamble *strings.Builder, info *AstContextInfo) {
 	if len(info.Imports) > 0 {
 		preamble.WriteString("// Imports:\n")
 		for _, imp := range info.Imports {
+			// Defensive checks for nil
+			if imp == nil {
+				continue
+			}
 			path := ""
 			if imp.Path != nil {
 				path = imp.Path.Value
@@ -1056,11 +1115,19 @@ func buildPreamble(info *AstContextInfo, targetPkg *packages.Package) string {
 			preamble.WriteString(fmt.Sprintf("//   import %s%s\n", name, path))
 		}
 	}
+}
+
+// formatEnclosingFuncSection adds enclosing function info to the preamble.
+func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier) {
 	if info.EnclosingFunc != nil {
 		preamble.WriteString(fmt.Sprintf("// Enclosing Function: %s\n", types.ObjectString(info.EnclosingFunc, qualifier)))
 	} else if info.EnclosingFuncNode != nil {
 		preamble.WriteString(fmt.Sprintf("// Enclosing Function (AST): %s\n", formatFuncSignature(info.EnclosingFuncNode)))
 	}
+}
+
+// formatCommentsSection adds relevant comments to the preamble.
+func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo) {
 	if len(info.CommentsNearCursor) > 0 {
 		preamble.WriteString("// Relevant Comments:\n")
 		for _, c := range info.CommentsNearCursor {
@@ -1070,19 +1137,56 @@ func buildPreamble(info *AstContextInfo, targetPkg *packages.Package) string {
 			preamble.WriteString(fmt.Sprintf("//   %s\n", cleanComment))
 		}
 	}
+}
+
+// formatCursorContextSection adds info about the node at the cursor to the preamble.
+func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo, targetPkg *packages.Package, qualifier types.Qualifier) {
 	if info.CallExpr != nil {
 		funcName := "[unknown function]"
+		// Attempt to get func name more reliably
 		switch fun := info.CallExpr.Fun.(type) {
 		case *ast.Ident:
 			funcName = fun.Name
 		case *ast.SelectorExpr:
-			if fun.Sel != nil {
-				funcName = fun.Sel.Name
+			// Handle package selector vs method call if possible
+			if xident, ok := fun.X.(*ast.Ident); ok {
+				// Check if X is a package name via TypesInfo.Uses
+				if obj, ok := targetPkg.TypesInfo.Uses[xident]; ok && types.IsInterface(obj.Type()) { // Heuristic: might be interface call
+					funcName = fmt.Sprintf("%s.%s", xident.Name, fun.Sel.Name)
+				} else if _, ok := obj.(*types.PkgName); ok {
+					funcName = fmt.Sprintf("%s.%s", xident.Name, fun.Sel.Name) // Package function/var
+				} else {
+					funcName = fmt.Sprintf("[expr].%s", fun.Sel.Name) // Method call
+				}
+			} else {
+				if fun.Sel != nil {
+					funcName = fmt.Sprintf("[expr].%s", fun.Sel.Name)
+				}
 			}
 		}
 		preamble.WriteString(fmt.Sprintf("// Inside function call: %s (Arg %d)\n", funcName, info.CallArgIndex+1))
 		if info.CallExprFuncType != nil {
 			preamble.WriteString(fmt.Sprintf("// Function Signature: %s\n", types.TypeString(info.CallExprFuncType, qualifier)))
+			// Add expected argument type
+			params := info.CallExprFuncType.Params()
+			if params != nil {
+				idx := info.CallArgIndex
+				var expectedType types.Type
+				if info.CallExprFuncType.Variadic() && idx >= params.Len()-1 {
+					// Handle variadic argument
+					lastParam := params.At(params.Len() - 1)
+					if slice, ok := lastParam.Type().(*types.Slice); ok {
+						expectedType = slice.Elem()
+					}
+				} else if idx < params.Len() {
+					// Handle regular argument
+					expectedType = params.At(idx).Type()
+				}
+
+				if expectedType != nil {
+					preamble.WriteString(fmt.Sprintf("// Expected Arg Type: %s\n", types.TypeString(expectedType, qualifier)))
+				}
+			}
 		} else {
 			preamble.WriteString("// Function Signature: (unknown)\n")
 		}
@@ -1112,6 +1216,10 @@ func buildPreamble(info *AstContextInfo, targetPkg *packages.Package) string {
 			preamble.WriteString(fmt.Sprintf("// Identifier at cursor: %s (Type unknown)\n", identName))
 		}
 	}
+}
+
+// formatScopeSection adds variables in scope to the preamble.
+func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier) {
 	if len(info.VariablesInScope) > 0 {
 		preamble.WriteString("// Variables/Constants/Types in Scope:\n")
 		var names []string
@@ -1124,7 +1232,6 @@ func buildPreamble(info *AstContextInfo, targetPkg *packages.Package) string {
 			preamble.WriteString(fmt.Sprintf("//   %s\n", types.ObjectString(obj, qualifier)))
 		}
 	}
-	return preamble.String()
 }
 
 // calculateCursorPos converts 1-based line/col to token.Pos (internal).
@@ -1132,6 +1239,9 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	if line <= 0 {
 		return token.NoPos, fmt.Errorf("invalid line number: %d (must be >= 1)", line)
 	}
+	if file == nil {
+		return token.NoPos, errors.New("invalid token.File (nil)")
+	} // Defensive check
 	if line > file.LineCount() {
 		return token.NoPos, fmt.Errorf("line number %d exceeds file line count %d", line, file.LineCount())
 	}
@@ -1193,6 +1303,9 @@ func addScopeVariables(typeScope *types.Scope, cursorPos token.Pos, scopeMap map
 	}
 	for _, name := range typeScope.Names() {
 		obj := typeScope.Lookup(name)
+		// Include if cursor position is invalid (e.g., package scope using token.NoPos)
+		// OR object defined before cursor
+		// OR object has no position (like builtins)
 		include := !cursorPos.IsValid() || !obj.Pos().IsValid() || obj.Pos() < cursorPos
 		if obj != nil && include {
 			switch obj.(type) {
@@ -1327,7 +1440,7 @@ cleanup:
 
 // findContextNodes tries to find the identifier, selector expression, or call expression
 // at/before the cursor and resolve its type information, updating the AstContextInfo struct directly.
-// **FIX:** Reverted signature to modify info directly.
+// Returns a struct containing the found nodes/types.
 func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Package, info *AstContextInfo) {
 	if len(path) == 0 {
 		log.Println("Cannot find context nodes: Missing AST path.")
@@ -1339,14 +1452,25 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 	// Check CallExpr
 	if callExpr, ok := innermostNode.(*ast.CallExpr); ok && cursorPos > callExpr.Lparen && cursorPos <= callExpr.Rparen {
 		info.CallExpr = callExpr
-		info.CallArgIndex = 0
+		info.CallArgIndex = -1 // Initialize to -1
+		// Determine argument index based on cursor position relative to commas and args
+		currentArgStart := callExpr.Lparen + 1 // Position after opening paren
 		for i, arg := range callExpr.Args {
-			if cursorPos > arg.End() {
-				info.CallArgIndex = i + 1
-			} else {
+			if cursorPos >= currentArgStart && cursorPos <= arg.End() {
+				info.CallArgIndex = i
 				break
 			}
+			// If cursor is after this arg (and potential comma), check next
+			currentArgStart = arg.End() + 1 // Position after this arg (assume comma exists)
+			// TODO: More precise comma handling?
+			if i == len(callExpr.Args)-1 && cursorPos > arg.End() { // Cursor after last arg
+				info.CallArgIndex = i + 1
+			}
 		}
+		if info.CallArgIndex == -1 && len(callExpr.Args) == 0 && cursorPos > callExpr.Lparen && cursorPos <= callExpr.Rparen {
+			info.CallArgIndex = 0 // Inside empty arg list
+		}
+
 		log.Printf("Cursor likely at argument index %d", info.CallArgIndex)
 		if hasTypeInfo {
 			if pkg.TypesInfo.Types == nil {
@@ -1472,16 +1596,16 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 
 	// Handle Basic types (just return the type name)
 	if basic, ok := underlying.(*types.Basic); ok {
-		return []string{basic.String()}
-	}
+		return []string{fmt.Sprintf("(type: %s)", basic.String())}
+	} // More explicit
 	if _, ok := underlying.(*types.Map); ok {
-		return []string{"// map type"}
-	}
+		return []string{"// map operations: make, len, delete, range"}
+	} // Suggest ops
 	if _, ok := underlying.(*types.Slice); ok {
-		return []string{"// slice type"}
+		return []string{"// slice operations: make, len, cap, append, copy, range"}
 	}
 	if _, ok := underlying.(*types.Chan); ok {
-		return []string{"// channel type"}
+		return []string{"// channel operations: make, len, cap, close, send (<-), receive (<-)"}
 	}
 
 	if st, ok := underlying.(*types.Struct); ok {
@@ -1537,7 +1661,17 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 						methodObj := sel.Obj()
 						if method, ok := methodObj.(*types.Func); ok {
 							if method != nil && method.Exported() {
-								members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier))) // Indicate method
+								// Check if already added by non-pointer receiver method set
+								found := false
+								for _, existing := range members {
+									if strings.HasSuffix(existing, method.Name()+"(...)") || strings.Contains(existing, method.Name()+" func(") { // Basic check
+										found = true
+										break
+									}
+								}
+								if !found {
+									members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier))) // Indicate method
+								}
 							}
 						} else if methodObj != nil {
 							log.Printf("Warning: Object in base method set is not *types.Func: %T", methodObj)
@@ -1626,6 +1760,11 @@ func (s *Spinner) Start(initialMessage string) {
 			s.mu.Lock()
 			s.running = false
 			s.mu.Unlock()
+			// Use non-blocking send in case Stop() already returned due to timeout
+			select {
+			case s.doneChan <- struct{}{}:
+			default:
+			}
 			close(s.doneChan) // Signal that the goroutine has finished cleanup
 		}()
 
@@ -1683,7 +1822,7 @@ func (s *Spinner) Stop() {
 		select {
 		case <-doneChan:
 			// Goroutine finished cleanup
-		case <-time.After(250 * time.Millisecond): // Increased timeout slightly
+		case <-time.After(300 * time.Millisecond): // Slightly longer timeout for safety
 			log.Println("Warning: Timeout waiting for spinner goroutine cleanup")
 		}
 	}
