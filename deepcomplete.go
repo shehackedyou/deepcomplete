@@ -356,8 +356,6 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 	}
 
 	// Marshal the *actual* Config struct (not FileConfig) for defaults
-	// Need to make fields exportable for MarshalIndent to work correctly
-	// Let's marshal a temporary struct with exported fields matching JSON tags
 	type ExportableConfig struct {
 		OllamaURL   string   `json:"ollama_url"`
 		Model       string   `json:"model"`
@@ -589,7 +587,8 @@ func (a *GoPackagesAnalyzer) performAnalysisSteps(
 	// --- Find Path & Context Nodes ---
 	path := findEnclosingPath(targetFileAST, info.CursorPos, info) // Pass info to store non-fatal errors
 	if path != nil {
-		findContextNodes(path, info.CursorPos, targetPkg, info) // Modifies info, adds non-fatal errors
+		// **FIX:** Call findContextNodes correctly (it modifies info directly now)
+		findContextNodes(path, info.CursorPos, targetPkg, info)
 	}
 
 	// --- Gather Scope Context ---
@@ -1328,6 +1327,7 @@ cleanup:
 
 // findContextNodes tries to find the identifier, selector expression, or call expression
 // at/before the cursor and resolve its type information, updating the AstContextInfo struct directly.
+// **FIX:** Reverted signature to modify info directly.
 func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Package, info *AstContextInfo) {
 	if len(path) == 0 {
 		log.Println("Cannot find context nodes: Missing AST path.")
@@ -1488,15 +1488,15 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 		for i := 0; i < st.NumFields(); i++ {
 			field := st.Field(i)
 			if field != nil && field.Exported() {
-				members = append(members, types.ObjectString(field, qualifier))
+				members = append(members, fmt.Sprintf("field %s", types.ObjectString(field, qualifier)))
 			}
 		}
-	}
+	} // Indicate field
 	if iface, ok := underlying.(*types.Interface); ok {
 		for i := 0; i < iface.NumExplicitMethods(); i++ {
 			method := iface.ExplicitMethod(i)
 			if method != nil && method.Exported() {
-				members = append(members, types.ObjectString(method, qualifier))
+				members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier)))
 			}
 		}
 		for i := 0; i < iface.NumEmbeddeds(); i++ {
@@ -1516,7 +1516,7 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 			// Defensive check for method object type
 			if method, ok := methodObj.(*types.Func); ok {
 				if method != nil && method.Exported() {
-					members = append(members, types.ObjectString(method, qualifier))
+					members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier))) // Indicate method
 				}
 			} else if methodObj != nil { // Log if it's not nil but also not a *types.Func
 				log.Printf("Warning: Object in method set is not *types.Func: %T", methodObj)
@@ -1537,7 +1537,7 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 						methodObj := sel.Obj()
 						if method, ok := methodObj.(*types.Func); ok {
 							if method != nil && method.Exported() {
-								members = append(members, types.ObjectString(method, qualifier))
+								members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier))) // Indicate method
 							}
 						} else if methodObj != nil {
 							log.Printf("Warning: Object in base method set is not *types.Func: %T", methodObj)
