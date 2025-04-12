@@ -10,8 +10,8 @@ import (
 	"os"
 	"strings"
 
-	// Use the CORRECT module path provided by the user
-	"github.com/shehackedyou/deepcomplete"
+	// Use your actual module path here
+	"github.com/shehackedyou/deepcomplete" // Corrected import path
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 	row := flag.Int("row", 0, "Cursor row number in the file (1-based). Required with --file.")
 	col := flag.Int("col", 0, "Cursor column number in the file (1-based, byte offset). Required with --file.")
 	filename := flag.String("file", "", "Path to the Go file for context-aware completion.")
-	prompt := flag.String("prompt", "", "A simple code prompt for basic completion (overrides --file).")
+	// prompt flag removed - using non-flag args instead
 	useAst := flag.Bool("ast", deepcomplete.DefaultConfig.UseAst, "Enable Abstract Syntax Tree (AST) and type analysis for richer context.")
 	// lexer flag removed
 	maxTokens := flag.Int("max-tokens", deepcomplete.DefaultConfig.MaxTokens, "Maximum number of tokens for the completion response.")
@@ -67,6 +67,13 @@ func main() {
 		log.Println("AST analysis disabled via flag.")
 	}
 
+	// --- Determine Input Mode (File vs Prompt Args) ---
+	var promptArgs string
+	if *filename == "" && flag.NArg() > 0 {
+		promptArgs = strings.Join(flag.Args(), " ")
+		log.Printf("Using non-flag arguments as prompt: %q", promptArgs)
+	}
+
 	// Create a background context. Consider adding timeout later.
 	ctx := context.Background()
 
@@ -82,12 +89,9 @@ func main() {
 		// Use exported colors for error message
 		log.Fatalf("%sError: Both --row and --col must be positive integers when --file is provided.%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
 	}
-	if *filename == "" && *prompt == "" {
-		log.Fatalf("%sError: Either --prompt or --file (with --row and --col) must be provided.%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
-	}
-	if *filename != "" && *prompt != "" {
-		log.Printf("%sWarning: Both --prompt and --file provided. Using --file.%s", deepcomplete.ColorYellow, deepcomplete.ColorReset)
-		*prompt = "" // Prioritize file input
+	// Check if we have either file input or prompt input (from args)
+	if *filename == "" && promptArgs == "" {
+		log.Fatalf("%sError: Either provide a prompt as arguments or use --file (with --row and --col).%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
 	}
 	// Check if file exists if provided
 	if *filename != "" {
@@ -102,10 +106,10 @@ func main() {
 	var err error
 
 	switch {
-	case *prompt != "": // Direct prompt input (uses basic context)
+	case promptArgs != "": // Direct prompt input from args
 		spinner.Start("Waiting for Ollama...") // Updated spinner message
 		var completion string
-		completion, err = deepcomplete.GetCompletion(ctx, *prompt, config) // Use simplified basic completion
+		completion, err = deepcomplete.GetCompletion(ctx, promptArgs, config) // Use simplified basic completion
 		spinner.Stop()
 		if err != nil {
 			// Use exported colors
@@ -138,6 +142,6 @@ func main() {
 
 	default:
 		// This case should be unreachable due to validation above, but keep as safeguard
-		log.Fatalf("%sInternal Error: Invalid flag combination.%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
+		log.Fatalf("%sInternal Error: Invalid input combination.%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
 	}
 }

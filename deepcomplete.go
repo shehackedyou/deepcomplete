@@ -40,7 +40,7 @@ const (
 	// Updated prompt template to better guide the LLM with context
 	promptTemplate = `<s>[INST] <<SYS>>
 You are an AI coding assistant specializing in Go.
-Complete the Go code based on the provided context (enclosing function, variables in scope, relevant comments, identifier/call under cursor).
+Complete the Go code based on the provided context (enclosing function, variables in scope, relevant comments, identifier/call/selector under cursor).
 Adhere strictly to Go syntax and common practices.
 Output ONLY the code completion, without any introductory text, comments, or explanations.
 Match the indentation of the surrounding code.
@@ -103,6 +103,7 @@ type AstContextInfo struct {
 	SelectorExprType   types.Type              // Type of the expression being selected from (e.g., type of x in x.y|)
 	CallExpr           *ast.CallExpr           // Call expression active at cursor (e.g., myFunc(|))
 	CallExprFuncType   *types.Signature        // Type signature of the function being called
+	CallArgIndex       int                     // Index of the argument the cursor is likely in (0-based)
 	VariablesInScope   map[string]types.Object // Map variable name to its type object
 	PromptPreamble     string                  // Formatted context for the LLM prompt
 	AnalysisErrors     []error                 // Non-fatal errors encountered during analysis
@@ -388,6 +389,7 @@ func AnalyzeCodeContext(ctx context.Context, filename string, line, col int) (in
 		FilePath:         filename, // Store original path initially
 		VariablesInScope: make(map[string]types.Object),
 		AnalysisErrors:   make([]error, 0), // Store non-fatal errors here
+		CallArgIndex:     -1,               // Default to -1 (not in call args)
 	}
 
 	// Add panic recovery
@@ -716,7 +718,7 @@ func AnalyzeCodeContext(ctx context.Context, filename string, line, col int) (in
 				funcName = fun.Sel.Name
 			}
 		}
-		preamble.WriteString(fmt.Sprintf("// Inside function call: %s(...)\n", funcName))
+		preamble.WriteString(fmt.Sprintf("// Inside function call: %s (Arg %d)\n", funcName, info.CallArgIndex+1)) // Show 1-based arg index
 		if info.CallExprFuncType != nil {
 			preamble.WriteString(fmt.Sprintf("// Function Signature: %s\n", types.TypeString(info.CallExprFuncType, qualifier)))
 		} else {
@@ -730,7 +732,16 @@ func AnalyzeCodeContext(ctx context.Context, filename string, line, col int) (in
 		}
 		typeName := types.TypeString(info.SelectorExprType, qualifier)
 		preamble.WriteString(fmt.Sprintf("// Selector context: expr type = %s (selecting '%s')\n", typeName, selName))
-		// TODO: List fields/methods of SelectorExprType if it's a struct/interface/package
+		// List fields/methods if available
+		members := listTypeMembers(info.SelectorExprType, targetPkg)
+		if len(members) > 0 {
+			preamble.WriteString("//   Available members:\n")
+			sort.Strings(members) // Sort for consistency
+			for _, member := range members {
+				preamble.WriteString(fmt.Sprintf("//     - %s\n", member))
+			}
+		}
+
 	} else if info.IdentifierAtCursor != nil {
 		// Simple identifier context
 		identName := info.IdentifierAtCursor.Name
@@ -1053,6 +1064,17 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 		if cursorPos > callExpr.Lparen && cursorPos <= callExpr.Rparen {
 			log.Printf("Cursor is inside CallExpr at pos %d", callExpr.Pos())
 			info.CallExpr = callExpr
+			// Determine argument index
+			info.CallArgIndex = 0 // Default to first arg
+			for i, arg := range callExpr.Args {
+				if cursorPos > arg.End() { // If cursor is after this arg, it's potentially the next one
+					info.CallArgIndex = i + 1
+				} else {
+					break // Cursor is before or within this arg
+				}
+			}
+			log.Printf("Cursor likely at argument index %d", info.CallArgIndex)
+
 			// Try to resolve the type of the function being called
 			if hasTypeInfo {
 				// Defensive check for Types map
@@ -1207,6 +1229,67 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 
 	info.IdentifierObject = obj
 	info.IdentifierType = typ
+}
+
+// listTypeMembers attempts to list fields and methods for a given type.
+func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
+	if typ == nil {
+		return nil
+	}
+
+	var members []string
+	qualifier := types.RelativeTo(pkg.Types) // For formatting types
+
+	// Dereference pointer types to get the underlying struct/interface
+	if ptr, ok := typ.Underlying().(*types.Pointer); ok {
+		typ = ptr.Elem()
+	}
+
+	// Handle named types (most common case for structs/interfaces with methods)
+	if named, ok := typ.(*types.Named); ok {
+		// List methods
+		for i := 0; i < named.NumMethods(); i++ {
+			method := named.Method(i)
+			if method.Exported() { // Only list exported members
+				members = append(members, types.ObjectString(method, qualifier))
+			}
+		}
+		// If it's a named struct, list fields
+		if underlyingStruct, ok := named.Underlying().(*types.Struct); ok {
+			for i := 0; i < underlyingStruct.NumFields(); i++ {
+				field := underlyingStruct.Field(i)
+				if field.Exported() { // Only list exported members
+					members = append(members, types.ObjectString(field, qualifier))
+				}
+			}
+		}
+		// TODO: Handle named interfaces similarly?
+	} else if iface, ok := typ.Underlying().(*types.Interface); ok {
+		// List methods for interface type
+		for i := 0; i < iface.NumExplicitMethods(); i++ {
+			method := iface.ExplicitMethod(i)
+			if method.Exported() {
+				members = append(members, types.ObjectString(method, qualifier))
+			}
+		}
+		// Also consider embedded interfaces
+		for i := 0; i < iface.NumEmbeddeds(); i++ {
+			embeddedType := iface.EmbeddedType(i)
+			// Recursively list members of embedded type? Careful about cycles.
+			// For simplicity, just indicate embedding for now.
+			members = append(members, fmt.Sprintf("// embeds %s", types.TypeString(embeddedType, qualifier)))
+		}
+	} else if st, ok := typ.Underlying().(*types.Struct); ok {
+		// Handle anonymous structs directly
+		for i := 0; i < st.NumFields(); i++ {
+			field := st.Field(i)
+			if field.Exported() { // Check if field is exported (relevant for embedded structs)
+				members = append(members, types.ObjectString(field, qualifier))
+			}
+		}
+	}
+
+	return members
 }
 
 // logAnalysisErrors logs any non-fatal errors found during context analysis (internal).
