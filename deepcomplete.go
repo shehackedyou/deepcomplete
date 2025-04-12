@@ -132,7 +132,6 @@ type SnippetContext struct {
 }
 
 // OllamaError defines a custom error for Ollama API issues (internal but used by retry).
-// Needs to be defined *before* retry or accessible within the package.
 type OllamaError struct {
 	Message string
 	Status  int // HTTP status code
@@ -174,7 +173,6 @@ type PromptFormatter interface {
 
 var (
 	// DefaultConfig enables AST context by default. Exported.
-	// Needs to be defined before LoadConfig uses it.
 	DefaultConfig = Config{
 		OllamaURL:      defaultOllamaURL,
 		Model:          defaultModel,
@@ -201,7 +199,6 @@ var (
 // =============================================================================
 
 // PrettyPrint prints colored text to the terminal. Exported for CLI use.
-// **FIX:** Ensure this is defined and exported.
 func PrettyPrint(color, text string) {
 	fmt.Print(color, text, ColorReset)
 }
@@ -210,64 +207,56 @@ func PrettyPrint(color, text string) {
 // Configuration Loading
 // =============================================================================
 
-// LoadConfig loads configuration from standard locations and merges with defaults.
-// Returns the loaded config and any error encountered during loading/parsing.
-// Precedence: Defaults < File Config
+// LoadConfig loads configuration from standard locations, merges with defaults,
+// and attempts to write a default config file if none exists.
+// Returns the loaded config and any non-fatal errors encountered during loading/parsing/writing.
 func LoadConfig() (Config, error) {
 	cfg := DefaultConfig // Start with defaults
 	var loadedFromFile bool
 	var loadErrors []error
 
-	// --- Check User Config Directory ---
-	configPath1 := ""
-	userConfigDir, err := os.UserConfigDir()
-	if err == nil {
-		configPath1 = filepath.Join(userConfigDir, configDirName, defaultConfigFileName)
-		loaded, loadErr := loadAndMergeConfig(configPath1, &cfg)
+	// Determine primary and secondary config paths
+	primaryPath, secondaryPath, pathErr := getConfigPaths()
+	if pathErr != nil {
+		loadErrors = append(loadErrors, pathErr)
+		log.Printf("Warning: Could not determine config paths: %v", pathErr)
+	}
+
+	// Try loading from primary path (e.g., XDG_CONFIG_HOME)
+	if primaryPath != "" {
+		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg)
 		if loadErr != nil {
-			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", configPath1, loadErr))
+			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", primaryPath, loadErr))
 		}
 		loadedFromFile = loaded
 		if loaded {
-			log.Printf("Loaded config from %s", configPath1)
-		}
-	} else {
-		log.Printf("Warning: Could not determine user config directory: %v", err)
-		loadErrors = append(loadErrors, fmt.Errorf("cannot find config dir: %w", err))
-	}
-
-	// --- Check User Data Directory (Alternative Location) ---
-	configPath2 := ""
-	if !loadedFromFile {
-		homeDir, err := os.UserHomeDir()
-		if err == nil {
-			configPath2 = filepath.Join(homeDir, ".local", "share", configDirName, defaultConfigFileName)
-			loaded, loadErr := loadAndMergeConfig(configPath2, &cfg)
-			if loadErr != nil {
-				loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", configPath2, loadErr))
-			}
-			loadedFromFile = loaded
-			if loaded {
-				log.Printf("Loaded config from %s", configPath2)
-			}
-		} else {
-			log.Printf("Warning: Could not determine user home directory: %v", err)
-			loadErrors = append(loadErrors, fmt.Errorf("cannot find home dir: %w", err))
+			log.Printf("Loaded config from %s", primaryPath)
 		}
 	}
 
-	// If no config file was found anywhere, try to write the default one
-	if !loadedFromFile {
-		log.Println("No config file found in standard locations.")
-		primaryConfigPath := configPath1 // Prefer XDG path
-		if primaryConfigPath == "" {
-			primaryConfigPath = configPath2
-		} // Fallback if XDG failed
+	// Try loading from secondary path if not loaded from primary
+	if !loadedFromFile && secondaryPath != "" {
+		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg)
+		if loadErr != nil {
+			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", secondaryPath, loadErr))
+		}
+		loadedFromFile = loaded
+		if loaded {
+			log.Printf("Loaded config from %s", secondaryPath)
+		}
+	}
 
-		if primaryConfigPath != "" {
-			log.Printf("Attempting to write default config to %s", primaryConfigPath)
-			// Use DefaultConfig here, as cfg might be partially modified if one file failed
-			if err := writeDefaultConfig(primaryConfigPath, DefaultConfig); err != nil {
+	// If no config file was found/loaded successfully, try to write the default one
+	if !loadedFromFile {
+		log.Println("No valid config file found in standard locations.")
+		writePath := primaryPath // Prefer primary path for writing
+		if writePath == "" {
+			writePath = secondaryPath
+		} // Fallback if primary failed
+
+		if writePath != "" {
+			log.Printf("Attempting to write default config to %s", writePath)
+			if err := writeDefaultConfig(writePath, DefaultConfig); err != nil {
 				log.Printf("Warning: Failed to write default config: %v", err)
 				loadErrors = append(loadErrors, fmt.Errorf("writing default config failed: %w", err))
 			}
@@ -288,6 +277,32 @@ func LoadConfig() (Config, error) {
 	return cfg, errors.Join(loadErrors...) // Return loaded/default config and combined non-fatal errors
 }
 
+// getConfigPaths determines the primary (XDG) and secondary (~/.local/share) config paths.
+func getConfigPaths() (primary string, secondary string, err error) {
+	var cfgErr, homeErr error
+
+	userConfigDir, cfgErr := os.UserConfigDir()
+	if cfgErr == nil {
+		primary = filepath.Join(userConfigDir, configDirName, defaultConfigFileName)
+	} else {
+		log.Printf("Warning: Could not determine user config directory: %v", cfgErr)
+	}
+
+	homeDir, homeErr := os.UserHomeDir()
+	if homeErr == nil {
+		secondary = filepath.Join(homeDir, ".local", "share", configDirName, defaultConfigFileName)
+	} else {
+		log.Printf("Warning: Could not determine user home directory: %v", homeErr)
+	}
+
+	// Return combined error if both failed
+	if cfgErr != nil && homeErr != nil {
+		err = fmt.Errorf("cannot determine config/home directories: %w; %w", cfgErr, homeErr)
+	}
+
+	return primary, secondary, err
+}
+
 // loadAndMergeConfig attempts to load config from a path and merge it into cfg.
 func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
 	data, err := os.ReadFile(path)
@@ -295,12 +310,16 @@ func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
-		return true, fmt.Errorf("reading config file failed: %w", err)
+		return true, fmt.Errorf("reading config file failed: %w", err) // File exists but read failed
+	}
+	if len(data) == 0 { // Handle empty file case
+		log.Printf("Warning: Config file exists but is empty: %s", path)
+		return true, nil // Treat as loaded but with no overrides
 	}
 
 	var fileCfg FileConfig
 	if err := json.Unmarshal(data, &fileCfg); err != nil {
-		return true, fmt.Errorf("parsing config file JSON failed: %w", err)
+		return true, fmt.Errorf("parsing config file JSON failed: %w", err) // Invalid JSON
 	}
 
 	// Merge non-nil values from fileCfg into cfg
@@ -337,7 +356,28 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 	}
 
 	// Marshal the *actual* Config struct (not FileConfig) for defaults
-	jsonData, err := json.MarshalIndent(defaultConfig, "", "  ")
+	// Need to make fields exportable for MarshalIndent to work correctly
+	// Let's marshal a temporary struct with exported fields matching JSON tags
+	type ExportableConfig struct {
+		OllamaURL   string   `json:"ollama_url"`
+		Model       string   `json:"model"`
+		MaxTokens   int      `json:"max_tokens"`
+		Stop        []string `json:"stop"`
+		Temperature float64  `json:"temperature"`
+		UseAst      bool     `json:"use_ast"`
+		UseFim      bool     `json:"use_fim"`
+	}
+	expCfg := ExportableConfig{
+		OllamaURL:   defaultConfig.OllamaURL,
+		Model:       defaultConfig.Model,
+		MaxTokens:   defaultConfig.MaxTokens,
+		Stop:        defaultConfig.Stop,
+		Temperature: defaultConfig.Temperature,
+		UseAst:      defaultConfig.UseAst,
+		UseFim:      defaultConfig.UseFim,
+	}
+
+	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal default config to JSON: %w", err)
 	}
