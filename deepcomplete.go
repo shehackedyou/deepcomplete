@@ -9,6 +9,7 @@ import (
 	"errors" // Using errors.Join requires Go 1.20+
 	"fmt"
 	"go/ast"
+	"go/format" // For formatting receiver in preamble
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -38,7 +39,7 @@ const (
 	// Standard prompt template - Refined system message
 	promptTemplate = `<s>[INST] <<SYS>>
 You are an expert Go programming assistant.
-Analyze the provided context (enclosing function, imports, scope variables, comments, code structure) and the preceding code snippet.
+Analyze the provided context (enclosing function/method, imports, scope variables, comments, code structure) and the preceding code snippet.
 Complete the Go code accurately and concisely.
 Output ONLY the raw Go code completion, without any markdown, explanations, or introductory text.
 <</SYS>>
@@ -89,8 +90,31 @@ type Config struct {
 	UseFim         bool     `json:"use_fim"` // Use Fill-in-the-Middle prompting
 }
 
+// Validate checks if the configuration values are valid.
+func (c *Config) Validate() error {
+	if strings.TrimSpace(c.OllamaURL) == "" {
+		return errors.New("ollama_url cannot be empty")
+	}
+	if _, err := url.ParseRequestURI(c.OllamaURL); err != nil {
+		return fmt.Errorf("invalid ollama_url: %w", err)
+	}
+	if strings.TrimSpace(c.Model) == "" {
+		return errors.New("model cannot be empty")
+	}
+	if c.MaxTokens <= 0 {
+		log.Printf("Warning: max_tokens (%d) is not positive, using default %d",
+			c.MaxTokens, defaultMaxTokens)
+		c.MaxTokens = defaultMaxTokens
+	}
+	if c.Temperature < 0 {
+		log.Printf("Warning: temperature (%.2f) is negative, using default %.2f",
+			c.Temperature, defaultTemperature)
+		c.Temperature = defaultTemperature
+	}
+	return nil
+}
+
 // FileConfig represents the structure of the JSON config file.
-// Uses pointers to distinguish between zero values and unset fields during merge.
 type FileConfig struct {
 	OllamaURL   *string   `json:"ollama_url"`
 	Model       *string   `json:"model"`
@@ -106,23 +130,26 @@ type AstContextInfo struct {
 	FilePath           string
 	CursorPos          token.Pos
 	PackageName        string
-	EnclosingFunc      *types.Func             // Function or method containing the cursor
-	EnclosingFuncNode  *ast.FuncDecl           // AST node for the function
-	EnclosingBlock     *ast.BlockStmt          // Innermost block statement
-	Imports            []*ast.ImportSpec       // Populated with file imports
-	CommentsNearCursor []string                // Comments found near the cursor
-	IdentifierAtCursor *ast.Ident              // Identifier immediately before/at cursor
-	IdentifierType     types.Type              // Type of the identifier at cursor (if resolved)
-	IdentifierObject   types.Object            // Object the identifier resolves to
-	SelectorExpr       *ast.SelectorExpr       // Selector expression active at cursor (e.g., x.y|)
-	SelectorExprType   types.Type              // Type of the expression being selected from (e.g., type of x in x.y|)
-	CallExpr           *ast.CallExpr           // Call expression active at cursor (e.g., myFunc(|))
-	CallExprFuncType   *types.Signature        // Type signature of the function being called
-	CallArgIndex       int                     // Index of the argument the cursor is likely in (0-based)
-	ExpectedArgType    types.Type              // Expected type of the current argument in a call expression
-	VariablesInScope   map[string]types.Object // Map variable name to its type object
-	PromptPreamble     string                  // Formatted context for the LLM prompt
-	AnalysisErrors     []error                 // Non-fatal errors encountered during analysis
+	EnclosingFunc      *types.Func   // Function or method type object
+	EnclosingFuncNode  *ast.FuncDecl // Function or method AST node
+	ReceiverType       string        // Formatted receiver type if it's a method
+	EnclosingBlock     *ast.BlockStmt
+	Imports            []*ast.ImportSpec
+	CommentsNearCursor []string
+	IdentifierAtCursor *ast.Ident
+	IdentifierType     types.Type
+	IdentifierObject   types.Object
+	SelectorExpr       *ast.SelectorExpr
+	SelectorExprType   types.Type
+	CallExpr           *ast.CallExpr
+	CallExprFuncType   *types.Signature
+	CallArgIndex       int
+	ExpectedArgType    types.Type
+	CompositeLit       *ast.CompositeLit
+	CompositeLitType   types.Type
+	VariablesInScope   map[string]types.Object
+	PromptPreamble     string
+	AnalysisErrors     []error
 }
 
 // SnippetContext holds the code prefix and suffix for prompting.
@@ -132,21 +159,22 @@ type SnippetContext struct {
 	FullLine string // The full line where the cursor is located
 }
 
-// OllamaError defines a custom error for Ollama API issues (internal but used by retry).
+// OllamaError defines a custom error for Ollama API issues.
 type OllamaError struct {
 	Message string
-	Status  int // HTTP status code
+	Status  int
 }
 
+// Error implements the error interface for OllamaError.
 func (e *OllamaError) Error() string {
 	return fmt.Sprintf("Ollama error: %s (Status: %d)", e.Message, e.Status)
 }
 
-// OllamaResponse represents the streaming response structure (internal).
+// OllamaResponse represents the streaming response structure.
 type OllamaResponse struct {
 	Response string `json:"response"`
 	Done     bool   `json:"done"`
-	Error    string `json:"error,omitempty"` // Check this field in the stream
+	Error    string `json:"error,omitempty"`
 }
 
 // =============================================================================
@@ -154,14 +182,11 @@ type OllamaResponse struct {
 // =============================================================================
 
 var (
-	// ErrAnalysisFailed indicates a non-recoverable error during code analysis.
-	ErrAnalysisFailed = errors.New("code analysis failed")
-	// ErrOllamaUnavailable indicates the Ollama API was unreachable or returned a server error.
+	ErrAnalysisFailed    = errors.New("code analysis failed")
 	ErrOllamaUnavailable = errors.New("ollama API unavailable or returned server error")
-	// ErrStreamProcessing indicates an error occurred while reading or processing the LLM stream.
-	ErrStreamProcessing = errors.New("error processing LLM stream")
-	// ErrConfig indicates an error loading or writing the configuration file.
-	ErrConfig = errors.New("configuration error")
+	ErrStreamProcessing  = errors.New("error processing LLM stream")
+	ErrConfig            = errors.New("configuration error")
+	ErrInvalidConfig     = errors.New("invalid configuration")
 )
 
 // =============================================================================
@@ -192,13 +217,13 @@ var (
 	DefaultConfig = Config{
 		OllamaURL:      defaultOllamaURL,
 		Model:          defaultModel,
-		PromptTemplate: promptTemplate,    // Set default template
-		FimTemplate:    fimPromptTemplate, // Set default FIM template
+		PromptTemplate: promptTemplate,
+		FimTemplate:    fimPromptTemplate,
 		MaxTokens:      defaultMaxTokens,
-		Stop:           []string{DefaultStop, "}", "//", "/*"}, // Use exported DefaultStop
+		Stop:           []string{DefaultStop, "}", "//", "/*"},
 		Temperature:    defaultTemperature,
-		UseAst:         true,  // Enable AST context by default
-		UseFim:         false, // Disable FIM by default
+		UseAst:         true,
+		UseFim:         false,
 	}
 
 	// Pastel color codes for terminal output. Exported.
@@ -225,20 +250,17 @@ func PrettyPrint(color, text string) {
 
 // LoadConfig loads configuration from standard locations, merges with defaults,
 // and attempts to write a default config file if none exists.
-// Returns the loaded config and any non-fatal errors encountered during loading/parsing/writing.
 func LoadConfig() (Config, error) {
 	cfg := DefaultConfig // Start with defaults
 	var loadedFromFile bool
 	var loadErrors []error
 
-	// Determine primary and secondary config paths
 	primaryPath, secondaryPath, pathErr := getConfigPaths()
 	if pathErr != nil {
 		loadErrors = append(loadErrors, pathErr)
 		log.Printf("Warning: Could not determine config paths: %v", pathErr)
 	}
 
-	// Try loading from primary path (e.g., XDG_CONFIG_HOME)
 	if primaryPath != "" {
 		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg)
 		if loadErr != nil {
@@ -250,7 +272,6 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Try loading from secondary path if not loaded from primary
 	if !loadedFromFile && secondaryPath != "" {
 		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg)
 		if loadErr != nil {
@@ -262,10 +283,9 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// If no config file was found/loaded successfully, try to write the default one
 	if !loadedFromFile {
 		log.Println("No valid config file found in standard locations.")
-		writePath := primaryPath // Prefer primary path for writing
+		writePath := primaryPath
 		if writePath == "" {
 			writePath = secondaryPath
 		} // Fallback if primary failed
@@ -282,7 +302,6 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Ensure essential internal templates are set if missing
 	if cfg.PromptTemplate == "" {
 		cfg.PromptTemplate = promptTemplate
 	}
@@ -290,7 +309,7 @@ func LoadConfig() (Config, error) {
 		cfg.FimTemplate = fimPromptTemplate
 	}
 
-	// Return a wrapped error if any loading/writing issues occurred
+	// Return combined non-fatal errors wrapped in ErrConfig
 	if len(loadErrors) > 0 {
 		return cfg, fmt.Errorf("%w: %w", ErrConfig, errors.Join(loadErrors...))
 	}
@@ -301,26 +320,21 @@ func LoadConfig() (Config, error) {
 // getConfigPaths determines the primary (XDG) and secondary (~/.local/share) config paths.
 func getConfigPaths() (primary string, secondary string, err error) {
 	var cfgErr, homeErr error
-
 	userConfigDir, cfgErr := os.UserConfigDir()
 	if cfgErr == nil {
 		primary = filepath.Join(userConfigDir, configDirName, defaultConfigFileName)
 	} else {
 		log.Printf("Warning: Could not determine user config directory: %v", cfgErr)
 	}
-
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
 		secondary = filepath.Join(homeDir, ".local", "share", configDirName, defaultConfigFileName)
 	} else {
 		log.Printf("Warning: Could not determine user home directory: %v", homeErr)
 	}
-
-	// Return combined error if both failed
 	if cfgErr != nil && homeErr != nil {
 		err = fmt.Errorf("cannot determine config/home directories: %w; %w", cfgErr, homeErr)
 	}
-
 	return primary, secondary, err
 }
 
@@ -331,19 +345,16 @@ func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
-		return true, fmt.Errorf("reading config file failed: %w", err) // File exists but read failed
+		return true, fmt.Errorf("reading config file %q failed: %w", path, err)
 	}
-	if len(data) == 0 { // Handle empty file case
+	if len(data) == 0 {
 		log.Printf("Warning: Config file exists but is empty: %s", path)
 		return true, nil // Treat as loaded but with no overrides
 	}
-
 	var fileCfg FileConfig
 	if err := json.Unmarshal(data, &fileCfg); err != nil {
-		return true, fmt.Errorf("parsing config file JSON failed: %w", err) // Invalid JSON
+		return true, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
 	}
-
-	// Merge non-nil values from fileCfg into cfg
 	if fileCfg.OllamaURL != nil {
 		cfg.OllamaURL = *fileCfg.OllamaURL
 	}
@@ -365,18 +376,15 @@ func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
 	if fileCfg.UseFim != nil {
 		cfg.UseFim = *fileCfg.UseFim
 	}
-
 	return true, nil
 }
 
 // writeDefaultConfig creates the directory and writes the default config as JSON.
 func writeDefaultConfig(path string, defaultConfig Config) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0750); err != nil { // Use 0750 for permissions
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
-
-	// Marshal the *actual* Config struct (not FileConfig) for defaults
 	type ExportableConfig struct {
 		OllamaURL   string   `json:"ollama_url"`
 		Model       string   `json:"model"`
@@ -395,13 +403,11 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 		UseAst:      defaultConfig.UseAst,
 		UseFim:      defaultConfig.UseFim,
 	}
-
 	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal default config to JSON: %w", err)
 	}
-
-	if err := os.WriteFile(path, jsonData, 0640); err != nil { // Use 0640 for permissions
+	if err := os.WriteFile(path, jsonData, 0640); err != nil {
 		return fmt.Errorf("failed to write default config file %s: %w", path, err)
 	}
 	log.Printf("Wrote default configuration to %s", path)
@@ -458,14 +464,14 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("ollama request timed out: %w", err)
+			return nil, fmt.Errorf("%w: ollama request timed out: %w", ErrOllamaUnavailable, err)
 		}
-		return nil, fmt.Errorf("error making HTTP request to Ollama: %w", err)
+		return nil, fmt.Errorf("%w: error making HTTP request: %w", ErrOllamaUnavailable, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, readErr := io.ReadAll(resp.Body)
-		bodyString := "(could not read error body)"
+		bodyString := "(read error)"
 		if readErr == nil {
 			bodyString = string(bodyBytes)
 			var ollamaErrResp struct {
@@ -475,17 +481,8 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 				bodyString = ollamaErrResp.Error
 			}
 		}
-		// Wrap specific Ollama errors
-		if resp.StatusCode == http.StatusNotFound {
-			err = &OllamaError{Message: fmt.Sprintf("Ollama API endpoint not found or model '%s' not available: %s", config.Model, bodyString), Status: resp.StatusCode}
-			return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
-		}
-		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
-			err = &OllamaError{Message: fmt.Sprintf("Ollama service unavailable or busy: %s", bodyString), Status: resp.StatusCode}
-			return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err) // Considered unavailable
-		}
 		err = &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
-		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err) // Treat other errors as unavailable too? Or a different category?
+		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 	}
 	return resp.Body, nil
 }
@@ -502,25 +499,23 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 
 // Analyze parses the file, performs type checking, and extracts context.
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line, col int) (info *AstContextInfo, analysisErr error) {
-	// Initialize context info struct
 	info = &AstContextInfo{
 		FilePath:         filename,
 		VariablesInScope: make(map[string]types.Object),
 		AnalysisErrors:   make([]error, 0),
 		CallArgIndex:     -1,
 	}
-
-	// Add panic recovery
 	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Panic recovered during AnalyzeCodeContext: %v\n%s", r, string(debug.Stack()))
+		r := recover()
+		if r != nil {
 			panicErr := fmt.Errorf("internal panic during analysis: %v", r)
-			addAnalysisError(info, panicErr) // Use helper
+			addAnalysisError(info, panicErr)
 			if analysisErr == nil {
 				analysisErr = panicErr
 			} else {
 				analysisErr = errors.Join(analysisErr, panicErr)
 			}
+			log.Printf("Panic recovered during AnalyzeCodeContext: %v\n%s", r, string(debug.Stack()))
 		}
 	}()
 
@@ -531,22 +526,20 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 	info.FilePath = absFilename
 	log.Printf("Starting context analysis for: %s (%d:%d)", absFilename, line, col)
 
-	// --- Load Package & File Info ---
 	fset := token.NewFileSet()
 	targetPkg, targetFileAST, targetFile, loadErrors := loadPackageInfo(ctx, absFilename, fset)
 	for _, loadErr := range loadErrors {
 		addAnalysisError(info, loadErr)
-	} // Use helper
+	}
 
-	// --- Fallback Parsing if loading failed ---
 	if targetFileAST == nil {
 		log.Printf("Attempting direct parse of %s", absFilename)
 		targetFileAST, targetFile, err = directParse(absFilename, fset)
 		if err != nil {
 			addAnalysisError(info, err)
 			analysisErr = errors.Join(info.AnalysisErrors...)
-			return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr)
-		} // Cannot proceed
+			return info, fmt.Errorf("%w: direct parse failed: %w", ErrAnalysisFailed, analysisErr)
+		}
 		if targetFileAST.Name != nil {
 			info.PackageName = targetFileAST.Name.Name
 		} else {
@@ -568,64 +561,57 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 		}
 	}
 
-	// Populate Imports
 	if targetFileAST != nil {
 		info.Imports = targetFileAST.Imports
 	}
 
-	// --- Perform Analysis Steps ---
-	err = a.performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, info) // Pass info
-	if err != nil {
-		addAnalysisError(info, err)
-	} // Add error from analysis steps
+	// Perform analysis steps only if we have a valid file token
+	if targetFile != nil {
+		err = a.performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, info)
+		if err != nil {
+			addAnalysisError(info, err)
+		} // Add non-fatal error from analysis steps
+	} else {
+		addAnalysisError(info, errors.New("cannot perform analysis steps: missing token.File"))
+	}
 
-	// --- Build Preamble ---
-	info.PromptPreamble = buildPreamble(info, targetPkg) // Pass info
+	info.PromptPreamble = buildPreamble(info, targetPkg)
 	log.Printf("Generated Context Preamble:\n---\n%s\n---", info.PromptPreamble)
 	logAnalysisErrors(info.AnalysisErrors) // Log all collected non-fatal errors
 
 	analysisErr = errors.Join(info.AnalysisErrors...)
-	// Return specific error if analysis had issues, even non-fatal ones
+	// Wrap the combined analysis errors only if they exist
 	if analysisErr != nil {
 		return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr)
 	}
 	return info, nil
 }
 
-// performAnalysisSteps encapsulates the core analysis logic after loading/parsing. (unexported helper)
+// performAnalysisSteps encapsulates the core analysis logic after loading/parsing.
 func (a *GoPackagesAnalyzer) performAnalysisSteps(
 	targetFile *token.File,
 	targetFileAST *ast.File,
 	targetPkg *packages.Package,
 	fset *token.FileSet,
 	line, col int,
-	info *AstContextInfo, // Modifies info directly
-) error { // Returns potential fatal error during steps
-
-	// --- Calculate Cursor Position ---
-	if targetFile == nil {
-		return errors.New("failed to get token.File for position calculation")
-	}
+	info *AstContextInfo,
+) error {
+	// This function now assumes targetFile is not nil
 	cursorPos, posErr := calculateCursorPos(targetFile, line, col)
 	if posErr != nil {
-		return fmt.Errorf("cursor position error: %w", posErr)
-	} // Return fatal error
-	info.CursorPos = cursorPos
-	log.Printf("Calculated cursor token.Pos: %d (Line: %d, Col: %d)", info.CursorPos, fset.Position(info.CursorPos).Line, fset.Position(info.CursorPos).Column)
-
-	// --- Find Path & Context Nodes ---
-	path := findEnclosingPath(targetFileAST, info.CursorPos, info) // Pass info to store non-fatal errors
-	if path != nil {
-		findContextNodes(path, info.CursorPos, targetPkg, info) // Modifies info, adds non-fatal errors
+		return fmt.Errorf("cursor position error: %w", posErr) // Return fatal error
 	}
+	info.CursorPos = cursorPos
+	log.Printf("Calculated cursor token.Pos: %d (Line: %d, Col: %d)",
+		info.CursorPos, fset.Position(info.CursorPos).Line, fset.Position(info.CursorPos).Column)
 
-	// --- Gather Scope Context ---
-	gatherScopeContext(path, targetPkg, info) // Modifies info, adds non-fatal errors
-
-	// --- Find Comments ---
-	findRelevantComments(targetFileAST, path, info.CursorPos, fset, info) // Modifies info
-
-	return nil // Return nil, non-fatal errors are in info.AnalysisErrors
+	path := findEnclosingPath(targetFileAST, info.CursorPos, info)
+	if path != nil {
+		findContextNodes(path, info.CursorPos, targetPkg, info)
+	}
+	gatherScopeContext(path, targetPkg, info)
+	findRelevantComments(targetFileAST, path, info.CursorPos, fset, info)
+	return nil // Non-fatal errors are added to info.AnalysisErrors
 }
 
 // --- Prompt Formatter ---
@@ -642,13 +628,12 @@ func newTemplateFormatter() *templateFormatter {
 func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx SnippetContext, config Config) string {
 	var finalPrompt string
 	template := config.PromptTemplate
-	snippet := snippetCtx.Prefix // Default to prefix for standard
+	snippet := snippetCtx.Prefix
 
 	if config.UseFim {
 		template = config.FimTemplate
 		prefix := snippetCtx.Prefix
 		suffix := snippetCtx.Suffix
-		// Basic truncation
 		combinedLen := len(prefix) + len(suffix)
 		if combinedLen > maxContentLength {
 			allowedLen := maxContentLength / 2
@@ -660,12 +645,9 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 			}
 			log.Printf("Truncated FIM prefix/suffix.")
 		}
-		// Use FIM template format (adjust markers if needed for model)
 		finalPrompt = fmt.Sprintf(template, prefix, suffix)
-		// Prepend context preamble (model might ignore if not trained for it)
 		finalPrompt = contextPreamble + "\n" + finalPrompt
 	} else {
-		// Standard Prompt
 		if len(snippet) > maxContentLength {
 			snippet = "..." + snippet[len(snippet)-maxContentLength+3:]
 			log.Printf("Truncated code snippet.")
@@ -692,150 +674,134 @@ type DeepCompleter struct {
 	config    Config
 }
 
-// NewDeepCompleter creates a new DeepCompleter service with default components.
-// It loads configuration from standard locations and applies defaults. Exported.
+// NewDeepCompleter creates a new DeepCompleter service with default components. Exported.
 func NewDeepCompleter() (*DeepCompleter, error) {
-	cfg, err := LoadConfig() // Load defaults + file config
-	// err from LoadConfig is now non-fatal warnings combined
-	if err != nil {
-		log.Printf("Warning during config load: %v", err)
-		// Continue with potentially default/partially loaded config
+	cfg, configErr := LoadConfig()
+	if configErr != nil && !errors.Is(configErr, ErrConfig) { // Handle fatal config path errors
+		return nil, configErr
+	} else if configErr != nil { // Log non-fatal config load/write warnings
+		log.Printf("Warning during config load: %v", configErr)
+		cfg = DefaultConfig // Ensure defaults on non-fatal load error
 	}
 
-	return &DeepCompleter{
-		client:    newHttpOllamaClient(),   // Use unexported constructor
-		analyzer:  NewGoPackagesAnalyzer(), // Use exported constructor
-		formatter: newTemplateFormatter(),  // Use unexported constructor
-		config:    cfg,
-	}, nil // Return nil error even if config loading had warnings
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	return &DeepCompleter{client: newHttpOllamaClient(), analyzer: NewGoPackagesAnalyzer(), formatter: newTemplateFormatter(), config: cfg}, nil
 }
 
-// NewDeepCompleterWithConfig creates a new DeepCompleter service with provided config
-// and default components. Exported.
-func NewDeepCompleterWithConfig(config Config) *DeepCompleter {
-	// Ensure templates have defaults if not set in provided config
+// NewDeepCompleterWithConfig creates a new DeepCompleter service with provided config. Exported.
+func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
 	}
 	if config.FimTemplate == "" {
 		config.FimTemplate = fimPromptTemplate
 	}
-
-	return &DeepCompleter{
-		client:    newHttpOllamaClient(),   // Use unexported constructor
-		analyzer:  NewGoPackagesAnalyzer(), // Use exported constructor
-		formatter: newTemplateFormatter(),  // Use unexported constructor
-		config:    config,
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
+	return &DeepCompleter{client: newHttpOllamaClient(), analyzer: NewGoPackagesAnalyzer(), formatter: newTemplateFormatter(), config: config}, nil
 }
 
-// GetCompletion provides completion for a raw code snippet (no file context). Non-streaming. Exported.
-// Calls GenerateStream internally and buffers the result.
+// GetCompletion provides completion for a raw code snippet. Non-streaming. Exported.
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
 	log.Println("DeepCompleter.GetCompletion called for basic prompt.")
 	contextPreamble := "// Provide Go code completion below."
 	snippetCtx := SnippetContext{Prefix: codeSnippet}
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, dc.config)
-
 	reader, err := dc.client.GenerateStream(ctx, prompt, dc.config)
 	if err != nil {
-		// Wrap Ollama specific errors
 		var ollamaErr *OllamaError
-		if errors.As(err, &ollamaErr) {
+		if errors.As(err, &ollamaErr) || errors.Is(err, ErrOllamaUnavailable) {
 			return "", fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 		}
 		return "", fmt.Errorf("failed to call Ollama API for basic prompt: %w", err)
 	}
-
 	var buffer bytes.Buffer
 	streamCtx, cancelStream := context.WithTimeout(ctx, 50*time.Second)
 	defer cancelStream()
-	// Use the package-level streamCompletion helper
 	if streamErr := streamCompletion(streamCtx, reader, &buffer); streamErr != nil {
-		// Wrap stream processing errors
 		return "", fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
 	}
 	return buffer.String(), nil
 }
 
-// GetCompletionStreamFromFile is the primary function using AST context and streaming output. Exported.
+// GetCompletionStreamFromFile uses AST context and streams completion. Exported.
 func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filename string, row, col int, w io.Writer) error {
-	var contextPreamble string = "// Basic file context only.\n"
+	var contextPreamble string = "// Basic file context only."
 	var analysisErr error // Stores combined non-fatal errors from analysis
 
-	// --- 1. Analyze Context ---
 	if dc.config.UseAst {
 		log.Printf("Analyzing context using AST/Types for %s:%d:%d", filename, row, col)
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 20*time.Second)
 		var analysisInfo *AstContextInfo
-		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, filename, row, col) // Use analyzer component
+		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, filename, row, col)
 		cancelAnalysis()
-		// analysisErr now holds combined non-fatal errors from Analyze
+
+		// If Analyze itself failed fatally, return the error immediately
+		if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) {
+			return fmt.Errorf("analysis failed fatally: %w", analysisErr)
+		}
+		// Log non-fatal errors collected during analysis if Analyze didn't fail fatally
+		if analysisErr != nil { // This means errors.Is(analysisErr, ErrAnalysisFailed) is true
+			logAnalysisErrors(analysisInfo.AnalysisErrors) // Log the collected errors
+		}
+
 		if analysisInfo != nil && analysisInfo.PromptPreamble != "" {
 			contextPreamble = analysisInfo.PromptPreamble
 		} else {
 			contextPreamble += "// Warning: AST analysis returned no specific context.\n"
 		}
-		// Log analysis errors regardless of whether preamble was generated
-		if analysisErr != nil {
-			logAnalysisErrors([]error{analysisErr})
-		} // Log non-fatal errors
 	} else {
 		log.Println("AST analysis disabled.")
 	}
 
-	// --- 2. Extract Snippet ---
 	snippetCtx, err := extractSnippetContext(filename, row, col)
 	if err != nil {
 		return fmt.Errorf("failed to extract code snippet context: %w", err)
-	} // Fatal error
+	}
 
-	// --- 3. Format Prompt ---
-	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, dc.config) // Use formatter component
+	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, dc.config)
 	log.Printf("Generated Prompt (length %d):\n---\n%s\n---", len(prompt), prompt)
 
-	// --- 4. Call LLM with Retry ---
 	apiCallFunc := func() error {
 		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
 		defer cancelApi()
-		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, dc.config) // Use client component
+		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, dc.config)
 		if apiErr != nil {
-			// Let retry logic handle check for OllamaError, wrap others
-			var ollamaErr *OllamaError
-			if errors.As(apiErr, &ollamaErr) {
-				return apiErr // Return original error for retry check
-			}
-			// Wrap non-retryable API errors
-			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, apiErr)
+			var oe *OllamaError
+			if errors.As(apiErr, &oe) {
+				return apiErr
+			} // Let retry handle OllamaError
+			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, apiErr) // Wrap others
 		}
-
-		PrettyPrint(ColorGreen, "Completion:\n") // Use exported PrettyPrint
-		// Use the package-level streamCompletion helper
+		PrettyPrint(ColorGreen, "Completion:\n")
 		streamErr := streamCompletion(apiCtx, reader, w)
 		fmt.Fprintln(w) // Final newline
 		if streamErr != nil {
-			// Wrap stream processing errors
-			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
+			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr) // Wrap stream errors
 		}
 		log.Println("Completion stream finished successfully for this attempt.")
 		return nil
 	}
 
-	err = retry(ctx, apiCallFunc, maxRetries, retryDelay) // Use retry helper defined below
+	err = retry(ctx, apiCallFunc, maxRetries, retryDelay)
 	if err != nil {
-		// Check if the final error was due to analysis issues propagated
-		if analysisErr != nil && errors.Is(err, ErrOllamaUnavailable) {
-			log.Printf("Warning: Ollama call failed after retries, potentially due to analysis errors: %v", analysisErr)
-			// Return the analysis error instead? Or combined? Let's return the API error for now.
+		// Wrap retry final error appropriately
+		var oe *OllamaError
+		if errors.As(err, &oe) || errors.Is(err, ErrOllamaUnavailable) {
+			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 		}
-		return fmt.Errorf("failed to get completion stream after retries: %w", err) // Fatal if retries fail
+		return fmt.Errorf("failed to get completion stream after retries: %w", err)
 	}
 
 	// Log analysis errors again as a final warning, even if completion succeeded
+	// Note: analysisErr here contains non-fatal errors wrapped with ErrAnalysisFailed if any occurred.
 	if analysisErr != nil {
-		log.Printf("Warning: Completion succeeded, but context analysis encountered errors: %v", analysisErr)
+		log.Printf("Warning: Completion succeeded, but context analysis encountered non-fatal errors: %v", analysisErr)
 	}
-	return nil // Overall success
+	return nil
 }
 
 // =============================================================================
@@ -843,8 +809,6 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filena
 // =============================================================================
 
 // --- Ollama Stream Processing Helpers ---
-
-// streamCompletion reads and processes the NDJSON stream from Ollama.
 func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 	defer r.Close()
 	reader := bufio.NewReader(r)
@@ -864,7 +828,7 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 						return procErr
 					}
 				}
-				return nil
+				return nil // Successful end of stream
 			}
 			log.Printf("Error reading from Ollama stream: %v", err)
 			select {
@@ -880,8 +844,6 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 		}
 	}
 }
-
-// processLine unmarshals and handles a single line from the Ollama stream.
 func processLine(line []byte, w io.Writer) error {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
@@ -890,7 +852,7 @@ func processLine(line []byte, w io.Writer) error {
 	var resp OllamaResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		log.Printf("Error unmarshalling Ollama JSON line: %v, line content: '%s'", err, string(line))
-		return nil
+		return nil // Continue processing next line
 	}
 	if resp.Error != "" {
 		log.Printf("Ollama reported an error in stream: %s", resp.Error)
@@ -904,51 +866,58 @@ func processLine(line []byte, w io.Writer) error {
 }
 
 // --- Retry Helper ---
-
-// retry implements a retry mechanism with backoff for specific errors.
 func retry(ctx context.Context, operation func() error, maxRetries int, initialDelay time.Duration) error {
 	var err error
 	currentDelay := initialDelay
 	for i := 0; i < maxRetries; i++ {
 		err = operation()
 		if err == nil {
-			return nil
+			return nil // Success
 		}
 		var ollamaErr *OllamaError
-		isRetryable := errors.As(err, &ollamaErr) && (ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests)
-		// Also check if the error wraps ErrOllamaUnavailable explicitly
-		isRetryable = isRetryable || errors.Is(err, ErrOllamaUnavailable)
+		isRetryable := errors.As(err, &ollamaErr) &&
+			(ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests)
+		isRetryable = isRetryable || errors.Is(err, ErrOllamaUnavailable) // Also retry on wrapped ErrOllamaUnavailable
 
 		if !isRetryable {
 			log.Printf("Non-retryable error encountered: %v", err)
-			return err
+			return err // Return non-retryable errors immediately
 		}
 		log.Printf("Attempt %d failed with retryable error: %v. Retrying in %v...", i+1, err, currentDelay)
 		select {
 		case <-ctx.Done():
 			log.Printf("Context cancelled during retry wait: %v", ctx.Err())
-			return ctx.Err()
+			return ctx.Err() // Respect context cancellation
 		case <-time.After(currentDelay):
+			// Optional: Implement exponential backoff
+			// currentDelay *= 2
 		}
 	}
 	log.Printf("Operation failed after %d retries.", maxRetries)
-	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, err)
+	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, err) // Return the last error
 }
 
 // --- Analysis Helpers ---
-
-// loadPackageInfo loads package information using go/packages.
 func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSet) (*packages.Package, *ast.File, *token.File, []error) {
 	dir := filepath.Dir(absFilename)
 	var loadErrors []error
-	cfg := &packages.Config{Context: ctx, Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedTypesSizes | packages.NeedDeps, Dir: dir, Fset: fset, ParseFile: func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
-		const mode = parser.ParseComments | parser.AllErrors
-		file, err := parser.ParseFile(fset, filename, src, mode)
-		if err != nil {
-			log.Printf("Parser error in %s (ignored for partial AST): %v", filename, err)
-		}
-		return file, nil
-	}, Tests: true}
+	cfg := &packages.Config{
+		Context: ctx,
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+			packages.NeedImports | packages.NeedTypes | packages.NeedSyntax |
+			packages.NeedTypesInfo | packages.NeedTypesSizes | packages.NeedDeps,
+		Dir:  dir,
+		Fset: fset,
+		ParseFile: func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+			const mode = parser.ParseComments | parser.AllErrors
+			file, err := parser.ParseFile(fset, filename, src, mode)
+			if err != nil {
+				log.Printf("Parser error in %s (ignored for partial AST): %v", filename, err)
+			}
+			return file, nil
+		},
+		Tests: true,
+	}
 	pkgs, loadErr := packages.Load(cfg, ".")
 	if loadErr != nil {
 		log.Printf("Error loading packages: %v", loadErr)
@@ -958,13 +927,15 @@ func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSe
 		log.Println("Detailed errors encountered during package loading")
 		loadErrors = append(loadErrors, errors.New("package loading reported errors"))
 	}
+
 	for _, pkg := range pkgs {
 		if pkg == nil || pkg.Fset == nil || pkg.Syntax == nil || pkg.CompiledGoFiles == nil {
 			continue
 		}
-		for i, _ := range pkg.CompiledGoFiles { /* FIX: Use _ for filePath */
+		// **FIX:** Correctly use blank identifier for unused filePath variable
+		for i, _ := range pkg.CompiledGoFiles { // Use _ for filePath
 			if i >= len(pkg.Syntax) {
-				continue
+				continue // Avoid index out of range
 			}
 			astNode := pkg.Syntax[i]
 			if astNode == nil {
@@ -978,8 +949,6 @@ func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSe
 	}
 	return nil, nil, nil, loadErrors
 }
-
-// directParse attempts to parse a single file directly.
 func directParse(absFilename string, fset *token.FileSet) (*ast.File, *token.File, error) {
 	srcBytes, readErr := os.ReadFile(absFilename)
 	if readErr != nil {
@@ -989,15 +958,14 @@ func directParse(absFilename string, fset *token.FileSet) (*ast.File, *token.Fil
 	targetFileAST, parseErr := parser.ParseFile(fset, absFilename, srcBytes, mode)
 	if parseErr != nil {
 		log.Printf("Direct parsing of %s failed: %v", absFilename, parseErr)
+		// Continue even if there are parse errors, as long as AST is not nil
 	}
 	if targetFileAST == nil {
 		return nil, nil, errors.New("failed to obtain any AST from direct parse")
 	}
 	targetFile := fset.File(targetFileAST.Pos())
-	return targetFileAST, targetFile, parseErr
+	return targetFileAST, targetFile, parseErr // Return parseErr as non-fatal
 }
-
-// findEnclosingPath finds the AST path to the cursor.
 func findEnclosingPath(targetFileAST *ast.File, cursorPos token.Pos, info *AstContextInfo) []ast.Node {
 	if targetFileAST == nil {
 		addAnalysisError(info, errors.New("cannot find enclosing path: targetFileAST is nil"))
@@ -1010,18 +978,33 @@ func findEnclosingPath(targetFileAST *ast.File, cursorPos token.Pos, info *AstCo
 	}
 	return path
 }
-
-// gatherScopeContext extracts enclosing function/block and populates scope variables.
 func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, info *AstContextInfo) {
 	if path == nil {
 		return
 	}
+	var fset *token.FileSet
+	if targetPkg != nil && targetPkg.Fset != nil {
+		fset = targetPkg.Fset
+	} else {
+		fset = token.NewFileSet()
+		log.Println("Warning: Using fallback FileSet for receiver formatting.")
+	}
+
 	for i := len(path) - 1; i >= 0; i-- {
 		node := path[i]
 		switch n := node.(type) {
 		case *ast.FuncDecl:
 			if info.EnclosingFuncNode == nil {
 				info.EnclosingFuncNode = n
+				if n.Recv != nil && len(n.Recv.List) > 0 && n.Recv.List[0].Type != nil {
+					var buf bytes.Buffer
+					if err := format.Node(&buf, fset, n.Recv.List[0].Type); err == nil {
+						info.ReceiverType = buf.String()
+					} else {
+						log.Printf("Warning: could not format receiver type: %v", err)
+						info.ReceiverType = "[error formatting receiver]"
+					}
+				}
 			}
 			if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Defs != nil && n.Name != nil {
 				if obj, ok := targetPkg.TypesInfo.Defs[n.Name]; ok && obj != nil {
@@ -1052,8 +1035,6 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, info *AstC
 	}
 	addPackageScope(targetPkg, info)
 }
-
-// addPackageScope adds package-level declarations to the scope map.
 func addPackageScope(targetPkg *packages.Package, info *AstContextInfo) {
 	if targetPkg != nil && targetPkg.Types != nil {
 		pkgScope := targetPkg.Types.Scope()
@@ -1069,8 +1050,6 @@ func addPackageScope(targetPkg *packages.Package, info *AstContextInfo) {
 		}
 	}
 }
-
-// findRelevantComments finds comments near the cursor.
 func findRelevantComments(targetFileAST *ast.File, path []ast.Node, cursorPos token.Pos, fset *token.FileSet, info *AstContextInfo) {
 	var cmap ast.CommentMap
 	if targetFileAST != nil {
@@ -1081,11 +1060,9 @@ func findRelevantComments(targetFileAST *ast.File, path []ast.Node, cursorPos to
 	}
 	info.CommentsNearCursor = findCommentsWithMap(cmap, path, info.CursorPos, fset)
 }
-
-// buildPreamble formats the collected context information into a string.
 func buildPreamble(info *AstContextInfo, targetPkg *packages.Package) string {
 	var preamble strings.Builder
-	qualifier := types.RelativeTo(targetPkg.Types)
+	qualifier := types.RelativeTo(targetPkg.Types) // Handle nil pkg
 	preamble.WriteString(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), info.PackageName))
 	formatImportsSection(&preamble, info)
 	formatEnclosingFuncSection(&preamble, info, qualifier)
@@ -1094,13 +1071,10 @@ func buildPreamble(info *AstContextInfo, targetPkg *packages.Package) string {
 	formatScopeSection(&preamble, info, qualifier)
 	return preamble.String()
 }
-
-// formatImportsSection adds import info to the preamble.
 func formatImportsSection(preamble *strings.Builder, info *AstContextInfo) {
 	if len(info.Imports) > 0 {
 		preamble.WriteString("// Imports:\n")
 		for _, imp := range info.Imports {
-			// Defensive checks for nil
 			if imp == nil {
 				continue
 			}
@@ -1116,17 +1090,28 @@ func formatImportsSection(preamble *strings.Builder, info *AstContextInfo) {
 		}
 	}
 }
-
-// formatEnclosingFuncSection adds enclosing function info to the preamble.
 func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier) {
+	funcOrMethod := "Function"
+	receiverStr := ""
+	if info.ReceiverType != "" {
+		funcOrMethod = "Method"
+		receiverStr = fmt.Sprintf("(%s) ", info.ReceiverType)
+	}
 	if info.EnclosingFunc != nil {
-		preamble.WriteString(fmt.Sprintf("// Enclosing Function: %s\n", types.ObjectString(info.EnclosingFunc, qualifier)))
+		name := info.EnclosingFunc.Name()
+		sigStr := types.TypeString(info.EnclosingFunc.Type(), qualifier)
+		if info.ReceiverType != "" && strings.HasPrefix(sigStr, "func(") {
+			sigStr = "func" + strings.TrimPrefix(sigStr, "func")
+		}
+		preamble.WriteString(fmt.Sprintf("// Enclosing %s: %s%s%s\n", funcOrMethod, receiverStr, name, sigStr))
 	} else if info.EnclosingFuncNode != nil {
-		preamble.WriteString(fmt.Sprintf("// Enclosing Function (AST): %s\n", formatFuncSignature(info.EnclosingFuncNode)))
+		name := "[anonymous]"
+		if info.EnclosingFuncNode.Name != nil {
+			name = info.EnclosingFuncNode.Name.Name
+		}
+		preamble.WriteString(fmt.Sprintf("// Enclosing %s (AST): %s%s(...)\n", funcOrMethod, receiverStr, name))
 	}
 }
-
-// formatCommentsSection adds relevant comments to the preamble.
 func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo) {
 	if len(info.CommentsNearCursor) > 0 {
 		preamble.WriteString("// Relevant Comments:\n")
@@ -1138,54 +1123,22 @@ func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo) {
 		}
 	}
 }
-
-// formatCursorContextSection adds info about the node at the cursor to the preamble.
 func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo, targetPkg *packages.Package, qualifier types.Qualifier) {
 	if info.CallExpr != nil {
 		funcName := "[unknown function]"
-		// Attempt to get func name more reliably
 		switch fun := info.CallExpr.Fun.(type) {
 		case *ast.Ident:
 			funcName = fun.Name
 		case *ast.SelectorExpr:
-			// Handle package selector vs method call if possible
-			if xident, ok := fun.X.(*ast.Ident); ok {
-				// Check if X is a package name via TypesInfo.Uses
-				if obj, ok := targetPkg.TypesInfo.Uses[xident]; ok && types.IsInterface(obj.Type()) { // Heuristic: might be interface call
-					funcName = fmt.Sprintf("%s.%s", xident.Name, fun.Sel.Name)
-				} else if _, ok := obj.(*types.PkgName); ok {
-					funcName = fmt.Sprintf("%s.%s", xident.Name, fun.Sel.Name) // Package function/var
-				} else {
-					funcName = fmt.Sprintf("[expr].%s", fun.Sel.Name) // Method call
-				}
-			} else {
-				if fun.Sel != nil {
-					funcName = fmt.Sprintf("[expr].%s", fun.Sel.Name)
-				}
+			if fun.Sel != nil {
+				funcName = fun.Sel.Name
 			}
 		}
 		preamble.WriteString(fmt.Sprintf("// Inside function call: %s (Arg %d)\n", funcName, info.CallArgIndex+1))
 		if info.CallExprFuncType != nil {
 			preamble.WriteString(fmt.Sprintf("// Function Signature: %s\n", types.TypeString(info.CallExprFuncType, qualifier)))
-			// Add expected argument type
-			params := info.CallExprFuncType.Params()
-			if params != nil {
-				idx := info.CallArgIndex
-				var expectedType types.Type
-				if info.CallExprFuncType.Variadic() && idx >= params.Len()-1 {
-					// Handle variadic argument
-					lastParam := params.At(params.Len() - 1)
-					if slice, ok := lastParam.Type().(*types.Slice); ok {
-						expectedType = slice.Elem()
-					}
-				} else if idx < params.Len() {
-					// Handle regular argument
-					expectedType = params.At(idx).Type()
-				}
-
-				if expectedType != nil {
-					preamble.WriteString(fmt.Sprintf("// Expected Arg Type: %s\n", types.TypeString(expectedType, qualifier)))
-				}
+			if info.ExpectedArgType != nil {
+				preamble.WriteString(fmt.Sprintf("// Expected Arg Type: %s\n", types.TypeString(info.ExpectedArgType, qualifier)))
 			}
 		} else {
 			preamble.WriteString("// Function Signature: (unknown)\n")
@@ -1205,6 +1158,33 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 				preamble.WriteString(fmt.Sprintf("//     - %s\n", member))
 			}
 		}
+	} else if info.CompositeLit != nil && info.CompositeLitType != nil {
+		typeName := types.TypeString(info.CompositeLitType, qualifier)
+		preamble.WriteString(fmt.Sprintf("// Inside composite literal of type: %s\n", typeName))
+		if st, ok := info.CompositeLitType.Underlying().(*types.Struct); ok {
+			presentFields := make(map[string]bool)
+			for _, elt := range info.CompositeLit.Elts {
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					if keyIdent, ok := kv.Key.(*ast.Ident); ok {
+						presentFields[keyIdent.Name] = true
+					}
+				}
+			}
+			var missingFields []string
+			for i := 0; i < st.NumFields(); i++ {
+				field := st.Field(i)
+				if field != nil && field.Exported() && !presentFields[field.Name()] {
+					missingFields = append(missingFields, types.ObjectString(field, qualifier))
+				}
+			}
+			if len(missingFields) > 0 {
+				preamble.WriteString("//   Available fields to add:\n")
+				sort.Strings(missingFields)
+				for _, fieldStr := range missingFields {
+					preamble.WriteString(fmt.Sprintf("//     - %s\n", fieldStr))
+				}
+			}
+		}
 	} else if info.IdentifierAtCursor != nil {
 		identName := info.IdentifierAtCursor.Name
 		if info.IdentifierType != nil {
@@ -1217,8 +1197,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		}
 	}
 }
-
-// formatScopeSection adds variables in scope to the preamble.
 func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier) {
 	if len(info.VariablesInScope) > 0 {
 		preamble.WriteString("// Variables/Constants/Types in Scope:\n")
@@ -1233,15 +1211,13 @@ func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifi
 		}
 	}
 }
-
-// calculateCursorPos converts 1-based line/col to token.Pos (internal).
 func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	if line <= 0 {
 		return token.NoPos, fmt.Errorf("invalid line number: %d (must be >= 1)", line)
 	}
 	if file == nil {
 		return token.NoPos, errors.New("invalid token.File (nil)")
-	} // Defensive check
+	}
 	if line > file.LineCount() {
 		return token.NoPos, fmt.Errorf("line number %d exceeds file line count %d", line, file.LineCount())
 	}
@@ -1266,8 +1242,6 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	}
 	return pos, nil
 }
-
-// addSignatureToScope adds parameters and named results from a function signature to the scope map (internal).
 func addSignatureToScope(sig *types.Signature, scope map[string]types.Object) {
 	if sig == nil {
 		return
@@ -1295,17 +1269,12 @@ func addSignatureToScope(sig *types.Signature, scope map[string]types.Object) {
 		}
 	}
 }
-
-// addScopeVariables adds variables from a types.Scope to the scope map (internal).
 func addScopeVariables(typeScope *types.Scope, cursorPos token.Pos, scopeMap map[string]types.Object) {
 	if typeScope == nil {
 		return
 	}
 	for _, name := range typeScope.Names() {
 		obj := typeScope.Lookup(name)
-		// Include if cursor position is invalid (e.g., package scope using token.NoPos)
-		// OR object defined before cursor
-		// OR object has no position (like builtins)
 		include := !cursorPos.IsValid() || !obj.Pos().IsValid() || obj.Pos() < cursorPos
 		if obj != nil && include {
 			switch obj.(type) {
@@ -1321,8 +1290,6 @@ func addScopeVariables(typeScope *types.Scope, cursorPos token.Pos, scopeMap map
 		}
 	}
 }
-
-// formatFuncSignature creates a string representation from an ast.FuncDecl (fallback, internal).
 func formatFuncSignature(f *ast.FuncDecl) string {
 	var sb strings.Builder
 	sb.WriteString("func ")
@@ -1340,8 +1307,6 @@ func formatFuncSignature(f *ast.FuncDecl) string {
 	}
 	return sb.String()
 }
-
-// findCommentsWithMap uses ast.CommentMap to find comments near the cursor or associated with enclosing nodes (internal).
 func findCommentsWithMap(cmap ast.CommentMap, path []ast.Node, cursorPos token.Pos, fset *token.FileSet) []string {
 	var comments []string
 	if cmap == nil || !cursorPos.IsValid() || fset == nil {
@@ -1437,10 +1402,6 @@ cleanup:
 	}
 	return uniqueComments
 }
-
-// findContextNodes tries to find the identifier, selector expression, or call expression
-// at/before the cursor and resolve its type information, updating the AstContextInfo struct directly.
-// Returns a struct containing the found nodes/types.
 func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Package, info *AstContextInfo) {
 	if len(path) == 0 {
 		log.Println("Cannot find context nodes: Missing AST path.")
@@ -1449,29 +1410,45 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 	hasTypeInfo := pkg != nil && pkg.TypesInfo != nil
 	innermostNode := path[0]
 
+	// Check CompositeLit first
+	if compLit, ok := innermostNode.(*ast.CompositeLit); ok && cursorPos >= compLit.Lbrace && cursorPos <= compLit.Rbrace {
+		info.CompositeLit = compLit
+		log.Printf("Cursor is inside CompositeLit at pos %d", compLit.Pos())
+		if hasTypeInfo && pkg.TypesInfo.Types != nil {
+			if tv, ok := pkg.TypesInfo.Types[compLit]; ok {
+				info.CompositeLitType = tv.Type
+				if info.CompositeLitType != nil {
+					log.Printf("Resolved composite literal type: %s", types.TypeString(info.CompositeLitType, types.RelativeTo(pkg.Types)))
+				} else {
+					addAnalysisError(info, errors.New("composite literal type is nil"))
+				}
+			} else {
+				addAnalysisError(info, errors.New("missing type info for composite literal"))
+			}
+		}
+		return // Prioritize CompositeLit context
+	}
+
 	// Check CallExpr
 	if callExpr, ok := innermostNode.(*ast.CallExpr); ok && cursorPos > callExpr.Lparen && cursorPos <= callExpr.Rparen {
 		info.CallExpr = callExpr
-		info.CallArgIndex = -1 // Initialize to -1
-		// Determine argument index based on cursor position relative to commas and args
-		currentArgStart := callExpr.Lparen + 1 // Position after opening paren
+		info.CallArgIndex = -1 // Initialize
+		currentArgStart := callExpr.Lparen + 1
 		for i, arg := range callExpr.Args {
 			if cursorPos >= currentArgStart && cursorPos <= arg.End() {
 				info.CallArgIndex = i
 				break
 			}
-			// If cursor is after this arg (and potential comma), check next
 			currentArgStart = arg.End() + 1 // Position after this arg (assume comma exists)
-			// TODO: More precise comma handling?
-			if i == len(callExpr.Args)-1 && cursorPos > arg.End() { // Cursor after last arg
+			if i == len(callExpr.Args)-1 && cursorPos > arg.End() {
 				info.CallArgIndex = i + 1
 			}
 		}
-		if info.CallArgIndex == -1 && len(callExpr.Args) == 0 && cursorPos > callExpr.Lparen && cursorPos <= callExpr.Rparen {
-			info.CallArgIndex = 0 // Inside empty arg list
+		if info.CallArgIndex == -1 && len(callExpr.Args) == 0 {
+			info.CallArgIndex = 0
 		}
-
 		log.Printf("Cursor likely at argument index %d", info.CallArgIndex)
+
 		if hasTypeInfo {
 			if pkg.TypesInfo.Types == nil {
 				addAnalysisError(info, errors.New("types map missing for call expr"))
@@ -1480,6 +1457,20 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 			if tv, ok := pkg.TypesInfo.Types[callExpr.Fun]; ok && tv.IsValue() {
 				if sig, ok := tv.Type.Underlying().(*types.Signature); ok {
 					info.CallExprFuncType = sig
+					params := sig.Params()
+					if params != nil {
+						idx := info.CallArgIndex
+						var expectedType types.Type
+						if sig.Variadic() && idx >= params.Len()-1 {
+							lastParam := params.At(params.Len() - 1)
+							if slice, ok := lastParam.Type().(*types.Slice); ok {
+								expectedType = slice.Elem()
+							}
+						} else if idx >= 0 && idx < params.Len() { // Check idx validity
+							expectedType = params.At(idx).Type()
+						}
+						info.ExpectedArgType = expectedType
+					}
 				} else {
 					addAnalysisError(info, fmt.Errorf("type of call func is %T, not signature", tv.Type))
 				}
@@ -1566,19 +1557,15 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 	info.IdentifierObject = obj
 	info.IdentifierType = typ
 }
-
-// listTypeMembers attempts to list fields and methods for a given type.
 func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 	if typ == nil {
 		return nil
 	}
 	var members []string
 	var qualifier types.Qualifier
-	// Defend against nil pkg or pkg.Types
 	if pkg != nil && pkg.Types != nil {
 		qualifier = types.RelativeTo(pkg.Types)
 	}
-
 	currentType := typ
 	isPointer := false
 	if ptr, ok := typ.(*types.Pointer); ok {
@@ -1587,20 +1574,18 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 	}
 	if currentType == nil {
 		return nil
-	} // Handle nil element type
-
+	}
 	underlying := currentType.Underlying()
 	if underlying == nil {
 		return nil
-	} // Handle nil underlying type
+	}
 
-	// Handle Basic types (just return the type name)
 	if basic, ok := underlying.(*types.Basic); ok {
 		return []string{fmt.Sprintf("(type: %s)", basic.String())}
-	} // More explicit
+	}
 	if _, ok := underlying.(*types.Map); ok {
 		return []string{"// map operations: make, len, delete, range"}
-	} // Suggest ops
+	}
 	if _, ok := underlying.(*types.Slice); ok {
 		return []string{"// slice operations: make, len, cap, append, copy, range"}
 	}
@@ -1615,7 +1600,7 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 				members = append(members, fmt.Sprintf("field %s", types.ObjectString(field, qualifier)))
 			}
 		}
-	} // Indicate field
+	}
 	if iface, ok := underlying.(*types.Interface); ok {
 		for i := 0; i < iface.NumExplicitMethods(); i++ {
 			method := iface.ExplicitMethod(i)
@@ -1630,28 +1615,22 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 			}
 		}
 	}
-
-	// Get method set for the original type (could be pointer or non-pointer)
 	mset := types.NewMethodSet(typ)
 	for i := 0; i < mset.Len(); i++ {
 		sel := mset.At(i)
 		if sel != nil {
 			methodObj := sel.Obj()
-			// Defensive check for method object type
 			if method, ok := methodObj.(*types.Func); ok {
 				if method != nil && method.Exported() {
-					members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier))) // Indicate method
+					members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier)))
 				}
-			} else if methodObj != nil { // Log if it's not nil but also not a *types.Func
+			} else if methodObj != nil {
 				log.Printf("Warning: Object in method set is not *types.Func: %T", methodObj)
 			}
 		}
 	}
-
-	// If original type was not a pointer, but underlying was named, also check pointer method set
 	if !isPointer {
 		if named, ok := currentType.(*types.Named); ok {
-			// Check if named is not nil before creating pointer
 			if named != nil {
 				ptrToNamed := types.NewPointer(named)
 				msetPtr := types.NewMethodSet(ptrToNamed)
@@ -1661,16 +1640,15 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 						methodObj := sel.Obj()
 						if method, ok := methodObj.(*types.Func); ok {
 							if method != nil && method.Exported() {
-								// Check if already added by non-pointer receiver method set
 								found := false
 								for _, existing := range members {
-									if strings.HasSuffix(existing, method.Name()+"(...)") || strings.Contains(existing, method.Name()+" func(") { // Basic check
+									if strings.HasSuffix(existing, method.Name()+"(...)") || strings.Contains(existing, method.Name()+" func(") {
 										found = true
 										break
 									}
 								}
 								if !found {
-									members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier))) // Indicate method
+									members = append(members, fmt.Sprintf("method %s", types.ObjectString(method, qualifier)))
 								}
 							}
 						} else if methodObj != nil {
@@ -1681,7 +1659,6 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 			}
 		}
 	}
-
 	if len(members) > 0 {
 		seen := make(map[string]struct{})
 		uniqueMembers := make([]string, 0, len(members))
@@ -1695,19 +1672,14 @@ func listTypeMembers(typ types.Type, pkg *packages.Package) []string {
 	}
 	return members
 }
-
-// logAnalysisErrors logs any non-fatal errors found during context analysis (internal).
 func logAnalysisErrors(errs []error) {
 	if len(errs) > 0 {
 		log.Printf("Context analysis completed with %d non-fatal error(s):", len(errs))
-		// Use errors.Join to format potentially nested errors nicely
 		log.Printf("  Analysis Errors: %v", errors.Join(errs...))
 	}
 }
-
-// addAnalysisError is a helper to log and store non-fatal analysis errors.
 func addAnalysisError(info *AstContextInfo, err error) {
-	if err != nil && info != nil { // Check info is not nil
+	if err != nil && info != nil {
 		log.Printf("Analysis Warning: %v", err)
 		info.AnalysisErrors = append(info.AnalysisErrors, err)
 	}
@@ -1731,7 +1703,7 @@ type Spinner struct {
 // NewSpinner creates a new Spinner. Exported Function.
 func NewSpinner() *Spinner {
 	return &Spinner{
-		chars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}, // Extended chars
+		chars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		index: 0,
 		// stopChan and doneChan initialized in Start
 	}
@@ -1744,46 +1716,41 @@ func (s *Spinner) Start(initialMessage string) {
 		s.mu.Unlock()
 		return // Already running
 	}
-	// Ensure channels are fresh if Start is called after Stop
 	s.stopChan = make(chan struct{})
-	s.doneChan = make(chan struct{}) // Initialize doneChan
-	s.message = initialMessage       // Set initial message
+	s.doneChan = make(chan struct{})
+	s.message = initialMessage
 	s.running = true
 	s.mu.Unlock()
 
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		// Signal completion and cleanup when goroutine exits
 		defer func() {
-			fmt.Print("\r\033[K") // Clear the line completely on stop
+			fmt.Print("\r\033[K") // Clear line on stop
 			s.mu.Lock()
 			s.running = false
 			s.mu.Unlock()
-			// Use non-blocking send in case Stop() already returned due to timeout
 			select {
-			case s.doneChan <- struct{}{}:
-			default:
+			case s.doneChan <- struct{}{}: // Signal done
+			default: // Avoid blocking if Stop already timed out
 			}
-			close(s.doneChan) // Signal that the goroutine has finished cleanup
+			close(s.doneChan)
 		}()
 
 		for {
 			select {
 			case <-s.stopChan:
-				return // Exit goroutine
+				return
 			case <-ticker.C:
 				s.mu.Lock()
-				// Check if running flag is still true before proceeding
 				if !s.running {
 					s.mu.Unlock()
 					return
 				}
 				char := s.chars[s.index]
-				msg := s.message // Read current message under lock
+				msg := s.message
 				s.index = (s.index + 1) % len(s.chars)
-				// Use carriage return (\r) and clear line (\033[K)
-				fmt.Printf("\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg) // Use exported constant
+				fmt.Printf("\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg)
 				s.mu.Unlock()
 			}
 		}
@@ -1794,7 +1761,6 @@ func (s *Spinner) Start(initialMessage string) {
 func (s *Spinner) UpdateMessage(newMessage string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Only update if spinner is actually running
 	if s.running {
 		s.message = newMessage
 	}
@@ -1803,26 +1769,22 @@ func (s *Spinner) UpdateMessage(newMessage string) {
 // Stop stops the spinner animation and waits for cleanup. Exported Method.
 func (s *Spinner) Stop() {
 	s.mu.Lock()
-	// Check running before trying to close channel
 	if !s.running {
 		s.mu.Unlock()
 		return
 	}
-	// Close stopChan safely if not already closed
 	select {
 	case <-s.stopChan: // Already closed
 	default:
 		close(s.stopChan)
 	}
-	doneChan := s.doneChan // Read doneChan under lock
+	doneChan := s.doneChan // Read under lock
 	s.mu.Unlock()          // Unlock before waiting
 
-	// Wait for the goroutine to signal completion (with a timeout)
 	if doneChan != nil {
 		select {
-		case <-doneChan:
-			// Goroutine finished cleanup
-		case <-time.After(300 * time.Millisecond): // Slightly longer timeout for safety
+		case <-doneChan: // Wait for goroutine to signal done
+		case <-time.After(300 * time.Millisecond):
 			log.Println("Warning: Timeout waiting for spinner goroutine cleanup")
 		}
 	}
@@ -1866,7 +1828,7 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 			lineEndOffset = file.Offset(lineEndPos)
 		}
 	}
-	if lineEndOffset == -1 {
+	if lineEndOffset == -1 { // Last line
 		lineEndOffset = file.Size()
 	}
 	startOffset := file.Offset(lineStartPos)
@@ -1892,7 +1854,7 @@ func readComments(code string) []string {
 			commentContent := strings.TrimPrefix(trimmedLine, "/*")
 			if strings.HasSuffix(commentContent, "*/") {
 				commentContent = strings.TrimSuffix(commentContent, "*/")
-				inBlockComment = false
+				inBlockComment = false // Single-line block comment
 			}
 			if comment := strings.TrimSpace(commentContent); comment != "" {
 				comments = append(comments, comment)

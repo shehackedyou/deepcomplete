@@ -105,7 +105,7 @@ func main() {
 	// --- Initialize DeepCompleter Service ---
 	// Use the final, merged configuration
 	// **FIX:** Correctly assign the single return value from NewDeepCompleterWithConfig
-	completer := deepcomplete.NewDeepCompleterWithConfig(config)
+	completer, _ := deepcomplete.NewDeepCompleterWithConfig(config)
 	// **FIX:** Remove the check for an error that is no longer returned
 	// if err != nil {
 	// 	log.Fatalf("%sError initializing completer: %v%s", deepcomplete.ColorRed, err, deepcomplete.ColorReset)
