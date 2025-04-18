@@ -1,4 +1,7 @@
-// deepcomplete/deepcomplete.go
+// Package deepcomplete provides core logic for local code completion using LLMs.
+// It includes components for interacting with LLMs (like Ollama), analyzing
+// Go code context using AST and type information, formatting prompts,
+// managing configuration, and caching analysis results.
 package deepcomplete
 
 import (
@@ -75,7 +78,8 @@ CODE TO FILL:
 	maxRetries       = 3
 	retryDelay       = 2 * time.Second
 	defaultMaxTokens = 256
-	// DefaultStop is exported for potential use in CLI default flags
+	// DefaultStop defines common stop sequences for code completion.
+	// Exported for potential use in CLI default flags.
 	DefaultStop        = "\n"
 	defaultTemperature = 0.1
 	// Default config file name
@@ -83,7 +87,7 @@ CODE TO FILL:
 	configDirName         = "deepcomplete" // Subdirectory name for config/data
 
 	// --- Cache Constants ---
-	// Increment cache schema version due to change in cached data structure
+	// cacheSchemaVersion helps invalidate cache if format changes.
 	cacheSchemaVersion = 2
 )
 
@@ -92,22 +96,23 @@ var (
 	cacheBucketName = []byte("AnalysisCache")
 )
 
-// Config holds the active configuration for the autocompletion. Exported.
+// Config holds the active configuration for the autocompletion service.
 type Config struct {
-	OllamaURL      string   `json:"ollama_url"`
-	Model          string   `json:"model"`
-	PromptTemplate string   `json:"-"` // Loaded internally, not from file
-	FimTemplate    string   `json:"-"` // Loaded internally, not from file
-	MaxTokens      int      `json:"max_tokens"`
-	Stop           []string `json:"stop"`
-	Temperature    float64  `json:"temperature"`
-	UseAst         bool     `json:"use_ast"` // Use AST and Type analysis (preferred)
-	UseFim         bool     `json:"use_fim"` // Use Fill-in-the-Middle prompting
-	MaxPreambleLen int      `json:"max_preamble_len"`
-	MaxSnippetLen  int      `json:"max_snippet_len"`
+	OllamaURL      string   `json:"ollama_url"`       // URL of the Ollama API endpoint.
+	Model          string   `json:"model"`            // Name of the Ollama model to use.
+	PromptTemplate string   `json:"-"`                // Template for standard completion prompts (loaded internally).
+	FimTemplate    string   `json:"-"`                // Template for Fill-in-the-Middle prompts (loaded internally).
+	MaxTokens      int      `json:"max_tokens"`       // Maximum number of tokens for the completion response.
+	Stop           []string `json:"stop"`             // Sequences where the model should stop generating text.
+	Temperature    float64  `json:"temperature"`      // Sampling temperature for the Ollama model (0-1).
+	UseAst         bool     `json:"use_ast"`          // Enable Abstract Syntax Tree (AST) and type analysis for richer context.
+	UseFim         bool     `json:"use_fim"`          // Use Fill-in-the-Middle prompting instead of standard completion.
+	MaxPreambleLen int      `json:"max_preamble_len"` // Max length in bytes for the AST/Type context preamble in the prompt.
+	MaxSnippetLen  int      `json:"max_snippet_len"`  // Max length in bytes for the code snippet part of the prompt.
 }
 
 // Validate checks if the configuration values are valid.
+// It logs warnings and applies defaults for some invalid numeric values.
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.OllamaURL) == "" {
 		return errors.New("ollama_url cannot be empty")
@@ -141,7 +146,8 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// FileConfig represents the structure of the JSON config file.
+// FileConfig represents the structure of the JSON config file for unmarshalling.
+// Pointers are used to distinguish between a field being absent and having a zero value.
 type FileConfig struct {
 	OllamaURL      *string   `json:"ollama_url"`
 	Model          *string   `json:"model"`
@@ -154,101 +160,106 @@ type FileConfig struct {
 	MaxSnippetLen  *int      `json:"max_snippet_len"`
 }
 
-// AstContextInfo holds structured information extracted from AST/Types analysis. Exported.
+// AstContextInfo holds structured information extracted from AST/Types analysis.
 // This struct is populated during analysis and used to build the prompt preamble.
-// It is NOT directly cached anymore.
+// It is NOT directly cached anymore; only derived data is cached.
 type AstContextInfo struct {
-	FilePath           string
-	CursorPos          token.Pos
-	PackageName        string
-	EnclosingFunc      *types.Func   // Function or method type object
-	EnclosingFuncNode  *ast.FuncDecl // Function or method AST node
-	ReceiverType       string        // Formatted receiver type if it's a method
-	EnclosingBlock     *ast.BlockStmt
-	Imports            []*ast.ImportSpec
-	CommentsNearCursor []string
-	IdentifierAtCursor *ast.Ident
-	IdentifierType     types.Type
-	IdentifierObject   types.Object
-	SelectorExpr       *ast.SelectorExpr
-	SelectorExprType   types.Type
-	CallExpr           *ast.CallExpr
-	CallExprFuncType   *types.Signature
-	CallArgIndex       int
-	ExpectedArgType    types.Type
-	CompositeLit       *ast.CompositeLit
-	CompositeLitType   types.Type
-	VariablesInScope   map[string]types.Object
-	PromptPreamble     string // Built during analysis OR retrieved from cache
-	AnalysisErrors     []error
+	FilePath           string                  // Absolute path to the analyzed file.
+	CursorPos          token.Pos               // Byte offset position of the cursor.
+	PackageName        string                  // Name of the package containing the file.
+	EnclosingFunc      *types.Func             // Type object for the enclosing function or method.
+	EnclosingFuncNode  *ast.FuncDecl           // AST node for the enclosing function or method.
+	ReceiverType       string                  // Formatted receiver type if it's a method (e.g., "(*MyType)").
+	EnclosingBlock     *ast.BlockStmt          // Innermost block statement containing the cursor.
+	Imports            []*ast.ImportSpec       // List of imports in the file.
+	CommentsNearCursor []string                // Relevant comments found near the cursor or associated node.
+	IdentifierAtCursor *ast.Ident              // Identifier AST node at the cursor, if any.
+	IdentifierType     types.Type              // Resolved type of the identifier at the cursor.
+	IdentifierObject   types.Object            // Resolved object (var, func, type, etc.) for the identifier.
+	SelectorExpr       *ast.SelectorExpr       // Selector expression (e.g., x.Y) at the cursor.
+	SelectorExprType   types.Type              // Resolved type of the expression being selected from (e.g., type of x).
+	CallExpr           *ast.CallExpr           // Call expression at the cursor.
+	CallExprFuncType   *types.Signature        // Resolved signature of the function being called.
+	CallArgIndex       int                     // Calculated index of the argument the cursor is likely positioned at (0-based).
+	ExpectedArgType    types.Type              // Expected type of the argument at the cursor position.
+	CompositeLit       *ast.CompositeLit       // Composite literal (struct, slice, map) at the cursor.
+	CompositeLitType   types.Type              // Resolved type of the composite literal.
+	VariablesInScope   map[string]types.Object // Map of identifiers (variables, constants, types, funcs) visible at the cursor position.
+	PromptPreamble     string                  // The final context string built from analysis OR retrieved from cache.
+	AnalysisErrors     []error                 // List of non-fatal errors encountered during analysis.
 }
 
-// SnippetContext holds the code prefix and suffix for prompting.
+// SnippetContext holds the code prefix and suffix relative to the cursor position.
 type SnippetContext struct {
-	Prefix   string
-	Suffix   string
-	FullLine string // The full line where the cursor is located
+	Prefix   string // Code from the start of the file up to the cursor.
+	Suffix   string // Code from the cursor to the end of the file.
+	FullLine string // The full line of code where the cursor is located.
 }
 
 // OllamaError defines a custom error for Ollama API issues.
 type OllamaError struct {
-	Message string
-	Status  int
+	Message string // Error message from Ollama or HTTP client.
+	Status  int    // HTTP status code, if available.
 }
 
 // Error implements the error interface for OllamaError.
 func (e *OllamaError) Error() string {
-	return fmt.Sprintf("Ollama error: %s (Status: %d)", e.Message, e.Status)
+	if e.Status != 0 {
+		return fmt.Sprintf("Ollama error: %s (Status: %d)", e.Message, e.Status)
+	}
+	return fmt.Sprintf("Ollama error: %s", e.Message)
 }
 
-// OllamaResponse represents the streaming response structure.
+// OllamaResponse represents the streaming response structure from Ollama's /api/generate.
 type OllamaResponse struct {
-	Response string `json:"response"`
-	Done     bool   `json:"done"`
-	Error    string `json:"error,omitempty"`
+	Response string `json:"response"`        // The generated text chunk.
+	Done     bool   `json:"done"`            // True if this is the final response chunk.
+	Error    string `json:"error,omitempty"` // Potential error message from Ollama within the stream.
 }
 
-// --- Cache Data Structures (Exportdata Fix) ---
+// --- Cache Data Structures ---
 
 // CachedAnalysisData holds the derived information extracted from analysis
 // that is needed to reconstruct the prompt preamble. This struct is gob-encoded
 // and stored in the cache.
 type CachedAnalysisData struct {
-	PackageName    string
-	PromptPreamble string
-	// Add other simple fields derived from AstContextInfo if needed directly
-	// from cache without re-analysis.
+	PackageName    string // Name of the package.
+	PromptPreamble string // The generated preamble string.
 }
 
 // CachedAnalysisEntry represents the structure stored in the bbolt database.
 // It includes metadata (hashes) and the gob-encoded analysis results.
 type CachedAnalysisEntry struct {
-	SchemaVersion   int
-	GoModHash       string
-	InputFileHashes map[string]string // Key: relative path from package dir, Value: SHA256 hash
-	AnalysisGob     []byte            // Gob-encoded CachedAnalysisData
+	SchemaVersion   int               // Cache format version for invalidation.
+	GoModHash       string            // Hash of the go.mod file.
+	InputFileHashes map[string]string // Hashes of relevant source files (key: relative path).
+	AnalysisGob     []byte            // Gob-encoded CachedAnalysisData.
 }
 
 // LSPPosition represents the 0-based line and character offset used by the Language Server Protocol.
+// Character offset is measured in UTF-16 code units.
 type LSPPosition struct {
-	Line      uint32 // 0-based line number
-	Character uint32 // 0-based UTF-16 code unit offset from the start of the line
+	Line      uint32 // 0-based line number.
+	Character uint32 // 0-based UTF-16 code unit offset from the start of the line.
 }
 
-// MemberKind defines the type of member (field or method). Restored.
+// MemberKind defines the type of member (field or method).
 type MemberKind string
 
 const (
-	FieldMember  MemberKind = "field"
+	// FieldMember indicates a struct field.
+	FieldMember MemberKind = "field"
+	// MethodMember indicates a method.
 	MethodMember MemberKind = "method"
-	OtherMember  MemberKind = "other"
+	// OtherMember indicates other kinds (e.g., built-in operations).
+	OtherMember MemberKind = "other"
 )
 
-// MemberInfo holds structured information about a type member. Restored.
+// MemberInfo holds structured information about a type member (field or method).
 type MemberInfo struct {
-	Name       string
-	Kind       MemberKind
-	TypeString string
+	Name       string     // Name of the field or method.
+	Kind       MemberKind // Kind of member (FieldMember, MethodMember).
+	TypeString string     // String representation of the member's type or signature.
 }
 
 // =============================================================================
@@ -256,12 +267,20 @@ type MemberInfo struct {
 // =============================================================================
 
 var (
-	ErrAnalysisFailed     = errors.New("code analysis failed")
-	ErrOllamaUnavailable  = errors.New("ollama API unavailable or returned server error")
-	ErrStreamProcessing   = errors.New("error processing LLM stream")
-	ErrConfig             = errors.New("configuration error")
-	ErrInvalidConfig      = errors.New("invalid configuration")
-	ErrCache              = errors.New("cache operation failed")
+	// ErrAnalysisFailed indicates that code analysis failed, potentially partially.
+	// It might wrap more specific errors. Check underlying errors for details.
+	ErrAnalysisFailed = errors.New("code analysis failed")
+	// ErrOllamaUnavailable indicates the Ollama API endpoint could not be reached or returned a server error.
+	ErrOllamaUnavailable = errors.New("ollama API unavailable or returned server error")
+	// ErrStreamProcessing indicates an error occurred while reading or processing the LLM's response stream.
+	ErrStreamProcessing = errors.New("error processing LLM stream")
+	// ErrConfig indicates an error occurred during configuration loading or validation.
+	ErrConfig = errors.New("configuration error")
+	// ErrInvalidConfig indicates that the provided or loaded configuration is invalid.
+	ErrInvalidConfig = errors.New("invalid configuration")
+	// ErrCache indicates a failure during a cache operation (read, write, delete).
+	ErrCache = errors.New("cache operation failed")
+	// ErrPositionConversion indicates a failure during LSP position to byte offset conversion.
 	ErrPositionConversion = errors.New("position conversion failed")
 )
 
@@ -271,18 +290,25 @@ var (
 
 // LLMClient defines the interface for interacting with the LLM API.
 type LLMClient interface {
+	// GenerateStream sends a prompt to the LLM and returns a reader for the streaming response.
 	GenerateStream(ctx context.Context, prompt string, config Config) (io.ReadCloser, error)
 }
 
-// Analyzer defines the interface for analyzing code context. Exported for testability.
+// Analyzer defines the interface for analyzing code context.
 type Analyzer interface {
+	// Analyze performs code analysis for the given file and cursor position.
+	// It returns structured context information and potentially non-fatal errors.
 	Analyze(ctx context.Context, filename string, line, col int) (*AstContextInfo, error)
+	// Close releases any resources held by the analyzer (e.g., cache database).
 	Close() error
+	// InvalidateCache removes cached data associated with a specific directory.
 	InvalidateCache(dir string) error
 }
 
-// PromptFormatter defines the interface for formatting the final prompt.
+// PromptFormatter defines the interface for formatting the final prompt sent to the LLM.
 type PromptFormatter interface {
+	// FormatPrompt combines the context preamble and code snippet into the final prompt string,
+	// applying necessary formatting and truncation based on the config.
 	FormatPrompt(contextPreamble string, snippetCtx SnippetContext, config Config) string
 }
 
@@ -291,7 +317,7 @@ type PromptFormatter interface {
 // =============================================================================
 
 var (
-	// DefaultConfig enables AST context by default. Exported.
+	// DefaultConfig provides default settings for the DeepCompleter service.
 	DefaultConfig = Config{
 		OllamaURL:      defaultOllamaURL,
 		Model:          defaultModel,
@@ -306,30 +332,39 @@ var (
 		MaxSnippetLen:  2048,
 	}
 
-	// Pastel color codes for terminal output. Exported.
-	ColorReset  = "\033[0m"
-	ColorGreen  = "\033[38;5;119m"
+	// ColorReset resets terminal color.
+	ColorReset = "\033[0m"
+	// ColorGreen defines a green color code for terminal output.
+	ColorGreen = "\033[38;5;119m"
+	// ColorYellow defines a yellow color code for terminal output.
 	ColorYellow = "\033[38;5;220m"
-	ColorBlue   = "\033[38;5;153m"
-	ColorRed    = "\033[38;5;203m"
-	ColorCyan   = "\033[38;5;141m"
+	// ColorBlue defines a blue color code for terminal output.
+	ColorBlue = "\033[38;5;153m"
+	// ColorRed defines a red color code for terminal output.
+	ColorRed = "\033[38;5;203m"
+	// ColorCyan defines a cyan color code for terminal output.
+	ColorCyan = "\033[38;5;141m"
 )
 
 // =============================================================================
 // Exported Helper Functions (e.g., for CLI)
 // =============================================================================
 
-// PrettyPrint prints colored text to the terminal. Exported for CLI use.
+// PrettyPrint prints colored text to the standard error stream.
+// Useful for status messages in CLI tools to avoid interfering with stdout.
 func PrettyPrint(color, text string) {
-	fmt.Print(color, text, ColorReset)
+	// Note: Changed to Fprintf(os.Stderr, ...) to separate UI messages from potential completion output.
+	fmt.Fprint(os.Stderr, color, text, ColorReset)
 }
 
 // =============================================================================
 // Configuration Loading
 // =============================================================================
 
-// LoadConfig loads configuration from standard locations, merges with defaults,
-// and attempts to write a default config file if none exists.
+// LoadConfig loads configuration from standard locations (XDG config, ~/.config),
+// merges with defaults, and attempts to write a default config file if none exists.
+// It returns the final configuration and potentially non-fatal errors encountered
+// during loading or default file writing, wrapped in ErrConfig.
 func LoadConfig() (Config, error) {
 	cfg := DefaultConfig
 	var loadedFromFile bool
@@ -354,14 +389,13 @@ func LoadConfig() (Config, error) {
 		loadedFromFile = loaded
 		if loadedFromFile && loadErr == nil {
 			log.Printf("Loaded config from %s", primaryPath)
-		} else if loadedFromFile && loadErr != nil {
+		} else if loadedFromFile {
 			log.Printf("Attempted load from %s but failed.", primaryPath)
 		}
 	}
 
 	// Try secondary path ONLY if primary was not found OR if primary existed but failed reading/parsing
 	primaryNotFound := len(loadErrors) > 0 && errors.Is(loadErrors[len(loadErrors)-1], os.ErrNotExist)
-
 	if !loadedFromFile && secondaryPath != "" && (primaryNotFound || primaryPath == "") {
 		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg)
 		if loadErr != nil {
@@ -375,7 +409,7 @@ func LoadConfig() (Config, error) {
 		loadedFromFile = loaded
 		if loadedFromFile && loadErr == nil {
 			log.Printf("Loaded config from %s", secondaryPath)
-		} else if loadedFromFile && loadErr != nil {
+		} else if loadedFromFile {
 			log.Printf("Attempted load from %s but failed.", secondaryPath)
 		}
 	}
@@ -442,7 +476,7 @@ func getConfigPaths() (primary string, secondary string, err error) {
 	}
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
-		if primary == "" && cfgErr != nil { // Fallback path using HOME if XDG fails
+		if primary == "" && cfgErr != nil {
 			primary = filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
 			log.Printf("Using fallback primary config path: %s", primary)
 		}
@@ -450,7 +484,7 @@ func getConfigPaths() (primary string, secondary string, err error) {
 	} else {
 		log.Printf("Warning: Could not determine user home directory: %v", homeErr)
 	}
-	if primary == "" && secondary == "" { // Report error only if BOTH failed
+	if primary == "" && secondary == "" {
 		err = fmt.Errorf("cannot determine config/home directories: config error: %v; home error: %v", cfgErr, homeErr)
 	}
 	return primary, secondary, err
@@ -469,13 +503,10 @@ func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
 		log.Printf("Warning: Config file exists but is empty: %s", path)
 		return true, nil
 	}
-
 	var fileCfg FileConfig
 	if err := json.Unmarshal(data, &fileCfg); err != nil {
 		return true, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
 	}
-
-	// Merge fields if they exist in the file config
 	if fileCfg.OllamaURL != nil {
 		cfg.OllamaURL = *fileCfg.OllamaURL
 	}
@@ -503,7 +534,6 @@ func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
 	if fileCfg.MaxSnippetLen != nil {
 		cfg.MaxSnippetLen = *fileCfg.MaxSnippetLen
 	}
-
 	return true, nil
 }
 
@@ -525,15 +555,9 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 		MaxSnippetLen  int      `json:"max_snippet_len"`
 	}
 	expCfg := ExportableConfig{
-		OllamaURL:      defaultConfig.OllamaURL,
-		Model:          defaultConfig.Model,
-		MaxTokens:      defaultConfig.MaxTokens,
-		Stop:           defaultConfig.Stop,
-		Temperature:    defaultConfig.Temperature,
-		UseAst:         defaultConfig.UseAst,
-		UseFim:         defaultConfig.UseFim,
-		MaxPreambleLen: defaultConfig.MaxPreambleLen,
-		MaxSnippetLen:  defaultConfig.MaxSnippetLen,
+		OllamaURL: defaultConfig.OllamaURL, Model: defaultConfig.Model, MaxTokens: defaultConfig.MaxTokens,
+		Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, UseAst: defaultConfig.UseAst,
+		UseFim: defaultConfig.UseFim, MaxPreambleLen: defaultConfig.MaxPreambleLen, MaxSnippetLen: defaultConfig.MaxSnippetLen,
 	}
 	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
 	if err != nil {
@@ -1062,6 +1086,7 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 // =============================================================================
 // DeepCompleter Service
 // =============================================================================
+// DeepCompleter orchestrates the code completion process.
 type DeepCompleter struct {
 	client    LLMClient
 	analyzer  Analyzer
@@ -1069,6 +1094,8 @@ type DeepCompleter struct {
 	config    Config
 }
 
+// NewDeepCompleter creates a new DeepCompleter service with default components
+// and configuration loaded from standard locations.
 func NewDeepCompleter() (*DeepCompleter, error) {
 	cfg, configErr := LoadConfig()
 	if configErr != nil && !errors.Is(configErr, ErrConfig) {
@@ -1101,6 +1128,7 @@ func NewDeepCompleter() (*DeepCompleter, error) {
 	return dc, nil
 }
 
+// NewDeepCompleterWithConfig creates a new DeepCompleter service with the provided configuration.
 func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
@@ -1121,6 +1149,7 @@ func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 	}, nil
 }
 
+// Close cleans up resources used by DeepCompleter, specifically the analyzer's cache.
 func (dc *DeepCompleter) Close() error {
 	if dc.analyzer != nil {
 		return dc.analyzer.Close()
@@ -1128,6 +1157,8 @@ func (dc *DeepCompleter) Close() error {
 	return nil
 }
 
+// GetCompletion provides completion for a raw code snippet without performing AST analysis.
+// This is a non-streaming operation.
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
 	log.Println("DeepCompleter.GetCompletion called for basic prompt.")
 	contextPreamble := "// Provide Go code completion below."
@@ -1153,6 +1184,8 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 	return strings.TrimSpace(buffer.String()), nil
 }
 
+// GetCompletionStreamFromFile performs context analysis (using AST/types or cache)
+// for the given file and cursor position, then streams the completion from the LLM to the provided writer.
 func (dc *DeepCompleter) GetCompletionStreamFromFile(
 	ctx context.Context,
 	filename string,
@@ -1219,9 +1252,9 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(
 			}
 			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, apiErr)
 		}
-		PrettyPrint(ColorGreen, "Completion:\n")
+		PrettyPrint(ColorGreen, "Completion:\n") // Print header before streaming to stderr
 		streamErr := streamCompletion(apiCtx, reader, w)
-		fmt.Fprintln(w) // Add newline after stream
+		fmt.Fprintln(w) // Add newline after stream to stdout
 		if streamErr != nil {
 			if errors.Is(streamErr, context.DeadlineExceeded) || errors.Is(streamErr, context.Canceled) {
 				return streamErr
@@ -2699,8 +2732,8 @@ func (s *Spinner) Start(initialMessage string) {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
-		return // Already running
-	}
+		return
+	} // Already running
 	s.stopChan = make(chan struct{})
 	s.doneChan = make(chan struct{})
 	s.message = initialMessage
@@ -2710,36 +2743,35 @@ func (s *Spinner) Start(initialMessage string) {
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		defer func() {
+		defer func() { // Cleanup function
 			s.mu.Lock()
 			isRunning := s.running
-			s.running = false // Mark as not running *before* potentially clearing line
+			s.running = false
 			s.mu.Unlock()
 			if isRunning {
-				fmt.Fprintf(os.Stderr, "\r\033[K") // Clear line on stop only if it was running
-			}
+				fmt.Fprintf(os.Stderr, "\r\033[K")
+			} // Clear line on stop
 			select {
-			case s.doneChan <- struct{}{}: // Signal done
-			default: // Avoid blocking if Stop already timed out
-			}
-			close(s.doneChan) // Close after signaling
+			case s.doneChan <- struct{}{}:
+			default:
+			} // Signal done
+			close(s.doneChan)
 		}()
 
 		for {
 			select {
 			case <-s.stopChan:
-				return // Exit goroutine when stopChan is closed
+				return // Exit goroutine
 			case <-ticker.C:
 				s.mu.Lock()
-				if !s.running { // Check running flag inside loop as well
+				if !s.running {
 					s.mu.Unlock()
-					return // Exit if stopped between ticks
-				}
+					return
+				} // Exit if stopped between ticks
 				char := s.chars[s.index]
 				msg := s.message
 				s.index = (s.index + 1) % len(s.chars)
-				// Use stderr for spinner to avoid interfering with completion output on stdout
-				fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg)
+				fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg) // Print to stderr
 				s.mu.Unlock()
 			}
 		}
@@ -2750,7 +2782,7 @@ func (s *Spinner) Start(initialMessage string) {
 func (s *Spinner) UpdateMessage(newMessage string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running { // Only update if actually running
+	if s.running {
 		s.message = newMessage
 	}
 }
@@ -2760,26 +2792,24 @@ func (s *Spinner) Stop() {
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
-		return // Already stopped
-	}
+		return
+	} // Already stopped
 	select {
-	case <-s.stopChan: // Already closed? Should not happen if running=true
+	case <-s.stopChan:
 	default:
-		close(s.stopChan) // Close channel to signal goroutine
-	}
-	doneChan := s.doneChan // Read under lock
-	s.mu.Unlock()          // Unlock before potentially waiting
+		close(s.stopChan)
+	} // Close stop channel
+	doneChan := s.doneChan
+	s.mu.Unlock()
 
-	if doneChan != nil {
-		// Wait with timeout for the goroutine to finish cleanup
+	if doneChan != nil { // Wait for goroutine cleanup with timeout
 		select {
-		case <-doneChan: // Wait for goroutine to signal done
+		case <-doneChan: // Wait for signal
 		case <-time.After(500 * time.Millisecond):
 			log.Println("Warning: Timeout waiting for spinner goroutine cleanup")
 		}
 	}
-	// Ensure line is cleared finally, regardless of goroutine state after timeout
-	fmt.Fprintf(os.Stderr, "\r\033[K")
+	fmt.Fprintf(os.Stderr, "\r\033[K") // Ensure line is cleared
 }
 
 // ============================================================================
