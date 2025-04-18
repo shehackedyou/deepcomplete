@@ -116,6 +116,8 @@ func main() { // Line 5
 
 // TestAnalyzeCodeContext_DirectParse tests basic context extraction by directly parsing a string.
 // This avoids the complexity of setting up go/packages for simple cases but won't have type info.
+// NOTE: With the cache change, this test might behave differently if caching were enabled,
+// as a cache hit would skip analysis steps. Caching is disabled by default in tests unless explicitly set up.
 func TestAnalyzeCodeContext_DirectParse(t *testing.T) {
 	content := `package main
 
@@ -149,23 +151,25 @@ func MyFunction(arg1 int, arg2 string) (res int, err error) {
 	}
 
 	// Create analyzer instance (using the internal struct directly for testing)
-	analyzer := NewGoPackagesAnalyzer() // Use exported constructor
-	// --- Ensure analyzer resources are closed (Step 24 Change) ---
+	// Explicitly disable caching for this direct parse test by not providing a DB path
+	// (NewGoPackagesAnalyzer handles nil DB gracefully)
+	analyzer := NewGoPackagesAnalyzer()
+	// Ensure analyzer resources are closed
 	t.Cleanup(func() {
 		t.Log("Closing analyzer in test cleanup...") // Add log for verification
 		if err := analyzer.Close(); err != nil {
 			t.Errorf("Error closing analyzer: %v", err)
 		}
 	})
-	// ---
 
 	// --- Test Case: Inside MyFunction (general) ---
 	t.Run("Inside MyFunction", func(t *testing.T) {
 		line, col := 18, 2 // Cursor position within the function body ("// Cursor is here")
 		ctx := context.Background()
 
-		// Call Analyze method - it will use the direct parse fallback as no go.mod exists
+		// Call Analyze method - it will use packages.Load (no cache involved here)
 		// We expect non-fatal errors related to package loading / type info missing
+		// because there's no go.mod in the temp dir.
 		info, analysisErr := analyzer.Analyze(ctx, tmpFilename, line, col)
 
 		// Check for fatal errors first (should not happen if file exists and pos is valid)
@@ -576,9 +580,215 @@ func TestFindIdentifierAtCursor(t *testing.T) {
 }
 
 func TestGoPackagesAnalyzer_Cache(t *testing.T) {
-	// TODO: Implement tests for bbolt caching (Step 23)
+	// TODO: Implement tests for bbolt caching
 	// Needs setup with temp DB file (ensure path cleanup), multiple Analyze calls on same dir,
 	// checking for cache hit logs, modifying files, checking for invalidation.
+	// Need to test the new caching strategy (caching derived preamble data via gob).
 	// Remember to call analyzer.Close() via t.Cleanup() in these tests.
-	t.Skip("GoPackagesAnalyzer caching tests not yet implemented")
+	t.Skip("GoPackagesAnalyzer caching tests not yet implemented (needs update for gob caching)")
+}
+
+// ============================================================================
+// LSP Position Conversion Tests (Added in Step 1)
+// ============================================================================
+
+func TestLSPPositionConversion(t *testing.T) {
+	// --- Test Utf16OffsetToBytes ---
+	t.Run("TestUtf16OffsetToBytes", func(t *testing.T) {
+		tests := []struct {
+			name           string
+			lineContent    string
+			utf16Offset    int
+			wantByteOffset int
+			wantErr        bool
+			wantErrType    error // Specific error type to check
+		}{
+			// Basic ASCII
+			{"ASCII start", "hello", 0, 0, false, nil},
+			{"ASCII middle", "hello", 2, 2, false, nil},
+			{"ASCII end", "hello", 5, 5, false, nil},
+			{"ASCII past end", "hello", 6, 5, true, ErrPositionConversion},  // Error expected, offset clamped by wantByteOffset
+			{"ASCII negative", "hello", -1, 0, true, ErrPositionConversion}, // Error expected
+
+			// Multi-byte UTF-8 (2 bytes)
+			{"2byte UTF-8 start", "héllo", 0, 0, false, nil},
+			{"2byte UTF-8 before", "héllo", 1, 1, false, nil}, // Before 'é'
+			{"2byte UTF-8 after", "héllo", 2, 3, false, nil},  // After 'é' (1 UTF-16 unit)
+			{"2byte UTF-8 middle", "héllo", 4, 5, false, nil}, // Before 'o'
+			{"2byte UTF-8 end", "héllo", 5, 6, false, nil},
+			{"2byte UTF-8 past end", "héllo", 6, 6, true, ErrPositionConversion},
+
+			// Multi-byte UTF-8 (3 bytes)
+			{"3byte UTF-8 start", "€ euro", 0, 0, false, nil},
+			{"3byte UTF-8 after", "€ euro", 1, 3, false, nil}, //  After '€' (1 UTF-16 unit)
+			{"3byte UTF-8 middle", "€ euro", 3, 5, false, nil}, // Before 'e'
+			{"3byte UTF-8 end", "€ euro", 6, 8, false, nil},
+			{"3byte UTF-8 past end", "€ euro", 7, 8, true, ErrPositionConversion},
+
+			// Multi-byte UTF-8 (4 bytes - Surrogate Pair in UTF-16)
+			{"4byte UTF-8 start", "😂笑", 0, 0, false, nil},
+			{"4byte UTF-8 middle (within surrogate)", "😂笑", 1, 0, false, nil}, // Offset 1 falls *within* the 2 UTF-16 units of 😂
+			{"4byte UTF-8 after surrogate", "😂笑", 2, 4, false, nil},          // Af ter 😂 (2 UTF-16 units)
+			{"4byte UTF-8 after second char", "😂笑", 3, 7, false, nil},         // After 笑 (1 UTF-16 unit)
+			{"4byte UTF-8 end", "😂笑", 3, 7, false, nil}, // No                      te: end is same as after second char for UTF-16 offset
+			{"4byte UTF-8 past end", "😂笑", 4, 7, true, ErrPositionConversion},
+
+			// Mixed
+			{"Mixed start", "a é 😂 €", 0, 0, false, nil},
+			{"Mixed after a", "a é 😂 €", 1, 1, false, nil},
+			{"Mixed after space", "a é 😂 €", 2, 2, false, nil},
+			{"Mixed after é", "a é 😂 €", 3, 4, false, nil}, // é is 1 utf16
+			{"Mixed after space 2", "a é 😂 €", 4, 5, false, nil},
+			{"Mixed within 😂", "a é 😂 €", 5, 5, false, nil}, // Within 😂 surrogate
+			{"Mixed after 😂", "a é 😂 €", 6, 9, false, nil}, // After  😂 (2 utf16)
+			{"Mixed after space 3", "a é 😂 €", 7, 10, false, nil},
+			{"Mixed after €", "a é 😂 €", 8, 13, false, nil}, // After € (1 utf16)
+			{"Mixed end", "a é 😂 €", 8, 13, false, nil},
+			{"Mixed past end", "a é 😂 €", 9, 13, true, ErrPositionConversion},
+
+			// Empty line
+			{"Empty line start", "", 0, 0, false, nil},
+			{"Empty line past end", "", 1, 0, true, ErrPositionConversion},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				gotByteOffset, err := Utf16OffsetToBytes([]byte(tt.lineContent), tt.utf16Offset)
+
+				if (err != nil) != tt.wantErr {
+					t.Errorf("Utf16OffsetToBytes() error = %v, wantErr %v", err, tt.wantErr)
+					return // Stop if error status differs
+				}
+				// Check specific error type if expecting an error
+				if tt.wantErr && tt.wantErrType != nil {
+					if !errors.Is(err, tt.wantErrType) {
+						t.Errorf("Utf16OffsetToBytes() error type = %T, want error wrapping %T", err, tt.wantErrType)
+					}
+				}
+				// Check byte offset only if error status matches expectation
+				// Note: If wantErr is true, Utf16OffsetToBytes might return a clamped offset,
+				// so we check against wantByteOffset even on error cases where clamping occurs.
+				if gotByteOffset != tt.wantByteOffset {
+					t.Errorf("Utf16OffsetToBytes() gotByteOffset = %d, want %d", gotByteOffset, tt.wantByteOffset)
+				}
+			})
+		}
+	})
+
+	// --- Test LspPositionToBytePosition ---
+	t.Run("TestLspPositionToBytePosition", func(t *testing.T) {
+		content := `line one
+two é 😂
+three €
+` // includes trailing newline
+
+		tests := []struct {
+			name        string
+			content     []byte
+			lspPos      LSPPosition
+			wantLine    int // 1-based Go line
+			wantCol     int // 1-based Go column (bytes)
+			wantByteOff int // 0-based byte offset
+			wantErr     bool
+			wantErrType error  // Specific error type to check (e.g., ErrPositionConversion)
+			wantWarnLog string // Substring expected in log output (for clamping warnings)
+		}{
+			// Basic cases
+			{"Start of file", []byte(content), LSPPosition{Line: 0, Character: 0}, 1, 1, 0, false, nil, ""},
+			{"Middle line 1", []byte(content), LSPPosition{Line: 0, Character: 5}, 1, 6, 5, false, nil, ""}, // After ' '
+			{"End line 1", []byte(content), LSPPosition{Line: 0, Character: 8}, 1, 9, 8, false, nil, ""},    // End of 'one'
+
+			// Line 2 with unicode
+			{"Start line 2", []byte(content), LSPPosition{Line: 1, Character: 0}, 2, 1, 9, false, nil, ""},                 // Start of 'two'
+			{"Middle line 2 (before é)", []byte(content), LSPPosition{Line: 1, Character: 4}, 2, 5, 13, false, nil, ""},    // After ' ' before 'é'
+			{"Middle line 2 (after é)", []byte(content), LSPPosition{Line: 1, Character: 5}, 2, 7, 15, false, nil, ""},     // After 'é' (1 utf16 unit, 2 bytes)
+			{"Middle line 2 (after space)", []byte(content), LSPPosition{Line: 1, Character: 6}, 2, 8, 16, false, nil, ""}, // After ' ' before 😂
+			{"Middle line 2 (within 😂)", []byte(content), LSPPosition{Line: 1, Character: 7}, 2, 8, 16, false, nil, ""},    // Within 😂 surrogate pair
+			{"Middle line 2 (after 😂)", []byte(content), LSPPosition{Line: 1, Character: 8}, 2, 12, 20, false, nil, ""},    // After 😂 (2 utf16 units, 4 bytes)
+			{"End line 2", []byte(content), LSPPosition{Line: 1, Character: 8}, 2, 12, 20, false, nil, ""},                 // End of 😂
+
+			// Line 3 with unicode
+			{"Start line 3", []byte(content), LSPPosition{Line: 2, Character: 0}, 3, 1, 21, false, nil, ""},                // Start of 'three'
+			{"Middle line 3 (after space)", []byte(content), LSPPosition{Line: 2, Character: 6}, 3, 7, 27, false, nil, ""}, // After ' ' before '€'
+			{"Middle line 3 (after €)", []byte(content), LSPPosition{Line: 2, Character: 7}, 3, 10, 30, false, nil, ""},    // After '€' (1 utf16 unit, 3 bytes)
+			{"End line 3", []byte(content), LSPPosition{Line: 2, Character: 7}, 3, 10, 30, false, nil, ""},                 // End of '€'
+
+			// Line 4 (empty line after content due to trailing newline)
+			{"Start empty line 4", []byte(content), LSPPosition{Line: 3, Character: 0}, 4, 1, 31, false, nil, ""}, // Start of the line after the last newline
+
+			// Edge cases and errors
+			{"Nil content", nil, LSPPosition{Line: 0, Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""},
+			{"Empty content", []byte(""), LSPPosition{Line: 0, Character: 0}, 1, 1, 0, false, nil, ""},                                // Start of empty file is valid
+			{"Empty content invalid char", []byte(""), LSPPosition{Line: 0, Character: 1}, 0, 0, -1, true, ErrPositionConversion, ""}, // Char > 0 on empty line
+			{"Empty content invalid line", []byte(""), LSPPosition{Line: 1, Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""}, // Line > 0 on empty file
+
+			{"Negative line", []byte(content), LSPPosition{Line: uint32(int32(-1)), Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""}, // Simulate negative line via cast
+			{"Negative char", []byte(content), LSPPosition{Line: 0, Character: uint32(int32(-1))}, 0, 0, -1, true, ErrPositionConversion, ""}, // Simulate negative char via cast
+
+			{"Line past end", []byte(content), LSPPosition{Line: 4, Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""},              // Line 4 doesn't exist (only 0-3)
+			{"Char past end line 1 (Clamps)", []byte(content), LSPPosition{Line: 0, Character: 10}, 1, 9, 8, false, nil, "Clamping"},       // Clamp char past 'one' (utf16 offset 10 > len 8) -> byte offset 8 (end), col 9
+			{"Char past end line 2 (Clamps)", []byte(content), LSPPosition{Line: 1, Character: 9}, 2, 12, 20, false, nil, "Clamping"},      // Clamp char past '😂' (utf16 offset 9 > len 8) -> byte offset 20 (end), col 12
+			{"Char past end line 3 (Clamps)", []byte(content), LSPPosition{Line: 2, Character: 8}, 3, 10, 30, false, nil, "Clamping"},      // Clamp char past '€' (utf16 offset 8 > len 7) -> byte offset 30 (end), col 10
+			{"Char past end empty line 4", []byte(content), LSPPosition{Line: 3, Character: 1}, 0, 0, -1, true, ErrPositionConversion, ""}, // Char > 0 on empty line
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				// Capture log output for checking warnings
+				var logBuf bytes.Buffer
+				// Use a test-specific logger temporarily
+				testLogger := log.New(&logBuf, "TEST: ", log.Lshortfile)
+				// Swap std logger, restore after test
+				oldLogger := log.Default() // Get current default logger
+				log.SetOutput(testLogger.Writer())
+				log.SetFlags(testLogger.Flags())
+				log.SetPrefix(testLogger.Prefix())
+				t.Cleanup(func() {
+					// Restore previous logger settings
+					log.SetOutput(oldLogger.Writer())
+					log.SetFlags(oldLogger.Flags())
+					log.SetPrefix(oldLogger.Prefix())
+				})
+
+				// Call the function under test
+				gotLine, gotCol, gotByteOff, err := LspPositionToBytePosition(tt.content, tt.lspPos)
+
+				// Check error status
+				if (err != nil) != tt.wantErr {
+					t.Errorf("LspPositionToBytePosition() error = %v, wantErr %v", err, tt.wantErr)
+					return // Stop checking other values if error status is wrong
+				}
+
+				// Check specific error type if specified
+				if tt.wantErr && tt.wantErrType != nil {
+					if !errors.Is(err, tt.wantErrType) {
+						t.Errorf("LspPositionToBytePosition() error type = %T, want error wrapping %T", err, tt.wantErrType)
+					}
+				}
+
+				// Check returned values only if error status matches expectation
+				if (err != nil) == tt.wantErr {
+					if gotLine != tt.wantLine {
+						t.Errorf("LspPositionToBytePosition() gotLine = %d, want %d", gotLine, tt.wantLine)
+					}
+					if gotCol != tt.wantCol {
+						t.Errorf("LspPositionToBytePosition() gotCol = %d, want %d", gotCol, tt.wantCol)
+					}
+					if gotByteOff != tt.wantByteOff {
+						t.Errorf("LspPositionToBytePosition() gotByteOff = %d, want %d", gotByteOff, tt.wantByteOff)
+					}
+				}
+
+				// Check log output for expected warnings (e.g., clamping)
+				logOutput := logBuf.String()
+				if tt.wantWarnLog != "" && !strings.Contains(logOutput, tt.wantWarnLog) {
+					t.Errorf("LspPositionToBytePosition() log output missing expected warning containing %q. Got:\n%s", tt.wantWarnLog, logOutput)
+				}
+				if tt.wantWarnLog == "" && strings.Contains(logOutput, "Warning:") {
+					// Only fail if an *unexpected* warning occurred
+					t.Errorf("LspPositionToBytePosition() logged unexpected warning. Got:\n%s", logOutput)
+				}
+			})
+		}
+	})
 }
