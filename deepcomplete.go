@@ -278,10 +278,30 @@ var (
 	ErrConfig = errors.New("configuration error")
 	// ErrInvalidConfig indicates that the provided or loaded configuration is invalid.
 	ErrInvalidConfig = errors.New("invalid configuration")
-	// ErrCache indicates a failure during a cache operation (read, write, delete).
+
+	// --- Cache Errors (Step 3) ---
+	// ErrCache indicates a general failure during a cache operation (read, write, delete).
 	ErrCache = errors.New("cache operation failed")
-	// ErrPositionConversion indicates a failure during LSP position to byte offset conversion.
+	// ErrCacheRead indicates a failure during reading from the cache.
+	ErrCacheRead = errors.New("cache read failed")
+	// ErrCacheWrite indicates a failure during writing to the cache.
+	ErrCacheWrite = errors.New("cache write failed")
+	// ErrCacheDecode indicates a failure decoding data read from the cache.
+	ErrCacheDecode = errors.New("cache decode failed")
+	// ErrCacheEncode indicates a failure encoding data for writing to the cache.
+	ErrCacheEncode = errors.New("cache encode failed")
+	// ErrCacheHash indicates a failure calculating file hashes for cache validation.
+	ErrCacheHash = errors.New("cache hash calculation failed")
+
+	// --- Position Conversion Errors (Step 3) ---
+	// ErrPositionConversion indicates a general failure during LSP position to byte offset conversion.
 	ErrPositionConversion = errors.New("position conversion failed")
+	// ErrInvalidPositionInput indicates that the input line or character position was invalid (e.g., negative).
+	ErrInvalidPositionInput = errors.New("invalid input position")
+	// ErrPositionOutOfRange indicates that the input position is outside the valid range of the document content.
+	ErrPositionOutOfRange = errors.New("position out of range")
+	// ErrInvalidUTF8 indicates invalid UTF-8 sequence encountered during conversion.
+	ErrInvalidUTF8 = errors.New("invalid utf-8 sequence")
 )
 
 // =============================================================================
@@ -351,9 +371,7 @@ var (
 // =============================================================================
 
 // PrettyPrint prints colored text to the standard error stream.
-// Useful for status messages in CLI tools to avoid interfering with stdout.
 func PrettyPrint(color, text string) {
-	// Note: Changed to Fprintf(os.Stderr, ...) to separate UI messages from potential completion output.
 	fmt.Fprint(os.Stderr, color, text, ColorReset)
 }
 
@@ -363,8 +381,6 @@ func PrettyPrint(color, text string) {
 
 // LoadConfig loads configuration from standard locations (XDG config, ~/.config),
 // merges with defaults, and attempts to write a default config file if none exists.
-// It returns the final configuration and potentially non-fatal errors encountered
-// during loading or default file writing, wrapped in ErrConfig.
 func LoadConfig() (Config, error) {
 	cfg := DefaultConfig
 	var loadedFromFile bool
@@ -476,7 +492,7 @@ func getConfigPaths() (primary string, secondary string, err error) {
 	}
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
-		if primary == "" && cfgErr != nil {
+		if primary == "" && cfgErr != nil { // Fallback path using HOME if XDG fails
 			primary = filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
 			log.Printf("Using fallback primary config path: %s", primary)
 		}
@@ -484,7 +500,7 @@ func getConfigPaths() (primary string, secondary string, err error) {
 	} else {
 		log.Printf("Warning: Could not determine user home directory: %v", homeErr)
 	}
-	if primary == "" && secondary == "" {
+	if primary == "" && secondary == "" { // Report error only if BOTH failed
 		err = fmt.Errorf("cannot determine config/home directories: config error: %v; home error: %v", cfgErr, homeErr)
 	}
 	return primary, secondary, err
@@ -555,9 +571,15 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 		MaxSnippetLen  int      `json:"max_snippet_len"`
 	}
 	expCfg := ExportableConfig{
-		OllamaURL: defaultConfig.OllamaURL, Model: defaultConfig.Model, MaxTokens: defaultConfig.MaxTokens,
-		Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, UseAst: defaultConfig.UseAst,
-		UseFim: defaultConfig.UseFim, MaxPreambleLen: defaultConfig.MaxPreambleLen, MaxSnippetLen: defaultConfig.MaxSnippetLen,
+		OllamaURL:      defaultConfig.OllamaURL,
+		Model:          defaultConfig.Model,
+		MaxTokens:      defaultConfig.MaxTokens,
+		Stop:           defaultConfig.Stop,
+		Temperature:    defaultConfig.Temperature,
+		UseAst:         defaultConfig.UseAst,
+		UseFim:         defaultConfig.UseFim,
+		MaxPreambleLen: defaultConfig.MaxPreambleLen,
+		MaxSnippetLen:  defaultConfig.MaxSnippetLen,
 	}
 	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
 	if err != nil {
@@ -575,18 +597,12 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 // =============================================================================
 
 // --- Ollama Client ---
+type httpOllamaClient struct{ httpClient *http.Client }
 
-// httpOllamaClient implements LLMClient using standard HTTP calls.
-type httpOllamaClient struct {
-	httpClient *http.Client
-}
-
-// newHttpOllamaClient creates a new client for Ollama interaction. (unexported)
 func newHttpOllamaClient() *httpOllamaClient {
 	return &httpOllamaClient{httpClient: &http.Client{Timeout: 90 * time.Second}}
 }
 
-// GenerateStream handles the HTTP request to the Ollama generate endpoint.
 func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, config Config) (io.ReadCloser, error) {
 	base := strings.TrimSuffix(config.OllamaURL, "/")
 	endpointPath := "/api/generate"
@@ -652,14 +668,11 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 }
 
 // --- Code Analyzer (bbolt implementation) ---
-
-// GoPackagesAnalyzer implements Analyzer using go/packages and bbolt cache.
 type GoPackagesAnalyzer struct {
 	db *bbolt.DB
 	mu sync.Mutex
 }
 
-// NewGoPackagesAnalyzer creates a new Go code analyzer, opening the bbolt DB.
 func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 	dbPath := ""
 	userCacheDir, err := os.UserCacheDir()
@@ -701,7 +714,6 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 	return &GoPackagesAnalyzer{db: db}
 }
 
-// Close closes the underlying bbolt database.
 func (a *GoPackagesAnalyzer) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -714,7 +726,6 @@ func (a *GoPackagesAnalyzer) Close() error {
 	return nil
 }
 
-// Analyze parses the file, performs type checking (potentially using cache for preamble), and extracts context.
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line, col int) (info *AstContextInfo, analysisErr error) {
 	info = &AstContextInfo{
 		FilePath:         filename,
@@ -756,7 +767,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 		dbErr := a.db.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(cacheBucketName)
 			if b == nil {
-				return fmt.Errorf("%w: cache bucket %s not found during View", ErrCache, string(cacheBucketName))
+				return fmt.Errorf("%w: cache bucket %s not found during View", ErrCacheRead, string(cacheBucketName))
 			}
 			valBytes := b.Get(cacheKey)
 			if valBytes == nil {
@@ -767,7 +778,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			decoder := gob.NewDecoder(bytes.NewReader(valBytes))
 			if err := decoder.Decode(&decoded); err != nil {
 				log.Printf("Warning: Failed to gob-decode cached entry header for key %s: %v. Treating as miss.", string(cacheKey), err)
-				return nil
+				return fmt.Errorf("%w: %w", ErrCacheDecode, err)
 			}
 			if decoded.SchemaVersion != cacheSchemaVersion {
 				log.Printf("Warning: Cache data for key %s has old schema version %d (want %d). Ignoring.", string(cacheKey), decoded.SchemaVersion, cacheSchemaVersion)
@@ -776,9 +787,9 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			cachedEntry = &decoded
 			return nil
 		})
-		if dbErr != nil {
+		if dbErr != nil && !errors.Is(dbErr, ErrCacheDecode) {
 			log.Printf("Warning: Error reading from bbolt cache: %v", dbErr)
-			addAnalysisError(info, fmt.Errorf("%w: read error: %w", ErrCache, dbErr))
+			addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheRead, dbErr))
 		}
 		log.Printf("DEBUG: Cache read attempt took %v", time.Since(readStart))
 	} else {
@@ -790,22 +801,23 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 		validationStart := time.Now()
 		log.Printf("DEBUG: Potential cache hit for key: %s. Validating file hashes...", string(cacheKey))
 		currentHashes, hashErr := calculateInputHashes(dir, nil)
-		if hashErr == nil && cachedEntry.GoModHash == goModHash && compareFileHashes(currentHashes, cachedEntry.InputFileHashes) {
+		if hashErr == nil &&
+			cachedEntry.GoModHash == goModHash &&
+			compareFileHashes(currentHashes, cachedEntry.InputFileHashes) {
 			log.Printf("DEBUG: Cache VALID for key: %s. Attempting to decode analysis data...", string(cacheKey))
 			decodeStart := time.Now()
 			var analysisData CachedAnalysisData
 			decoder := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob))
 			if decodeErr := decoder.Decode(&analysisData); decodeErr == nil {
-				// Cache hit: Populate info directly from cached data
 				info.PackageName = analysisData.PackageName
 				info.PromptPreamble = analysisData.PromptPreamble
 				cacheHit = true
-				loadDuration = time.Since(decodeStart) // Record decode time
+				loadDuration = time.Since(decodeStart)
 				log.Printf("DEBUG: Analysis data successfully decoded from cache in %v.", loadDuration)
 				log.Printf("DEBUG: Using cached preamble (length %d). Skipping packages.Load and analysis steps.", len(info.PromptPreamble))
 			} else {
 				log.Printf("Warning: Failed to gob-decode cached analysis data: %v. Treating as miss.", decodeErr)
-				addAnalysisError(info, fmt.Errorf("%w: analysis data decode error: %w", ErrCache, decodeErr))
+				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr))
 				a.deleteCacheEntry(cacheKey)
 			}
 		} else {
@@ -813,7 +825,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 				string(cacheKey), hashErr, compareFileHashes(currentHashes, cachedEntry.InputFileHashes), cachedEntry.GoModHash == goModHash)
 			a.deleteCacheEntry(cacheKey)
 			if hashErr != nil {
-				addAnalysisError(info, fmt.Errorf("%w: hash calculation error: %w", ErrCache, hashErr))
+				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr))
 			}
 		}
 		log.Printf("DEBUG: Cache validation/decode took %v", time.Since(validationStart))
@@ -901,7 +913,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 						saveErr := a.db.Update(func(tx *bbolt.Tx) error {
 							b := tx.Bucket(cacheBucketName)
 							if b == nil {
-								return fmt.Errorf("%w: cache bucket %s disappeared during save", ErrCache, string(cacheBucketName))
+								return fmt.Errorf("%w: cache bucket %s disappeared during save", ErrCacheWrite, string(cacheBucketName))
 							}
 							log.Printf("DEBUG: Writing %d bytes to cache for key %s", len(encodedBytes), string(cacheKey))
 							return b.Put(cacheKey, encodedBytes)
@@ -910,19 +922,19 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 							log.Printf("DEBUG: Saved analysis results to bbolt cache %s in %v", string(cacheKey), time.Since(saveStart))
 						} else {
 							log.Printf("Warning: Failed to write to bbolt cache for key %s: %v", string(cacheKey), saveErr)
-							addAnalysisError(info, fmt.Errorf("%w: write error: %w", ErrCache, saveErr))
+							addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheWrite, saveErr))
 						}
 					} else {
 						log.Printf("Warning: Failed to gob-encode cache entry for key %s: %v", string(cacheKey), entryEncodeErr)
-						addAnalysisError(info, fmt.Errorf("%w: entry encode error: %w", ErrCache, entryEncodeErr))
+						addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheEncode, entryEncodeErr))
 					}
 				} else {
 					log.Printf("Warning: Failed to gob-encode analysis data for caching: %v", encodeErr)
-					addAnalysisError(info, fmt.Errorf("%w: data encode error: %w", ErrCache, encodeErr))
+					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheEncode, encodeErr))
 				}
 			} else {
 				log.Printf("Warning: Failed to calculate input hashes for caching: %v", hashErr)
-				addAnalysisError(info, fmt.Errorf("%w: hash calculation error: %w", ErrCache, hashErr))
+				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr))
 			}
 		} else if a.db != nil {
 			log.Printf("DEBUG: Skipping cache save for key %s (Load Errors: %d, Preamble Empty: %t)",
@@ -983,7 +995,7 @@ func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	})
 	if err != nil {
 		log.Printf("Warning: Failed to delete cache entry %s: %v", string(cacheKey), err)
-		return fmt.Errorf("%w: failed to delete entry %s: %w", ErrCache, string(cacheKey), err)
+		return fmt.Errorf("%w: failed to delete entry %s: %w", ErrCacheWrite, string(cacheKey), err)
 	}
 	log.Printf("DEBUG: Successfully invalidated cache entry for key: %s", string(cacheKey))
 	return nil
@@ -1004,8 +1016,8 @@ func (a *GoPackagesAnalyzer) performAnalysisSteps(
 
 	cursorPos, posErr := calculateCursorPos(targetFile, line, col)
 	if posErr != nil {
-		return fmt.Errorf("cursor position error: %w", posErr)
-	}
+		return fmt.Errorf("%w: %w", ErrPositionConversion, posErr)
+	} // Wrap specific error
 	info.CursorPos = cursorPos
 	log.Printf("Calculated cursor token.Pos: %d (%s)", info.CursorPos, fset.PositionFor(info.CursorPos, true))
 
@@ -1086,7 +1098,6 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 // =============================================================================
 // DeepCompleter Service
 // =============================================================================
-// DeepCompleter orchestrates the code completion process.
 type DeepCompleter struct {
 	client    LLMClient
 	analyzer  Analyzer
@@ -1094,8 +1105,6 @@ type DeepCompleter struct {
 	config    Config
 }
 
-// NewDeepCompleter creates a new DeepCompleter service with default components
-// and configuration loaded from standard locations.
 func NewDeepCompleter() (*DeepCompleter, error) {
 	cfg, configErr := LoadConfig()
 	if configErr != nil && !errors.Is(configErr, ErrConfig) {
@@ -1128,7 +1137,6 @@ func NewDeepCompleter() (*DeepCompleter, error) {
 	return dc, nil
 }
 
-// NewDeepCompleterWithConfig creates a new DeepCompleter service with the provided configuration.
 func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
@@ -1149,7 +1157,6 @@ func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 	}, nil
 }
 
-// Close cleans up resources used by DeepCompleter, specifically the analyzer's cache.
 func (dc *DeepCompleter) Close() error {
 	if dc.analyzer != nil {
 		return dc.analyzer.Close()
@@ -1157,8 +1164,6 @@ func (dc *DeepCompleter) Close() error {
 	return nil
 }
 
-// GetCompletion provides completion for a raw code snippet without performing AST analysis.
-// This is a non-streaming operation.
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
 	log.Println("DeepCompleter.GetCompletion called for basic prompt.")
 	contextPreamble := "// Provide Go code completion below."
@@ -1184,8 +1189,6 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 	return strings.TrimSpace(buffer.String()), nil
 }
 
-// GetCompletionStreamFromFile performs context analysis (using AST/types or cache)
-// for the given file and cursor position, then streams the completion from the LLM to the provided writer.
 func (dc *DeepCompleter) GetCompletionStreamFromFile(
 	ctx context.Context,
 	filename string,
@@ -2068,10 +2071,10 @@ func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifi
 
 func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	if line <= 0 {
-		return token.NoPos, fmt.Errorf("invalid line number: %d (must be >= 1)", line)
+		return token.NoPos, fmt.Errorf("%w: line number %d must be >= 1", ErrInvalidPositionInput, line)
 	}
 	if col <= 0 {
-		return token.NoPos, fmt.Errorf("invalid column number: %d (must be >= 1)", col)
+		return token.NoPos, fmt.Errorf("%w: column number %d must be >= 1", ErrInvalidPositionInput, col)
 	}
 	if file == nil {
 		return token.NoPos, errors.New("invalid token.File (nil)")
@@ -2082,11 +2085,11 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 		if line == fileLineCount+1 && col == 1 {
 			return file.Pos(file.Size()), nil
 		}
-		return token.NoPos, fmt.Errorf("line number %d exceeds file line count %d", line, fileLineCount)
+		return token.NoPos, fmt.Errorf("%w: line number %d exceeds file line count %d", ErrPositionOutOfRange, line, fileLineCount)
 	}
 	lineStartPos := file.LineStart(line)
 	if !lineStartPos.IsValid() {
-		return token.NoPos, fmt.Errorf("cannot get start offset for line %d in file '%s'", line, file.Name())
+		return token.NoPos, fmt.Errorf("%w: cannot get start offset for line %d in file '%s'", ErrPositionConversion, line, file.Name())
 	}
 
 	lineStartOffset := file.Offset(lineStartPos)
@@ -2111,7 +2114,7 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	pos := file.Pos(finalOffset)
 	if !pos.IsValid() {
 		log.Printf("Error: Clamped offset %d resulted in invalid token.Pos. Using line start %d.", finalOffset, lineStartPos)
-		return lineStartPos, fmt.Errorf("failed to calculate valid token.Pos for offset %d", finalOffset)
+		return lineStartPos, fmt.Errorf("%w: failed to calculate valid token.Pos for offset %d", ErrPositionConversion, finalOffset)
 	}
 	return pos, nil
 }
@@ -2484,10 +2487,10 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 	targetLine := int(lspPos.Line)
 	targetUTF16Char := int(lspPos.Character)
 	if targetLine < 0 {
-		return 0, 0, -1, fmt.Errorf("%w: invalid LSP line: %d (must be >= 0)", ErrPositionConversion, targetLine)
+		return 0, 0, -1, fmt.Errorf("%w: line number %d must be >= 0", ErrInvalidPositionInput, targetLine)
 	}
 	if targetUTF16Char < 0 {
-		return 0, 0, -1, fmt.Errorf("%w: invalid LSP character offset: %d (must be >= 0)", ErrPositionConversion, targetUTF16Char)
+		return 0, 0, -1, fmt.Errorf("%w: character offset %d must be >= 0", ErrInvalidPositionInput, targetUTF16Char)
 	}
 
 	currentLine := 0
@@ -2500,8 +2503,12 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 		if currentLine == targetLine {
 			byteOffsetInLine, convErr := Utf16OffsetToBytes(lineTextBytes, targetUTF16Char)
 			if convErr != nil {
-				log.Printf("Warning: utf16OffsetToBytes failed (line %d, char %d): %v. Clamping to line end.", targetLine, targetUTF16Char, convErr)
-				byteOffsetInLine = lineLengthBytes
+				if errors.Is(convErr, ErrPositionOutOfRange) {
+					log.Printf("Warning: utf16OffsetToBytes reported offset out of range (line %d, char %d): %v. Clamping to line end.", targetLine, targetUTF16Char, convErr)
+					byteOffsetInLine = lineLengthBytes
+				} else {
+					return 0, 0, -1, fmt.Errorf("failed converting UTF16 to byte offset on line %d: %w", currentLine, convErr)
+				}
 			}
 			line = currentLine + 1
 			col = byteOffsetInLine + 1
@@ -2521,15 +2528,15 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 			byteOffset = currentByteOffset
 			return line, col, byteOffset, nil
 		} else {
-			return 0, 0, -1, fmt.Errorf("%w: invalid character offset %d on line %d (after last line with content)", ErrPositionConversion, targetUTF16Char, targetLine)
+			return 0, 0, -1, fmt.Errorf("%w: invalid character offset %d on line %d (after last line with content)", ErrPositionOutOfRange, targetUTF16Char, targetLine)
 		}
 	}
-	return 0, 0, -1, fmt.Errorf("%w: LSP line %d not found in file (total lines scanned %d)", ErrPositionConversion, targetLine, currentLine)
+	return 0, 0, -1, fmt.Errorf("%w: LSP line %d not found in file (total lines scanned %d)", ErrPositionOutOfRange, targetLine, currentLine)
 }
 
 func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
 	if utf16Offset < 0 {
-		return 0, fmt.Errorf("%w: invalid utf16Offset: %d (must be >= 0)", ErrPositionConversion, utf16Offset)
+		return 0, fmt.Errorf("%w: invalid utf16Offset: %d (must be >= 0)", ErrInvalidPositionInput, utf16Offset)
 	}
 	if utf16Offset == 0 {
 		return 0, nil
@@ -2542,7 +2549,7 @@ func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
 		}
 		r, size := utf8.DecodeRune(line[byteOffset:])
 		if r == utf8.RuneError && size <= 1 {
-			return byteOffset, fmt.Errorf("%w: invalid UTF-8 sequence at byte offset %d", ErrPositionConversion, byteOffset)
+			return byteOffset, fmt.Errorf("%w at byte offset %d", ErrInvalidUTF8, byteOffset)
 		}
 		utf16Units := 1
 		if r > 0xFFFF {
@@ -2558,7 +2565,7 @@ func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
 		}
 	}
 	if currentUTF16Offset < utf16Offset {
-		return len(line), fmt.Errorf("%w: utf16Offset %d is beyond the line length in UTF-16 units (%d)", ErrPositionConversion, utf16Offset, currentUTF16Offset)
+		return len(line), fmt.Errorf("%w: utf16Offset %d is beyond the line length in UTF-16 units (%d)", ErrPositionOutOfRange, utf16Offset, currentUTF16Offset)
 	}
 	return byteOffset, nil
 }
@@ -2639,7 +2646,7 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		}
 		hash, err := hashFileContent(absPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to hash input file %s: %w", absPath, err)
+			return nil, fmt.Errorf("%w: failed to hash input file %s: %w", ErrCacheHash, absPath, err)
 		}
 		hashes[relPath] = hash
 	}
@@ -2707,78 +2714,66 @@ func (a *GoPackagesAnalyzer) deleteCacheEntry(cacheKey []byte) {
 // ============================================================================
 // Spinner & File Helpers
 // ============================================================================
-
-// Spinner provides visual feedback for long-running operations.
 type Spinner struct {
 	chars    []string
-	message  string // Current message to display
+	message  string
 	index    int
-	mu       sync.Mutex // Protects message and index
+	mu       sync.Mutex
 	stopChan chan struct{}
-	doneChan chan struct{} // Used for graceful shutdown confirmation
+	doneChan chan struct{}
 	running  bool
 }
 
-// NewSpinner creates and initializes a new Spinner. // Function restored
 func NewSpinner() *Spinner {
-	return &Spinner{
-		chars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}, // Default spinner characters
-		index: 0,
-	}
+	return &Spinner{chars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}, index: 0}
 }
-
-// Start begins the spinner animation in a separate goroutine.
 func (s *Spinner) Start(initialMessage string) {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
 		return
-	} // Already running
+	}
 	s.stopChan = make(chan struct{})
 	s.doneChan = make(chan struct{})
 	s.message = initialMessage
 	s.running = true
 	s.mu.Unlock()
-
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		defer func() { // Cleanup function
+		defer func() {
 			s.mu.Lock()
 			isRunning := s.running
 			s.running = false
 			s.mu.Unlock()
 			if isRunning {
 				fmt.Fprintf(os.Stderr, "\r\033[K")
-			} // Clear line on stop
+			}
 			select {
 			case s.doneChan <- struct{}{}:
 			default:
-			} // Signal done
+			}
 			close(s.doneChan)
 		}()
-
 		for {
 			select {
 			case <-s.stopChan:
-				return // Exit goroutine
+				return
 			case <-ticker.C:
 				s.mu.Lock()
 				if !s.running {
 					s.mu.Unlock()
 					return
-				} // Exit if stopped between ticks
+				}
 				char := s.chars[s.index]
 				msg := s.message
 				s.index = (s.index + 1) % len(s.chars)
-				fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg) // Print to stderr
+				fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg)
 				s.mu.Unlock()
 			}
 		}
 	}()
 }
-
-// UpdateMessage changes the message displayed next to the spinner.
 func (s *Spinner) UpdateMessage(newMessage string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2786,43 +2781,38 @@ func (s *Spinner) UpdateMessage(newMessage string) {
 		s.message = newMessage
 	}
 }
-
-// Stop halts the spinner animation and cleans up resources.
 func (s *Spinner) Stop() {
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
 		return
-	} // Already stopped
+	}
 	select {
 	case <-s.stopChan:
 	default:
 		close(s.stopChan)
-	} // Close stop channel
+	}
 	doneChan := s.doneChan
 	s.mu.Unlock()
-
-	if doneChan != nil { // Wait for goroutine cleanup with timeout
+	if doneChan != nil {
 		select {
-		case <-doneChan: // Wait for signal
+		case <-doneChan:
 		case <-time.After(500 * time.Millisecond):
 			log.Println("Warning: Timeout waiting for spinner goroutine cleanup")
 		}
 	}
-	fmt.Fprintf(os.Stderr, "\r\033[K") // Ensure line is cleared
+	fmt.Fprintf(os.Stderr, "\r\033[K")
 }
 
 // ============================================================================
 // Snippet Extraction Helper (Restored)
 // ============================================================================
-
-// extractSnippetContext reads the file and extracts the code prefix/suffix around the cursor.
 func extractSnippetContext(filename string, row, col int) (SnippetContext, error) {
 	var ctx SnippetContext
 	contentBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return ctx, fmt.Errorf("error reading file '%s': %w", filename, err)
-	}
+	} // Keep os error
 	content := string(contentBytes)
 	fset := token.NewFileSet()
 	file := fset.AddFile(filename, 1, len(contentBytes))
@@ -2833,9 +2823,9 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 	cursorPos, posErr := calculateCursorPos(file, row, col)
 	if posErr != nil {
 		return ctx, fmt.Errorf("cannot determine valid cursor position: %w", posErr)
-	}
+	} // Already returns specific errors
 	if !cursorPos.IsValid() {
-		return ctx, fmt.Errorf("invalid cursor position calculated (Pos: %d)", cursorPos)
+		return ctx, fmt.Errorf("%w: invalid cursor position calculated (Pos: %d)", ErrPositionConversion, cursorPos)
 	}
 
 	offset := file.Offset(cursorPos)
