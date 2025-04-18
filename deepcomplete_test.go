@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/token"
 	"log"
@@ -13,6 +14,9 @@ import (
 	"reflect" // For comparing complex structs/slices
 	"strings"
 	"testing"
+	"time"
+
+	"go.etcd.io/bbolt"
 	// For spinner test
 )
 
@@ -34,6 +38,7 @@ func createFileSetAndFile(t *testing.T, name, content string) (*token.FileSet, *
 }
 
 // TestCalculateCursorPos tests the conversion of line/column to token.Pos offset.
+// (Cycle 1 Change: Added multi-byte test case)
 func TestCalculateCursorPos(t *testing.T) {
 	// Sample file content for position calculation
 	content := `package main
@@ -42,8 +47,9 @@ import "fmt" // Line 3
 
 func main() { // Line 5
 	fmt.Println("Hello") // Line 6
-} // Line 7
-// Line 8` // Ensure content ends without newline for some tests
+	fmt.Println("你好世界") // Line 7 (Multi-byte)
+} // Line 8
+// Line 9` // Ensure content ends without newline for some tests
 
 	// Use a simple fileset for this test, file content doesn't need full parsing here
 	fset := token.NewFileSet()
@@ -53,29 +59,33 @@ func main() { // Line 5
 	}
 
 	tests := []struct {
-		name string
-		line int
-		col  int
-		// wantPos    token.Pos // Comparing exact Pos can be tricky, focus on offset
+		name       string
+		line       int
+		col        int
 		wantErr    bool
-		wantOffset int // Expected byte offset for verification
+		wantOffset int // Expected 0-based byte offset for verification
 	}{
 		{"Start of file", 1, 1, false, 0},
 		{"Start of line 3", 3, 1, false, 15},                         // Offset of 'import "fmt"'
-		{"Middle of Println", 6, 10, false, 46},                      // Offset within Println
+		{"Middle of Println", 6, 10, false, 46},                      // Offset within Println "Hello"
 		{"End of Println line", 6, 26, false, 62},                    // Offset after ')' on line 6
-		{"Cursor after Println line (at newline)", 6, 27, false, 62}, // Clamped to line end offset if no newline char exists there? Let's test file size limit instead.
-		{"Start of line 7", 7, 1, false, 63},                         // Offset of '}' on line 7
-		{"End of line 7", 7, 2, false, 64},                           // Offset after '}' on line 7
-		{"Start of line 8", 8, 1, false, 65},                         // Offset of '/' in comment
-		{"End of line 8", 8, 10, false, 74},                          // Offset at end of content
-		{"Cursor after end of file", 8, 11, false, 74},               // Clamped to end of file size
-		{"Invalid line (too high)", 9, 1, true, -1},
+		{"Cursor after Println line (at newline)", 6, 27, false, 62}, // Clamped to line end offset (before newline)
+		{"Start of line 7", 7, 1, false, 63},                         // Offset of 'f' in fmt
+		{"Middle of multi-byte string (before 好)", 7, 16, false, 78}, // Offset inside "你好世界" quotes, before 好
+		{"Middle of multi-byte string (after 好)", 7, 17, false, 81},  // Offset inside "你好世界" quotes, after 好 (3 bytes)
+		{"Middle of multi-byte string (after 界)", 7, 20, false, 90},  // Offset inside "你好世界" quotes, after 界 (3 bytes)
+		{"End of multi-byte string line", 7, 23, false, 93},          // Offset after ')' on line 7
+		{"Start of line 8", 8, 1, false, 94},                         // Offset of '}' on line 8
+		{"End of line 8", 8, 2, false, 95},                           // Offset after '}' on line 8
+		{"Start of line 9", 9, 1, false, 96},                         // Offset of '/' in comment
+		{"End of line 9", 9, 10, false, 105},                         // Offset at end of content
+		{"Cursor after end of file", 9, 11, false, 105},              // Clamped to end of file size
+		{"Invalid line (too high)", 10, 1, true, -1},
 		{"Invalid line (zero)", 0, 1, true, -1},
 		{"Invalid col (zero)", 6, 0, true, -1},
 		{"Invalid col (too high for line)", 6, 100, false, 62}, // Clamped to end of line offset
-		{"Col too high last line", 8, 100, false, 74},          // Clamped to end of file offset
-		{"Col too high last line + 1", 9, 100, true, -1},       // Invalid line number
+		{"Col too high last line", 9, 100, false, 105},         // Clamped to end of file offset
+		{"Col too high last line + 1", 10, 100, true, -1},      // Invalid line number
 	}
 
 	for _, tt := range tests {
@@ -153,7 +163,7 @@ func MyFunction(arg1 int, arg2 string) (res int, err error) {
 	// Create analyzer instance (using the internal struct directly for testing)
 	// Explicitly disable caching for this direct parse test by not providing a DB path
 	// (NewGoPackagesAnalyzer handles nil DB gracefully)
-	analyzer := NewGoPackagesAnalyzer()
+	analyzer := NewGoPackagesAnalyzer() // Will create without DB path
 	// Ensure analyzer resources are closed
 	t.Cleanup(func() {
 		t.Log("Closing analyzer in test cleanup...") // Add log for verification
@@ -579,13 +589,137 @@ func TestFindIdentifierAtCursor(t *testing.T) {
 	t.Skip("findIdentifierAtCursor tests not yet implemented")
 }
 
+// TestGoPackagesAnalyzer_Cache tests the bbolt caching mechanism.
+// (Cycle 2 Change: Implemented InvalidateCache test)
 func TestGoPackagesAnalyzer_Cache(t *testing.T) {
-	// TODO: Implement tests for bbolt caching
-	// Needs setup with temp DB file (ensure path cleanup), multiple Analyze calls on same dir,
-	// checking for cache hit logs, modifying files, checking for invalidation.
-	// Need to test the new caching strategy (caching derived preamble data via gob).
-	// Remember to call analyzer.Close() via t.Cleanup() in these tests.
-	t.Skip("GoPackagesAnalyzer caching tests not yet implemented (needs update for gob caching)")
+	// Test InvalidateCache specifically
+	t.Run("InvalidateCache", func(t *testing.T) {
+		// Setup: Create temp dir, temp file, temp cache DB
+		tmpDir := t.TempDir()
+		testFilename := filepath.Join(tmpDir, "cache_test.go")
+		testContent := `package main
+func main() { println("hello") } // Line 2, Col 20
+`
+		if err := os.WriteFile(testFilename, []byte(testContent), 0644); err != nil {
+			t.Fatalf("Failed to write test file: %v", err)
+		}
+
+		// --- Create Analyzer with a temporary DB path ---
+		// Override user cache dir logic for isolated test DB
+		dbDir := filepath.Join(tmpDir, "test_bboltdb", fmt.Sprintf("v%d", cacheSchemaVersion))
+		if err := os.MkdirAll(dbDir, 0750); err != nil {
+			t.Fatalf("Failed to create temp db dir: %v", err)
+		}
+		dbPath := filepath.Join(dbDir, "test_cache.db")
+
+		// Manually create analyzer pointing to test DB path
+		opts := &bbolt.Options{Timeout: 1 * time.Second}
+		db, err := bbolt.Open(dbPath, 0600, opts)
+		if err != nil {
+			t.Fatalf("Failed to open test bbolt cache file %s: %v", dbPath, err)
+		}
+		err = db.Update(func(tx *bbolt.Tx) error {
+			_, err := tx.CreateBucketIfNotExists(cacheBucketName)
+			return err
+		})
+		if err != nil {
+			db.Close()
+			t.Fatalf("Failed to create test cache bucket: %v", err)
+		}
+		analyzer := &GoPackagesAnalyzer{db: db} // Inject the test DB
+		t.Cleanup(func() {
+			t.Log("Closing test analyzer...")
+			if err := analyzer.Close(); err != nil { // Close should close the injected DB
+				t.Errorf("Error closing test analyzer: %v", err)
+			}
+			// db file is cleaned up by t.TempDir()
+		})
+		// ---
+
+		ctx := context.Background()
+		line, col := 2, 20
+
+		// --- Capture log output ---
+		var logBuf bytes.Buffer
+		// Use a test-specific logger temporarily
+		testLogger := log.New(&logBuf, "TESTCACHE: ", log.Lshortfile)
+		// Swap std logger, restore after test
+		oldLogger := log.Default() // Get current default logger
+		log.SetOutput(testLogger.Writer())
+		log.SetFlags(testLogger.Flags())
+		log.SetPrefix(testLogger.Prefix())
+		t.Cleanup(func() {
+			// Restore previous logger settings
+			log.SetOutput(oldLogger.Writer())
+			log.SetFlags(oldLogger.Flags())
+			log.SetPrefix(oldLogger.Prefix())
+		})
+		// ---
+
+		// 1. First Analysis (should be a cache miss and populate cache)
+		t.Log("Performing first analysis (expect cache miss)...")
+		logBuf.Reset() // Clear buffer before first analysis
+		_, err = analyzer.Analyze(ctx, testFilename, line, col)
+		if err != nil && !errors.Is(err, ErrAnalysisFailed) { // Allow non-fatal analysis errors
+			t.Fatalf("First Analyze failed unexpectedly: %v", err)
+		}
+		logOutput1 := logBuf.String()
+		if !strings.Contains(logOutput1, "Cache miss or invalid") && !strings.Contains(logOutput1, "Cache disabled") {
+			t.Errorf("Expected 'Cache miss' or 'Cache disabled' log during first analysis, got:\n%s", logOutput1)
+		}
+		if !strings.Contains(logOutput1, "Saved analysis results to bbolt cache") {
+			t.Errorf("Expected 'Saved analysis results' log during first analysis, got:\n%s", logOutput1)
+		}
+
+		// 2. Second Analysis (should be a cache hit)
+		t.Log("Performing second analysis (expect cache hit)...")
+		logBuf.Reset() // Clear buffer
+		_, err = analyzer.Analyze(ctx, testFilename, line, col)
+		if err != nil && !errors.Is(err, ErrAnalysisFailed) {
+			t.Fatalf("Second Analyze failed unexpectedly: %v", err)
+		}
+		logOutput2 := logBuf.String()
+		if !strings.Contains(logOutput2, "Potential cache hit") || !strings.Contains(logOutput2, "Cache VALID") {
+			t.Errorf("Expected 'Potential cache hit' and 'Cache VALID' logs during second analysis, got:\n%s", logOutput2)
+		}
+		if strings.Contains(logOutput2, "Cache miss or invalid") {
+			t.Errorf("Unexpected 'Cache miss' log during second analysis (should have hit), got:\n%s", logOutput2)
+		}
+
+		// 3. Invalidate Cache
+		t.Log("Invalidating cache...")
+		logBuf.Reset()
+		err = analyzer.InvalidateCache(tmpDir) // Invalidate for the directory
+		if err != nil {
+			t.Fatalf("InvalidateCache failed: %v", err)
+		}
+		logOutputInvalidate := logBuf.String()
+		if !strings.Contains(logOutputInvalidate, "Invalidating cache for key") || !strings.Contains(logOutputInvalidate, "Deleting cache entry") {
+			t.Errorf("Expected 'Invalidating cache' and 'Deleting cache entry' logs, got:\n%s", logOutputInvalidate)
+		}
+
+		// 4. Third Analysis (should be a cache miss again)
+		t.Log("Performing third analysis (expect cache miss after invalidation)...")
+		logBuf.Reset()
+		_, err = analyzer.Analyze(ctx, testFilename, line, col)
+		if err != nil && !errors.Is(err, ErrAnalysisFailed) {
+			t.Fatalf("Third Analyze failed unexpectedly: %v", err)
+		}
+		logOutput3 := logBuf.String()
+		if !strings.Contains(logOutput3, "Cache miss or invalid") {
+			t.Errorf("Expected 'Cache miss' log during third analysis after invalidation, got:\n%s", logOutput3)
+		}
+		if strings.Contains(logOutput3, "Cache VALID") {
+			t.Errorf("Unexpected 'Cache VALID' log during third analysis (should have missed), got:\n%s", logOutput3)
+		}
+		if !strings.Contains(logOutput3, "Saved analysis results to bbolt cache") {
+			t.Errorf("Expected 'Saved analysis results' log during third analysis, got:\n%s", logOutput3)
+		}
+	})
+
+	// TODO: Add tests for cache hits, different file modifications causing misses,
+	// go.mod changes causing misses, schema version changes causing misses, etc.
+	t.Skip("Remaining GoPackagesAnalyzer caching tests not yet implemented")
 }
 
 // ============================================================================
@@ -607,48 +741,48 @@ func TestLSPPositionConversion(t *testing.T) {
 			{"ASCII start", "hello", 0, 0, false, nil},
 			{"ASCII middle", "hello", 2, 2, false, nil},
 			{"ASCII end", "hello", 5, 5, false, nil},
-			{"ASCII past end", "hello", 6, 5, true, ErrPositionConversion},  // Error expected, offset clamped by wantByteOffset
-			{"ASCII negative", "hello", -1, 0, true, ErrPositionConversion}, // Error expected
+			{"ASCII past end", "hello", 6, 5, true, ErrPositionOutOfRange},    // Error expected, offset clamped by wantByteOffset
+			{"ASCII negative", "hello", -1, 0, true, ErrInvalidPositionInput}, // Error expected
 
 			// Multi-byte UTF-8 (2 bytes)
 			{"2byte UTF-8 start", "héllo", 0, 0, false, nil},
 			{"2byte UTF-8 before", "héllo", 1, 1, false, nil}, // Before 'é'
-			{"2byte UTF-8 after", "héllo", 2, 3, false, nil},  // After 'é' (1 UTF-16 unit)
+			{"2byte UTF-8 after", "héllo", 2, 3, false, nil},  // After 'é' (1 UTF-16 unit, 2 bytes)
 			{"2byte UTF-8 middle", "héllo", 4, 5, false, nil}, // Before 'o'
 			{"2byte UTF-8 end", "héllo", 5, 6, false, nil},
-			{"2byte UTF-8 past end", "héllo", 6, 6, true, ErrPositionConversion},
+			{"2byte UTF-8 past end", "héllo", 6, 6, true, ErrPositionOutOfRange},
 
 			// Multi-byte UTF-8 (3 bytes)
 			{"3byte UTF-8 start", "€ euro", 0, 0, false, nil},
-			{"3byte UTF-8 after", "€ euro", 1, 3, false, nil}, //  After '€' (1 UTF-16 unit)
+			{"3byte UTF-8 after", "€ euro", 1, 3, false, nil}, //   After '€' (1 UTF-16 unit, 3 bytes)
 			{"3byte UTF-8 middle", "€ euro", 3, 5, false, nil}, // Before 'e'
 			{"3byte UTF-8 end", "€ euro", 6, 8, false, nil},
-			{"3byte UTF-8 past end", "€ euro", 7, 8, true, ErrPositionConversion},
+			{"3byte UTF-8 past end", "€ euro", 7, 8, true, ErrPositionOutOfRange},
 
 			// Multi-byte UTF-8 (4 bytes - Surrogate Pair in UTF-16)
 			{"4byte UTF-8 start", "😂笑", 0, 0, false, nil},
-			{"4byte UTF-8 middle (within surrogate)", "😂笑", 1, 0, false, nil}, // Offset 1 falls *within* the 2 UTF-16 units of 😂
-			{"4byte UTF-8 after surrogate", "😂笑", 2, 4, false, nil},          // Af ter 😂 (2 UTF-16 units)
-			{"4byte UTF-8 after second char", "😂笑", 3, 7, false, nil},         // After 笑 (1 UTF-16 unit)
-			{"4byte UTF-8 end", "😂笑", 3, 7, false, nil}, // No                      te: end is same as after second char for UTF-16 offset
-			{"4byte UTF-8 past end", "😂笑", 4, 7, true, ErrPositionConversion},
+			{"4byte UTF-8 middle (within surrogate)", "😂笑", 1, 0, false, nil}, // Offset 1 falls *within* the 2 UTF-16 units of 😂 -> byte offset remains 0
+			{"4byte UTF-8 after surrogate", "😂笑", 2, 4, false, nil},          // Af ter 😂 (2 UTF-16 units, 4 bytes)
+			{"4byte UTF-8 after second char", "😂笑", 3, 7, false, nil},         // After 笑 (1 UTF-16 unit, 3 bytes) -> total 4+3=7 bytes
+			{"4byte UTF-8 end", "😂笑", 3, 7, false, nil},                       // End is same as after second char for UTF-16 offset
+			{"4byte UTF-8 past end", "😂笑", 4, 7, true, ErrPositionOutOfRange},
 
 			// Mixed
 			{"Mixed start", "a é 😂 €", 0, 0, false, nil},
-			{"Mixed after a", "a é 😂 €", 1, 1, false, nil},
-			{"Mixed after space", "a é 😂 €", 2, 2, false, nil},
-			{"Mixed after é", "a é 😂 €", 3, 4, false, nil}, // é is 1 utf16
-			{"Mixed after space 2", "a é 😂 €", 4, 5, false, nil},
-			{"Mixed within 😂", "a é 😂 €", 5, 5, false, nil}, // Within 😂 surrogate
-			{"Mixed after 😂", "a é 😂 €", 6, 9, false, nil}, // After  😂 (2 utf16)
-			{"Mixed after space 3", "a é 😂 €", 7, 10, false, nil},
-			{"Mixed after €", "a é 😂 €", 8, 13, false, nil}, // After € (1 utf16)
-			{"Mixed end", "a é 😂 €", 8, 13, false, nil},
-			{"Mixed past end", "a é 😂 €", 9, 13, true, ErrPositionConversion},
+			{"Mixed after a", "a é 😂 €", 1, 1, false, nil},     // a (   1b, 1u16)
+			{"Mixed after space", "a é 😂 €", 2, 2, false, nil}, // spa   ce (1b, 1u16)
+			{"Mixed after é", "a é 😂 €", 3, 4, false, nil},     // é (2   b, 1u16) -> 1+1+2=4 bytes
+			{"Mixed after space 2", "a é 😂 €", 4, 5, false, nil}, // sp ace (1b, 1u16) -> 4+1=5 bytes
+			{"Mixed within 😂", "a é 😂 €", 5, 5, false, nil},    // Wi   thin 😂 surrogate (4b, 2u16) -> byte offset remains 5
+			{"Mixed after 😂", "a é 😂 €", 6, 9, false, nil},     // A   fter 😂 -> 5+4=9 bytes
+			{"Mixed after space 3", "a é 😂 €", 7, 10, false, nil},// spa ce (1b, 1u16) -> 9+1=10 bytes
+			{"Mixed after €", "a é 😂 €", 8, 13, false, nil},    // A   fter € (3b, 1u16) -> 10+3=13 bytes
+			{"Mixed end", "a é 😂 €", 8, 13, false, nil},           // End is same offset
+			{"Mixed past end", "a é 😂 €", 9, 13, true, ErrPositionOutOfRange},
 
 			// Empty line
 			{"Empty line start", "", 0, 0, false, nil},
-			{"Empty line past end", "", 1, 0, true, ErrPositionConversion},
+			{"Empty line past end", "", 1, 0, true, ErrPositionOutOfRange},
 		}
 
 		for _, tt := range tests {
@@ -698,38 +832,38 @@ three €
 			{"Middle line 1", []byte(content), LSPPosition{Line: 0, Character: 5}, 1, 6, 5, false, nil, ""}, // After ' '
 			{"End line 1", []byte(content), LSPPosition{Line: 0, Character: 8}, 1, 9, 8, false, nil, ""},    // End of 'one'
 
-			// Line 2 with unicode
+			// Line 2 with unicode (line starts at byte offset 9)
 			{"Start line 2", []byte(content), LSPPosition{Line: 1, Character: 0}, 2, 1, 9, false, nil, ""},                 // Start of 'two'
-			{"Middle line 2 (before é)", []byte(content), LSPPosition{Line: 1, Character: 4}, 2, 5, 13, false, nil, ""},    // After ' ' before 'é'
-			{"Middle line 2 (after é)", []byte(content), LSPPosition{Line: 1, Character: 5}, 2, 7, 15, false, nil, ""},     // After 'é' (1 utf16 unit, 2 bytes)
-			{"Middle line 2 (after space)", []byte(content), LSPPosition{Line: 1, Character: 6}, 2, 8, 16, false, nil, ""}, // After ' ' before 😂
-			{"Middle line 2 (within 😂)", []byte(content), LSPPosition{Line: 1, Character: 7}, 2, 8, 16, false, nil, ""},    // Within 😂 surrogate pair
-			{"Middle line 2 (after 😂)", []byte(content), LSPPosition{Line: 1, Character: 8}, 2, 12, 20, false, nil, ""},    // After 😂 (2 utf16 units, 4 bytes)
-			{"End line 2", []byte(content), LSPPosition{Line: 1, Character: 8}, 2, 12, 20, false, nil, ""},                 // End of 😂
+			{"Middle line 2 (before é)", []byte(content), LSPPosition{Line: 1, Character: 4}, 2, 5, 13, false, nil, ""},    // After ' ' before 'é' (t=1,w=1,o=1, =1 => 4 chars, 4 bytes) -> Go Col 4+1=5, Offset 9+4=13
+			{"Middle line 2 (after é)", []byte(content), LSPPosition{Line: 1, Character: 5}, 2, 7, 15, false, nil, ""},     // After 'é' (1 utf16 unit, 2 bytes) -> Go Col 5+2=7, Offset 13+2=15
+			{"Middle line 2 (after space)", []byte(content), LSPPosition{Line: 1, Character: 6}, 2, 8, 16, false, nil, ""}, // After ' ' before 😂 (1 utf16, 1 byte) -> Go Col 7+1=8, Offset 15+1=16
+			{"Middle line 2 (within 😂)", []byte(content), LSPPosition{Line: 1, Character: 7}, 2, 8, 16, false, nil, ""},    // Within 😂 surrogate pair (byte offset remains at start of rune) -> Go Col 8, Offset 16
+			{"Middle line 2 (after 😂)", []byte(content), LSPPosition{Line: 1, Character: 8}, 2, 12, 20, false, nil, ""},    // After 😂 (2 utf16 units, 4 bytes) -> Go Col 8+4=12, Offset 16+4=20
+			{"End line 2", []byte(content), LSPPosition{Line: 1, Character: 8}, 2, 12, 20, false, nil, ""},                 // End of 😂 (same as after)
 
-			// Line 3 with unicode
+			// Line 3 with unicode (line starts at byte offset 21)
 			{"Start line 3", []byte(content), LSPPosition{Line: 2, Character: 0}, 3, 1, 21, false, nil, ""},                // Start of 'three'
-			{"Middle line 3 (after space)", []byte(content), LSPPosition{Line: 2, Character: 6}, 3, 7, 27, false, nil, ""}, // After ' ' before '€'
-			{"Middle line 3 (after €)", []byte(content), LSPPosition{Line: 2, Character: 7}, 3, 10, 30, false, nil, ""},    // After '€' (1 utf16 unit, 3 bytes)
-			{"End line 3", []byte(content), LSPPosition{Line: 2, Character: 7}, 3, 10, 30, false, nil, ""},                 // End of '€'
+			{"Middle line 3 (after space)", []byte(content), LSPPosition{Line: 2, Character: 6}, 3, 7, 27, false, nil, ""}, // After ' ' before '€' (t=1,h=1,r=1,e=1,e=1, =1 => 6 chars, 6 bytes) -> Go Col 6+1=7, Offset 21+6=27
+			{"Middle line 3 (after €)", []byte(content), LSPPosition{Line: 2, Character: 7}, 3, 10, 30, false, nil, ""},    // After '€' (1 utf16 unit, 3 bytes) -> Go Col 7+3=10, Offset 27+3=30
+			{"End line 3", []byte(content), LSPPosition{Line: 2, Character: 7}, 3, 10, 30, false, nil, ""},                 // End of '€' (same as after)
 
-			// Line 4 (empty line after content due to trailing newline)
+			// Line 4 (empty line after content due to trailing newline, starts at offset 31)
 			{"Start empty line 4", []byte(content), LSPPosition{Line: 3, Character: 0}, 4, 1, 31, false, nil, ""}, // Start of the line after the last newline
 
 			// Edge cases and errors
 			{"Nil content", nil, LSPPosition{Line: 0, Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""},
 			{"Empty content", []byte(""), LSPPosition{Line: 0, Character: 0}, 1, 1, 0, false, nil, ""},                                // Start of empty file is valid
-			{"Empty content invalid char", []byte(""), LSPPosition{Line: 0, Character: 1}, 0, 0, -1, true, ErrPositionConversion, ""}, // Char > 0 on empty line
-			{"Empty content invalid line", []byte(""), LSPPosition{Line: 1, Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""}, // Line > 0 on empty file
+			{"Empty content invalid char", []byte(""), LSPPosition{Line: 0, Character: 1}, 0, 0, -1, true, ErrPositionOutOfRange, ""}, // Char > 0 on empty line -> Utf16OffsetToBytes returns ErrPositionOutOfRange
+			{"Empty content invalid line", []byte(""), LSPPosition{Line: 1, Character: 0}, 0, 0, -1, true, ErrPositionOutOfRange, ""}, // Line > 0 on empty file
 
-			{"Negative line", []byte(content), LSPPosition{Line: uint32(int32(-1)), Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""}, // Simulate negative line via cast
-			{"Negative char", []byte(content), LSPPosition{Line: 0, Character: uint32(int32(-1))}, 0, 0, -1, true, ErrPositionConversion, ""}, // Simulate negative char via cast
+			{"Negative line", []byte(content), LSPPosition{Line: uint32(int32(-1)), Character: 0}, 0, 0, -1, true, ErrInvalidPositionInput, ""}, // Simulate negative line via cast
+			{"Negative char", []byte(content), LSPPosition{Line: 0, Character: uint32(int32(-1))}, 0, 0, -1, true, ErrInvalidPositionInput, ""}, // Simulate negative char via cast
 
-			{"Line past end", []byte(content), LSPPosition{Line: 4, Character: 0}, 0, 0, -1, true, ErrPositionConversion, ""},              // Line 4 doesn't exist (only 0-3)
+			{"Line past end", []byte(content), LSPPosition{Line: 4, Character: 0}, 0, 0, -1, true, ErrPositionOutOfRange, ""},              // Line 4 doesn't exist (only 0-3)
 			{"Char past end line 1 (Clamps)", []byte(content), LSPPosition{Line: 0, Character: 10}, 1, 9, 8, false, nil, "Clamping"},       // Clamp char past 'one' (utf16 offset 10 > len 8) -> byte offset 8 (end), col 9
 			{"Char past end line 2 (Clamps)", []byte(content), LSPPosition{Line: 1, Character: 9}, 2, 12, 20, false, nil, "Clamping"},      // Clamp char past '😂' (utf16 offset 9 > len 8) -> byte offset 20 (end), col 12
 			{"Char past end line 3 (Clamps)", []byte(content), LSPPosition{Line: 2, Character: 8}, 3, 10, 30, false, nil, "Clamping"},      // Clamp char past '€' (utf16 offset 8 > len 7) -> byte offset 30 (end), col 10
-			{"Char past end empty line 4", []byte(content), LSPPosition{Line: 3, Character: 1}, 0, 0, -1, true, ErrPositionConversion, ""}, // Char > 0 on empty line
+			{"Char past end empty line 4", []byte(content), LSPPosition{Line: 3, Character: 1}, 0, 0, -1, true, ErrPositionOutOfRange, ""}, // Char > 0 on empty line
 		}
 
 		for _, tt := range tests {
