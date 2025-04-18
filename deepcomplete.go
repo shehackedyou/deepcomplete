@@ -1,42 +1,38 @@
 // Package deepcomplete provides core logic for local code completion using LLMs.
-// It includes components for interacting with LLMs (like Ollama), analyzing
-// Go code context using AST and type information, formatting prompts,
-// managing configuration, and caching analysis results.
 package deepcomplete
 
 import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256" // For hashing
-	"encoding/gob"  // For serializing cache data
+	"crypto/sha256"
+	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
-	"errors" // Using errors.Join requires Go 1.20+
+	"errors"
 	"fmt"
 	"go/ast"
-	"go/format" // For formatting receiver in preamble
+	"go/format"
 	"go/parser"
 	"go/token"
 	"go/types"
-	"io" // For file hashing errors
+	"io"
 	"log"
-	"net" // For network errors
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime/debug" // For panic recovery stack trace
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8" // Added for LSP position conversion helpers
+	"unicode/utf8"
 
-	"go.etcd.io/bbolt"                  // Import bbolt
-	"golang.org/x/tools/go/ast/astutil" // Utility for AST traversal
-	"golang.org/x/tools/go/packages"    // Standard way to load packages for analysis
-	// Removed: "golang.org/x/tools/go/types/exportdata" - No longer used due to instability/moves
+	"go.etcd.io/bbolt"
+	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 )
 
 // =============================================================================
@@ -46,7 +42,7 @@ import (
 const (
 	defaultOllamaURL = "http://localhost:11434"
 	defaultModel     = "deepseek-coder-r2"
-	// Standard prompt template
+	// Standard prompt template used for completions.
 	promptTemplate = `<s>[INST] <<SYS>>
 You are an expert Go programming assistant.
 Analyze the provided context (enclosing function/method, imports, scope variables, comments, code structure) and the preceding code snippet.
@@ -60,7 +56,7 @@ CONTEXT:
 CODE SNIPPET TO COMPLETE:
 ` + "```go\n%s\n```" + `
 [/INST]`
-	// FIM prompt template
+	// FIM prompt template used for fill-in-the-middle tasks.
 	fimPromptTemplate = `<s>[INST] <<SYS>>
 You are an expert Go programming assistant performing a fill-in-the-middle task.
 Analyze the provided context and the code surrounding the <MID> marker.
@@ -75,44 +71,36 @@ CODE TO FILL:
 <PRE>%s<MID>%s<SUF>
 [/INST]`
 
-	maxRetries       = 3
-	retryDelay       = 2 * time.Second
-	defaultMaxTokens = 256
-	// DefaultStop defines common stop sequences for code completion.
-	// Exported for potential use in CLI default flags.
-	DefaultStop        = "\n"
-	defaultTemperature = 0.1
-	// Default config file name
-	defaultConfigFileName = "config.json"
-	configDirName         = "deepcomplete" // Subdirectory name for config/data
-
-	// --- Cache Constants ---
-	// cacheSchemaVersion helps invalidate cache if format changes.
-	cacheSchemaVersion = 2
+	maxRetries            = 3               // Default number of retries for Ollama API calls.
+	retryDelay            = 2 * time.Second // Default delay between retries.
+	defaultMaxTokens      = 256             // Default maximum tokens for LLM response.
+	DefaultStop           = "\n"            // Default stop sequence for LLM. Exported for CLI use.
+	defaultTemperature    = 0.1             // Default sampling temperature for LLM.
+	defaultConfigFileName = "config.json"   // Default config file name.
+	configDirName         = "deepcomplete"  // Subdirectory name for config/data.
+	cacheSchemaVersion    = 2               // Used to invalidate cache if internal formats change.
 )
 
 var (
-	// --- Cache Bucket Name ---
-	cacheBucketName = []byte("AnalysisCache")
+	cacheBucketName = []byte("AnalysisCache") // Name of the bbolt bucket for caching.
 )
 
 // Config holds the active configuration for the autocompletion service.
 type Config struct {
-	OllamaURL      string   `json:"ollama_url"`       // URL of the Ollama API endpoint.
-	Model          string   `json:"model"`            // Name of the Ollama model to use.
-	PromptTemplate string   `json:"-"`                // Template for standard completion prompts (loaded internally).
-	FimTemplate    string   `json:"-"`                // Template for Fill-in-the-Middle prompts (loaded internally).
-	MaxTokens      int      `json:"max_tokens"`       // Maximum number of tokens for the completion response.
-	Stop           []string `json:"stop"`             // Sequences where the model should stop generating text.
-	Temperature    float64  `json:"temperature"`      // Sampling temperature for the Ollama model (0-1).
-	UseAst         bool     `json:"use_ast"`          // Enable Abstract Syntax Tree (AST) and type analysis for richer context.
-	UseFim         bool     `json:"use_fim"`          // Use Fill-in-the-Middle prompting instead of standard completion.
-	MaxPreambleLen int      `json:"max_preamble_len"` // Max length in bytes for the AST/Type context preamble in the prompt.
-	MaxSnippetLen  int      `json:"max_snippet_len"`  // Max length in bytes for the code snippet part of the prompt.
+	OllamaURL      string   `json:"ollama_url"`
+	Model          string   `json:"model"`
+	PromptTemplate string   `json:"-"` // Loaded internally, not from config file.
+	FimTemplate    string   `json:"-"` // Loaded internally, not from config file.
+	MaxTokens      int      `json:"max_tokens"`
+	Stop           []string `json:"stop"`
+	Temperature    float64  `json:"temperature"`
+	UseAst         bool     `json:"use_ast"`          // Enable AST/Type analysis.
+	UseFim         bool     `json:"use_fim"`          // Use Fill-in-the-Middle prompting.
+	MaxPreambleLen int      `json:"max_preamble_len"` // Max bytes for AST context preamble.
+	MaxSnippetLen  int      `json:"max_snippet_len"`  // Max bytes for code snippet context.
 }
 
-// Validate checks if the configuration values are valid.
-// It logs warnings and applies defaults for some invalid numeric values.
+// Validate checks if configuration values are valid, applying defaults for some fields.
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.OllamaURL) == "" {
 		return errors.New("ollama_url cannot be empty")
@@ -123,31 +111,28 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Model) == "" {
 		return errors.New("model cannot be empty")
 	}
+	// Apply defaults for invalid numeric values.
 	if c.MaxTokens <= 0 {
-		log.Printf("Warning: max_tokens (%d) is not positive, using default %d",
-			c.MaxTokens, defaultMaxTokens)
+		log.Printf("Warning: max_tokens (%d) is not positive, using default %d", c.MaxTokens, defaultMaxTokens)
 		c.MaxTokens = defaultMaxTokens
 	}
 	if c.Temperature < 0 {
-		log.Printf("Warning: temperature (%.2f) is negative, using default %.2f",
-			c.Temperature, defaultTemperature)
+		log.Printf("Warning: temperature (%.2f) is negative, using default %.2f", c.Temperature, defaultTemperature)
 		c.Temperature = defaultTemperature
 	}
 	if c.MaxPreambleLen <= 0 {
-		log.Printf("Warning: max_preamble_len (%d) is not positive, using default %d",
-			c.MaxPreambleLen, DefaultConfig.MaxPreambleLen)
+		log.Printf("Warning: max_preamble_len (%d) is not positive, using default %d", c.MaxPreambleLen, DefaultConfig.MaxPreambleLen)
 		c.MaxPreambleLen = DefaultConfig.MaxPreambleLen
 	}
 	if c.MaxSnippetLen <= 0 {
-		log.Printf("Warning: max_snippet_len (%d) is not positive, using default %d",
-			c.MaxSnippetLen, DefaultConfig.MaxSnippetLen)
+		log.Printf("Warning: max_snippet_len (%d) is not positive, using default %d", c.MaxSnippetLen, DefaultConfig.MaxSnippetLen)
 		c.MaxSnippetLen = DefaultConfig.MaxSnippetLen
 	}
 	return nil
 }
 
 // FileConfig represents the structure of the JSON config file for unmarshalling.
-// Pointers are used to distinguish between a field being absent and having a zero value.
+// Pointers distinguish between absent fields and zero values.
 type FileConfig struct {
 	OllamaURL      *string   `json:"ollama_url"`
 	Model          *string   `json:"model"`
@@ -160,49 +145,47 @@ type FileConfig struct {
 	MaxSnippetLen  *int      `json:"max_snippet_len"`
 }
 
-// AstContextInfo holds structured information extracted from AST/Types analysis.
-// This struct is populated during analysis and used to build the prompt preamble.
-// It is NOT directly cached anymore; only derived data is cached.
+// AstContextInfo holds structured information extracted from code analysis.
+// This is used internally to build the prompt preamble.
 type AstContextInfo struct {
-	FilePath           string                  // Absolute path to the analyzed file.
-	CursorPos          token.Pos               // Byte offset position of the cursor.
-	PackageName        string                  // Name of the package containing the file.
-	EnclosingFunc      *types.Func             // Type object for the enclosing function or method.
-	EnclosingFuncNode  *ast.FuncDecl           // AST node for the enclosing function or method.
-	ReceiverType       string                  // Formatted receiver type if it's a method (e.g., "(*MyType)").
-	EnclosingBlock     *ast.BlockStmt          // Innermost block statement containing the cursor.
-	Imports            []*ast.ImportSpec       // List of imports in the file.
-	CommentsNearCursor []string                // Relevant comments found near the cursor or associated node.
-	IdentifierAtCursor *ast.Ident              // Identifier AST node at the cursor, if any.
-	IdentifierType     types.Type              // Resolved type of the identifier at the cursor.
-	IdentifierObject   types.Object            // Resolved object (var, func, type, etc.) for the identifier.
-	SelectorExpr       *ast.SelectorExpr       // Selector expression (e.g., x.Y) at the cursor.
-	SelectorExprType   types.Type              // Resolved type of the expression being selected from (e.g., type of x).
-	CallExpr           *ast.CallExpr           // Call expression at the cursor.
-	CallExprFuncType   *types.Signature        // Resolved signature of the function being called.
-	CallArgIndex       int                     // Calculated index of the argument the cursor is likely positioned at (0-based).
-	ExpectedArgType    types.Type              // Expected type of the argument at the cursor position.
-	CompositeLit       *ast.CompositeLit       // Composite literal (struct, slice, map) at the cursor.
-	CompositeLitType   types.Type              // Resolved type of the composite literal.
-	VariablesInScope   map[string]types.Object // Map of identifiers (variables, constants, types, funcs) visible at the cursor position.
-	PromptPreamble     string                  // The final context string built from analysis OR retrieved from cache.
-	AnalysisErrors     []error                 // List of non-fatal errors encountered during analysis.
+	FilePath           string
+	CursorPos          token.Pos
+	PackageName        string
+	EnclosingFunc      *types.Func   // From type analysis.
+	EnclosingFuncNode  *ast.FuncDecl // From AST.
+	ReceiverType       string        // Formatted receiver if method.
+	EnclosingBlock     *ast.BlockStmt
+	Imports            []*ast.ImportSpec
+	CommentsNearCursor []string
+	IdentifierAtCursor *ast.Ident
+	IdentifierType     types.Type
+	IdentifierObject   types.Object
+	SelectorExpr       *ast.SelectorExpr // e.g., x.Y
+	SelectorExprType   types.Type        // Type of x.
+	CallExpr           *ast.CallExpr     // e.g., fn(a, b)
+	CallExprFuncType   *types.Signature  // Signature of fn.
+	CallArgIndex       int               // 0-based index of cursor arg.
+	ExpectedArgType    types.Type        // Expected type of arg at cursor.
+	CompositeLit       *ast.CompositeLit // e.g., T{...}
+	CompositeLitType   types.Type        // Type of T.
+	VariablesInScope   map[string]types.Object
+	PromptPreamble     string  // Generated context string (potentially from cache).
+	AnalysisErrors     []error // Non-fatal errors encountered during analysis.
 }
 
-// SnippetContext holds the code prefix and suffix relative to the cursor position.
+// SnippetContext holds the code prefix and suffix relative to the cursor.
 type SnippetContext struct {
-	Prefix   string // Code from the start of the file up to the cursor.
-	Suffix   string // Code from the cursor to the end of the file.
-	FullLine string // The full line of code where the cursor is located.
+	Prefix   string // Code before cursor.
+	Suffix   string // Code after cursor.
+	FullLine string // Full line where cursor is located.
 }
 
 // OllamaError defines a custom error for Ollama API issues.
 type OllamaError struct {
-	Message string // Error message from Ollama or HTTP client.
-	Status  int    // HTTP status code, if available.
+	Message string
+	Status  int // HTTP status code, if available.
 }
 
-// Error implements the error interface for OllamaError.
 func (e *OllamaError) Error() string {
 	if e.Status != 0 {
 		return fmt.Sprintf("Ollama error: %s (Status: %d)", e.Message, e.Status)
@@ -210,56 +193,47 @@ func (e *OllamaError) Error() string {
 	return fmt.Sprintf("Ollama error: %s", e.Message)
 }
 
-// OllamaResponse represents the streaming response structure from Ollama's /api/generate.
+// OllamaResponse represents the streaming response structure from Ollama.
 type OllamaResponse struct {
-	Response string `json:"response"`        // The generated text chunk.
-	Done     bool   `json:"done"`            // True if this is the final response chunk.
-	Error    string `json:"error,omitempty"` // Potential error message from Ollama within the stream.
+	Response string `json:"response"`
+	Done     bool   `json:"done"`
+	Error    string `json:"error,omitempty"`
 }
 
-// --- Cache Data Structures ---
-
-// CachedAnalysisData holds the derived information extracted from analysis
-// that is needed to reconstruct the prompt preamble. This struct is gob-encoded
-// and stored in the cache.
+// CachedAnalysisData holds derived information stored in the cache (gob-encoded).
 type CachedAnalysisData struct {
-	PackageName    string // Name of the package.
-	PromptPreamble string // The generated preamble string.
+	PackageName    string
+	PromptPreamble string
 }
 
-// CachedAnalysisEntry represents the structure stored in the bbolt database.
-// It includes metadata (hashes) and the gob-encoded analysis results.
+// CachedAnalysisEntry represents the full structure stored in bbolt.
 type CachedAnalysisEntry struct {
-	SchemaVersion   int               // Cache format version for invalidation.
-	GoModHash       string            // Hash of the go.mod file.
-	InputFileHashes map[string]string // Hashes of relevant source files (key: relative path).
+	SchemaVersion   int               // Cache format version.
+	GoModHash       string            // Hash of go.mod.
+	InputFileHashes map[string]string // Hashes of source files (key: relative path).
 	AnalysisGob     []byte            // Gob-encoded CachedAnalysisData.
 }
 
-// LSPPosition represents the 0-based line and character offset used by the Language Server Protocol.
-// Character offset is measured in UTF-16 code units.
+// LSPPosition represents a 0-based line/character offset (UTF-16).
 type LSPPosition struct {
-	Line      uint32 // 0-based line number.
-	Character uint32 // 0-based UTF-16 code unit offset from the start of the line.
+	Line      uint32
+	Character uint32
 }
 
 // MemberKind defines the type of member (field or method).
 type MemberKind string
 
 const (
-	// FieldMember indicates a struct field.
-	FieldMember MemberKind = "field"
-	// MethodMember indicates a method.
+	FieldMember  MemberKind = "field"
 	MethodMember MemberKind = "method"
-	// OtherMember indicates other kinds (e.g., built-in operations).
-	OtherMember MemberKind = "other"
+	OtherMember  MemberKind = "other" // Built-ins, etc.
 )
 
-// MemberInfo holds structured information about a type member (field or method).
+// MemberInfo holds structured information about a type member.
 type MemberInfo struct {
-	Name       string     // Name of the field or method.
-	Kind       MemberKind // Kind of member (FieldMember, MethodMember).
-	TypeString string     // String representation of the member's type or signature.
+	Name       string
+	Kind       MemberKind
+	TypeString string // Type representation.
 }
 
 // =============================================================================
@@ -267,68 +241,41 @@ type MemberInfo struct {
 // =============================================================================
 
 var (
-	// ErrAnalysisFailed indicates that code analysis failed, potentially partially.
-	// It might wrap more specific errors. Check underlying errors for details.
-	ErrAnalysisFailed = errors.New("code analysis failed")
-	// ErrOllamaUnavailable indicates the Ollama API endpoint could not be reached or returned a server error.
-	ErrOllamaUnavailable = errors.New("ollama API unavailable or returned server error")
-	// ErrStreamProcessing indicates an error occurred while reading or processing the LLM's response stream.
-	ErrStreamProcessing = errors.New("error processing LLM stream")
-	// ErrConfig indicates an error occurred during configuration loading or validation.
-	ErrConfig = errors.New("configuration error")
-	// ErrInvalidConfig indicates that the provided or loaded configuration is invalid.
-	ErrInvalidConfig = errors.New("invalid configuration")
-
-	// --- Cache Errors (Step 3) ---
-	// ErrCache indicates a general failure during a cache operation (read, write, delete).
-	ErrCache = errors.New("cache operation failed")
-	// ErrCacheRead indicates a failure during reading from the cache.
-	ErrCacheRead = errors.New("cache read failed")
-	// ErrCacheWrite indicates a failure during writing to the cache.
-	ErrCacheWrite = errors.New("cache write failed")
-	// ErrCacheDecode indicates a failure decoding data read from the cache.
-	ErrCacheDecode = errors.New("cache decode failed")
-	// ErrCacheEncode indicates a failure encoding data for writing to the cache.
-	ErrCacheEncode = errors.New("cache encode failed")
-	// ErrCacheHash indicates a failure calculating file hashes for cache validation.
-	ErrCacheHash = errors.New("cache hash calculation failed")
-
-	// --- Position Conversion Errors (Step 3) ---
-	// ErrPositionConversion indicates a general failure during LSP position to byte offset conversion.
-	ErrPositionConversion = errors.New("position conversion failed")
-	// ErrInvalidPositionInput indicates that the input line or character position was invalid (e.g., negative).
-	ErrInvalidPositionInput = errors.New("invalid input position")
-	// ErrPositionOutOfRange indicates that the input position is outside the valid range of the document content.
-	ErrPositionOutOfRange = errors.New("position out of range")
-	// ErrInvalidUTF8 indicates invalid UTF-8 sequence encountered during conversion.
-	ErrInvalidUTF8 = errors.New("invalid utf-8 sequence")
+	ErrAnalysisFailed       = errors.New("code analysis failed")        // Non-fatal if preamble generated.
+	ErrOllamaUnavailable    = errors.New("ollama API unavailable")      // Network or server error.
+	ErrStreamProcessing     = errors.New("error processing LLM stream") // Issue reading/parsing stream.
+	ErrConfig               = errors.New("configuration error")         // Issue loading/saving config.
+	ErrInvalidConfig        = errors.New("invalid configuration")       // Provided config values are bad.
+	ErrCache                = errors.New("cache operation failed")      // General cache error.
+	ErrCacheRead            = errors.New("cache read failed")
+	ErrCacheWrite           = errors.New("cache write failed")
+	ErrCacheDecode          = errors.New("cache decode failed")
+	ErrCacheEncode          = errors.New("cache encode failed")
+	ErrCacheHash            = errors.New("cache hash calculation failed")
+	ErrPositionConversion   = errors.New("position conversion failed") // LSP <-> byte offset.
+	ErrInvalidPositionInput = errors.New("invalid input position")     // Line/col < 0, etc.
+	ErrPositionOutOfRange   = errors.New("position out of range")      // Position outside document bounds.
+	ErrInvalidUTF8          = errors.New("invalid utf-8 sequence")     // During position conversion.
 )
 
 // =============================================================================
 // Interfaces for Components
 // =============================================================================
 
-// LLMClient defines the interface for interacting with the LLM API.
+// LLMClient defines interaction with the LLM API.
 type LLMClient interface {
-	// GenerateStream sends a prompt to the LLM and returns a reader for the streaming response.
 	GenerateStream(ctx context.Context, prompt string, config Config) (io.ReadCloser, error)
 }
 
-// Analyzer defines the interface for analyzing code context.
+// Analyzer defines code context analysis.
 type Analyzer interface {
-	// Analyze performs code analysis for the given file and cursor position.
-	// It returns structured context information and potentially non-fatal errors.
 	Analyze(ctx context.Context, filename string, line, col int) (*AstContextInfo, error)
-	// Close releases any resources held by the analyzer (e.g., cache database).
 	Close() error
-	// InvalidateCache removes cached data associated with a specific directory.
 	InvalidateCache(dir string) error
 }
 
-// PromptFormatter defines the interface for formatting the final prompt sent to the LLM.
+// PromptFormatter defines prompt construction.
 type PromptFormatter interface {
-	// FormatPrompt combines the context preamble and code snippet into the final prompt string,
-	// applying necessary formatting and truncation based on the config.
 	FormatPrompt(contextPreamble string, snippetCtx SnippetContext, config Config) string
 }
 
@@ -337,14 +284,14 @@ type PromptFormatter interface {
 // =============================================================================
 
 var (
-	// DefaultConfig provides default settings for the DeepCompleter service.
+	// DefaultConfig provides default settings.
 	DefaultConfig = Config{
 		OllamaURL:      defaultOllamaURL,
 		Model:          defaultModel,
 		PromptTemplate: promptTemplate,
 		FimTemplate:    fimPromptTemplate,
 		MaxTokens:      defaultMaxTokens,
-		Stop:           []string{DefaultStop, "}", "//", "/*"},
+		Stop:           []string{DefaultStop, "}", "//", "/*"}, // Common Go stop sequences.
 		Temperature:    defaultTemperature,
 		UseAst:         true,
 		UseFim:         false,
@@ -352,25 +299,20 @@ var (
 		MaxSnippetLen:  2048,
 	}
 
-	// ColorReset resets terminal color.
-	ColorReset = "\033[0m"
-	// ColorGreen defines a green color code for terminal output.
-	ColorGreen = "\033[38;5;119m"
-	// ColorYellow defines a yellow color code for terminal output.
+	// Terminal color codes.
+	ColorReset  = "\033[0m"
+	ColorGreen  = "\033[38;5;119m"
 	ColorYellow = "\033[38;5;220m"
-	// ColorBlue defines a blue color code for terminal output.
-	ColorBlue = "\033[38;5;153m"
-	// ColorRed defines a red color code for terminal output.
-	ColorRed = "\033[38;5;203m"
-	// ColorCyan defines a cyan color code for terminal output.
-	ColorCyan = "\033[38;5;141m"
+	ColorBlue   = "\033[38;5;153m"
+	ColorRed    = "\033[38;5;203m"
+	ColorCyan   = "\033[38;5;141m"
 )
 
 // =============================================================================
-// Exported Helper Functions (e.g., for CLI)
+// Exported Helper Functions
 // =============================================================================
 
-// PrettyPrint prints colored text to the standard error stream.
+// PrettyPrint prints colored text to stderr.
 func PrettyPrint(color, text string) {
 	fmt.Fprint(os.Stderr, color, text, ColorReset)
 }
@@ -379,8 +321,8 @@ func PrettyPrint(color, text string) {
 // Configuration Loading
 // =============================================================================
 
-// LoadConfig loads configuration from standard locations (XDG config, ~/.config),
-// merges with defaults, and attempts to write a default config file if none exists.
+// LoadConfig loads configuration from standard locations, merges with defaults,
+// and attempts to write a default config if none exists or is invalid.
 func LoadConfig() (Config, error) {
 	cfg := DefaultConfig
 	var loadedFromFile bool
@@ -393,12 +335,12 @@ func LoadConfig() (Config, error) {
 		log.Printf("Warning: Could not determine config paths: %v", pathErr)
 	}
 
-	// Try loading from primary path first
+	// Try loading from primary path first.
 	if primaryPath != "" {
 		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg)
 		if loadErr != nil {
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				configParseError = loadErr
+				configParseError = loadErr // Track parsing error specifically.
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", primaryPath, loadErr))
 		}
@@ -410,13 +352,13 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Try secondary path ONLY if primary was not found OR if primary existed but failed reading/parsing
+	// Try secondary path ONLY if primary was not found OR failed reading/parsing.
 	primaryNotFound := len(loadErrors) > 0 && errors.Is(loadErrors[len(loadErrors)-1], os.ErrNotExist)
 	if !loadedFromFile && secondaryPath != "" && (primaryNotFound || primaryPath == "") {
 		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg)
 		if loadErr != nil {
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				if configParseError == nil {
+				if configParseError == nil { // Only store first parse error.
 					configParseError = loadErr
 				}
 			}
@@ -430,7 +372,7 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Write default config if no file existed OR if parsing failed
+	// Write default config if no file existed OR if parsing failed.
 	loadSucceeded := loadedFromFile && configParseError == nil
 	if !loadSucceeded {
 		if configParseError != nil {
@@ -438,7 +380,7 @@ func LoadConfig() (Config, error) {
 		} else {
 			log.Println("No config file found. Attempting to write default.")
 		}
-		writePath := primaryPath
+		writePath := primaryPath // Prefer primary path for writing default.
 		if writePath == "" {
 			writePath = secondaryPath
 		}
@@ -452,10 +394,10 @@ func LoadConfig() (Config, error) {
 			log.Println("Warning: Cannot determine path to write default config.")
 			loadErrors = append(loadErrors, errors.New("cannot determine default config path"))
 		}
-		cfg = DefaultConfig // Use defaults if load failed
+		cfg = DefaultConfig // Use defaults if load failed or parse error occurred.
 	}
 
-	// Assign internal templates
+	// Assign internal templates (not loaded from file).
 	if cfg.PromptTemplate == "" {
 		cfg.PromptTemplate = promptTemplate
 	}
@@ -463,66 +405,82 @@ func LoadConfig() (Config, error) {
 		cfg.FimTemplate = fimPromptTemplate
 	}
 
-	// Validate final config
+	// Validate the final merged/default configuration.
 	finalCfg := cfg
 	if err := finalCfg.Validate(); err != nil {
 		log.Printf("Warning: Config after load/merge failed validation: %v. Returning defaults.", err)
 		loadErrors = append(loadErrors, fmt.Errorf("post-load config validation failed: %w", err))
+		// Ensure default config itself is valid.
 		if valErr := DefaultConfig.Validate(); valErr != nil {
+			// This is a critical internal error.
 			return DefaultConfig, fmt.Errorf("default config is invalid: %w", valErr)
 		}
-		finalCfg = DefaultConfig
+		finalCfg = DefaultConfig // Fallback to pure defaults on validation failure.
 	}
 
-	// Return validated config and any non-fatal load errors
+	// Return validated config and any non-fatal load errors wrapped in ErrConfig.
 	if len(loadErrors) > 0 {
+		// Use errors.Join to combine multiple load/write errors.
 		return finalCfg, fmt.Errorf("%w: %w", ErrConfig, errors.Join(loadErrors...))
 	}
 	return finalCfg, nil
 }
 
-// getConfigPaths determines the primary (XDG) and secondary (~/.local/share) config paths.
+// getConfigPaths determines the primary (XDG) and secondary (~/.config) config paths.
 func getConfigPaths() (primary string, secondary string, err error) {
 	var cfgErr, homeErr error
-	userConfigDir, cfgErr := os.UserConfigDir()
+	userConfigDir, cfgErr := os.UserConfigDir() // e.g., ~/.config or AppData
 	if cfgErr == nil {
 		primary = filepath.Join(userConfigDir, configDirName, defaultConfigFileName)
 	} else {
 		log.Printf("Warning: Could not determine user config directory: %v", cfgErr)
 	}
+
+	// Fallback using home directory if XDG path failed.
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
-		if primary == "" && cfgErr != nil { // Fallback path using HOME if XDG fails
-			primary = filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
+		// Use ~/.config as secondary/fallback if XDG failed.
+		secondary = filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
+		if primary == "" && cfgErr != nil {
+			primary = secondary // Promote secondary to primary if XDG failed.
 			log.Printf("Using fallback primary config path: %s", primary)
+			secondary = "" // Avoid checking ~/.config twice.
 		}
-		secondary = filepath.Join(homeDir, ".local", "share", configDirName, defaultConfigFileName)
+		// Avoid setting secondary if it's the same as primary.
+		if primary == secondary {
+			secondary = ""
+		}
 	} else {
 		log.Printf("Warning: Could not determine user home directory: %v", homeErr)
 	}
-	if primary == "" && secondary == "" { // Report error only if BOTH failed
+
+	// Report error only if BOTH determination methods failed.
+	if primary == "" && secondary == "" {
 		err = fmt.Errorf("cannot determine config/home directories: config error: %v; home error: %v", cfgErr, homeErr)
 	}
 	return primary, secondary, err
 }
 
-// loadAndMergeConfig attempts to load config from a path and merge it into cfg.
-func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
+// loadAndMergeConfig attempts to load config from a path and merge into cfg.
+func loadAndMergeConfig(path string, cfg *Config) (loaded bool, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+			return false, nil // File not found is not an error here.
 		}
-		return true, fmt.Errorf("reading config file %q failed: %w", path, err)
+		return true, fmt.Errorf("reading config file %q failed: %w", path, err) // Return true because file exists but read failed.
 	}
 	if len(data) == 0 {
 		log.Printf("Warning: Config file exists but is empty: %s", path)
-		return true, nil
+		return true, nil // File exists but is empty.
 	}
+
 	var fileCfg FileConfig
 	if err := json.Unmarshal(data, &fileCfg); err != nil {
-		return true, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
+		return true, fmt.Errorf("parsing config file JSON %q failed: %w", path, err) // File exists but parse failed.
 	}
+
+	// Merge non-nil fields from fileCfg into cfg.
 	if fileCfg.OllamaURL != nil {
 		cfg.OllamaURL = *fileCfg.OllamaURL
 	}
@@ -550,15 +508,18 @@ func loadAndMergeConfig(path string, cfg *Config) (bool, error) {
 	if fileCfg.MaxSnippetLen != nil {
 		cfg.MaxSnippetLen = *fileCfg.MaxSnippetLen
 	}
-	return true, nil
+
+	return true, nil // Loaded and merged successfully.
 }
 
 // writeDefaultConfig creates the directory and writes the default config as JSON.
 func writeDefaultConfig(path string, defaultConfig Config) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil { // Use appropriate permissions.
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
+
+	// Use a temporary struct to marshal only the exportable fields.
 	type ExportableConfig struct {
 		OllamaURL      string   `json:"ollama_url"`
 		Model          string   `json:"model"`
@@ -581,10 +542,12 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 		MaxPreambleLen: defaultConfig.MaxPreambleLen,
 		MaxSnippetLen:  defaultConfig.MaxSnippetLen,
 	}
+
 	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal default config to JSON: %w", err)
 	}
+	// Write with restricted permissions.
 	if err := os.WriteFile(path, jsonData, 0640); err != nil {
 		return fmt.Errorf("failed to write default config file %s: %w", path, err)
 	}
@@ -593,34 +556,38 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 }
 
 // =============================================================================
-// Default Implementations (Continued)
+// Default Component Implementations
 // =============================================================================
 
-// --- Ollama Client ---
-type httpOllamaClient struct{ httpClient *http.Client }
+// httpOllamaClient implements LLMClient using HTTP requests to Ollama.
+type httpOllamaClient struct {
+	httpClient *http.Client
+}
 
 func newHttpOllamaClient() *httpOllamaClient {
+	// Configure HTTP client with a reasonable timeout.
 	return &httpOllamaClient{httpClient: &http.Client{Timeout: 90 * time.Second}}
 }
 
+// GenerateStream sends a request to Ollama's /api/generate endpoint.
 func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, config Config) (io.ReadCloser, error) {
 	base := strings.TrimSuffix(config.OllamaURL, "/")
-	endpointPath := "/api/generate"
-	endpointURL := base + endpointPath
+	endpointURL := base + "/api/generate"
 
 	u, err := url.Parse(endpointURL)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing Ollama URL '%s': %w", endpointURL, err)
 	}
 
+	// Construct the JSON payload for Ollama API.
 	payload := map[string]interface{}{
 		"model":  config.Model,
 		"prompt": prompt,
-		"stream": true,
+		"stream": true, // Request streaming response.
 		"options": map[string]interface{}{
 			"temperature": config.Temperature,
-			"num_ctx":     4096,
-			"top_p":       0.9,
+			"num_ctx":     4096, // Consider making configurable?
+			"top_p":       0.9,  // Consider making configurable?
 			"stop":        config.Stop,
 			"num_predict": config.MaxTokens,
 		},
@@ -630,15 +597,17 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 		return nil, fmt.Errorf("error marshaling JSON payload: %w", err)
 	}
 
+	// Create and send the HTTP request.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/x-ndjson")
+	req.Header.Set("Accept", "application/x-ndjson") // Expect newline-delimited JSON.
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// Handle common network errors.
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: ollama request timed out after %v: %w", ErrOllamaUnavailable, c.httpClient.Timeout, err)
 		}
@@ -646,14 +615,17 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 		if errors.As(err, &netErr) && netErr.Op == "dial" {
 			return nil, fmt.Errorf("%w: connection refused or network error connecting to %s: %w", ErrOllamaUnavailable, u.Host, err)
 		}
-		return nil, fmt.Errorf("%w: error making HTTP request: %w", ErrOllamaUnavailable, err)
+		return nil, fmt.Errorf("%w: http request failed: %w", ErrOllamaUnavailable, err)
 	}
+
+	// Check for non-200 status codes.
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, readErr := io.ReadAll(resp.Body)
-		bodyString := "(read error)"
+		bodyString := "(failed to read error response body)"
 		if readErr == nil {
 			bodyString = string(bodyBytes)
+			// Try to extract specific error message from Ollama JSON response.
 			var ollamaErrResp struct {
 				Error string `json:"error"`
 			}
@@ -662,21 +634,26 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 			}
 		}
 		err = &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
-		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err) // Wrap the specific OllamaError.
 	}
+
+	// Return the response body for streaming.
 	return resp.Body, nil
 }
 
-// --- Code Analyzer (bbolt implementation) ---
+// GoPackagesAnalyzer implements Analyzer using go/packages and bbolt caching.
 type GoPackagesAnalyzer struct {
-	db *bbolt.DB
-	mu sync.Mutex
+	db *bbolt.DB  // BoltDB handle for caching.
+	mu sync.Mutex // Protects access to db handle during Close.
 }
 
+// NewGoPackagesAnalyzer initializes the analyzer and opens the bbolt cache DB.
 func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 	dbPath := ""
+	// Determine cache directory path.
 	userCacheDir, err := os.UserCacheDir()
 	if err == nil {
+		// Include schema version in path to auto-invalidate old caches.
 		dbDir := filepath.Join(userCacheDir, configDirName, "bboltdb", fmt.Sprintf("v%d", cacheSchemaVersion))
 		if err := os.MkdirAll(dbDir, 0750); err == nil {
 			dbPath = filepath.Join(dbDir, "analysis_cache.db")
@@ -689,12 +666,14 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 
 	var db *bbolt.DB
 	if dbPath != "" {
+		// Open bbolt database with a timeout.
 		opts := &bbolt.Options{Timeout: 1 * time.Second}
-		db, err = bbolt.Open(dbPath, 0600, opts)
+		db, err = bbolt.Open(dbPath, 0600, opts) // Restrictive file permissions.
 		if err != nil {
 			log.Printf("Warning: Failed to open bbolt cache file %s: %v. Caching will be disabled.", dbPath, err)
-			db = nil
+			db = nil // Ensure db is nil if open fails.
 		} else {
+			// Ensure the cache bucket exists.
 			err = db.Update(func(tx *bbolt.Tx) error {
 				_, err := tx.CreateBucketIfNotExists(cacheBucketName)
 				if err != nil {
@@ -704,7 +683,7 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 			})
 			if err != nil {
 				log.Printf("Warning: Failed to ensure bbolt bucket exists: %v. Caching disabled.", err)
-				db.Close()
+				db.Close() // Close DB if bucket creation failed.
 				db = nil
 			} else {
 				log.Printf("Using bbolt cache at %s (Schema v%d)", dbPath, cacheSchemaVersion)
@@ -714,34 +693,36 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 	return &GoPackagesAnalyzer{db: db}
 }
 
+// Close closes the bbolt database connection if open.
 func (a *GoPackagesAnalyzer) Close() error {
-	a.mu.Lock()
+	a.mu.Lock() // Ensure exclusive access to db handle during close.
 	defer a.mu.Unlock()
 	if a.db != nil {
 		log.Println("Closing bbolt cache database.")
 		err := a.db.Close()
-		a.db = nil
+		a.db = nil // Set to nil after closing.
 		return err
 	}
 	return nil
 }
 
+// Analyze performs code analysis, utilizing the cache if possible.
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line, col int) (info *AstContextInfo, analysisErr error) {
 	info = &AstContextInfo{
 		FilePath:         filename,
 		VariablesInScope: make(map[string]types.Object),
 		AnalysisErrors:   make([]error, 0),
-		CallArgIndex:     -1,
+		CallArgIndex:     -1, // Default value.
 	}
+	// Recover from potential panics during analysis.
 	defer func() {
-		r := recover()
-		if r != nil {
+		if r := recover(); r != nil {
 			panicErr := fmt.Errorf("internal panic during analysis: %v", r)
-			addAnalysisError(info, panicErr)
+			addAnalysisError(info, panicErr) // Log panic as analysis error.
 			if analysisErr == nil {
 				analysisErr = panicErr
 			} else {
-				analysisErr = errors.Join(analysisErr, panicErr)
+				analysisErr = errors.Join(analysisErr, panicErr) // Append panic error.
 			}
 			log.Printf("Panic recovered during AnalyzeCodeContext: %v\n%s", r, string(debug.Stack()))
 		}
@@ -755,75 +736,91 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 	log.Printf("Starting context analysis for: %s (%d:%d)", absFilename, line, col)
 	dir := filepath.Dir(absFilename)
 
+	// --- Cache Check ---
 	goModHash := calculateGoModHash(dir)
-	cacheKey := []byte(dir + "::" + goModHash)
+	cacheKey := []byte(dir + "::" + goModHash) // Cache key based on dir and go.mod hash.
 	var loadDuration, stepsDuration, preambleDuration time.Duration
 	cacheHit := false
 	var cachedEntry *CachedAnalysisEntry
 
-	// --- Try Loading from Cache ---
+	// Try reading from cache if db is available.
 	if a.db != nil {
 		readStart := time.Now()
 		dbErr := a.db.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(cacheBucketName)
 			if b == nil {
+				// Bucket might disappear if DB file is corrupted/deleted externally.
 				return fmt.Errorf("%w: cache bucket %s not found during View", ErrCacheRead, string(cacheBucketName))
 			}
 			valBytes := b.Get(cacheKey)
 			if valBytes == nil {
-				return nil // Cache miss
+				return nil // Cache miss.
 			}
 
+			// Decode the cached entry header.
 			var decoded CachedAnalysisEntry
 			decoder := gob.NewDecoder(bytes.NewReader(valBytes))
 			if err := decoder.Decode(&decoded); err != nil {
 				log.Printf("Warning: Failed to gob-decode cached entry header for key %s: %v. Treating as miss.", string(cacheKey), err)
+				// Return wrapped error to indicate decode failure.
 				return fmt.Errorf("%w: %w", ErrCacheDecode, err)
 			}
+			// Check schema version for compatibility.
 			if decoded.SchemaVersion != cacheSchemaVersion {
 				log.Printf("Warning: Cache data for key %s has old schema version %d (want %d). Ignoring.", string(cacheKey), decoded.SchemaVersion, cacheSchemaVersion)
-				return nil
+				return nil // Treat as miss if schema differs.
 			}
-			cachedEntry = &decoded
+			cachedEntry = &decoded // Store decoded entry for hash validation.
 			return nil
 		})
-		if dbErr != nil && !errors.Is(dbErr, ErrCacheDecode) {
-			log.Printf("Warning: Error reading from bbolt cache: %v", dbErr)
-			addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheRead, dbErr))
+		// Handle cache read/decode errors.
+		if dbErr != nil {
+			log.Printf("Warning: Error reading or decoding from bbolt cache: %v", dbErr)
+			addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheRead, dbErr)) // Log as non-fatal analysis error.
+			// If decode failed, try to delete the corrupted entry.
+			if errors.Is(dbErr, ErrCacheDecode) {
+				a.deleteCacheEntry(cacheKey)
+			}
 		}
 		log.Printf("DEBUG: Cache read attempt took %v", time.Since(readStart))
 	} else {
 		log.Printf("DEBUG: Cache disabled (db handle is nil).")
 	}
 
-	// --- Validate Cache Hit and Use Cached Data ---
+	// Validate cache hit based on file hashes.
 	if cachedEntry != nil {
 		validationStart := time.Now()
 		log.Printf("DEBUG: Potential cache hit for key: %s. Validating file hashes...", string(cacheKey))
-		currentHashes, hashErr := calculateInputHashes(dir, nil) // Pass nil pkg here, load pkg only on miss
+		// Calculate current hashes (pass nil pkg, load only on miss).
+		currentHashes, hashErr := calculateInputHashes(dir, nil)
+		// Check go.mod hash and individual file hashes.
 		if hashErr == nil &&
 			cachedEntry.GoModHash == goModHash &&
-			compareFileHashes(currentHashes, cachedEntry.InputFileHashes) { // compareFileHashes now logs details
+			compareFileHashes(currentHashes, cachedEntry.InputFileHashes) { // compareFileHashes logs details on mismatch.
+
 			log.Printf("DEBUG: Cache VALID for key: %s. Attempting to decode analysis data...", string(cacheKey))
 			decodeStart := time.Now()
+			// Decode the actual analysis data (preamble).
 			var analysisData CachedAnalysisData
 			decoder := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob))
 			if decodeErr := decoder.Decode(&analysisData); decodeErr == nil {
+				// Cache hit and decode successful! Use cached data.
 				info.PackageName = analysisData.PackageName
 				info.PromptPreamble = analysisData.PromptPreamble
 				cacheHit = true
-				loadDuration = time.Since(decodeStart)
+				loadDuration = time.Since(decodeStart) // Use decode time as load time for hits.
 				log.Printf("DEBUG: Analysis data successfully decoded from cache in %v.", loadDuration)
 				log.Printf("DEBUG: Using cached preamble (length %d). Skipping packages.Load and analysis steps.", len(info.PromptPreamble))
 			} else {
+				// Failed to decode analysis data - cache entry is corrupt.
 				log.Printf("Warning: Failed to gob-decode cached analysis data: %v. Treating as miss.", decodeErr)
 				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr))
-				a.deleteCacheEntry(cacheKey)
+				a.deleteCacheEntry(cacheKey) // Delete corrupt entry.
 			}
 		} else {
-			// compareFileHashes logs specific reasons now
+			// Cache is invalid (hash mismatch or error calculating current hashes).
 			log.Printf("DEBUG: Cache INVALID for key: %s (HashErr: %v). Treating as miss.", string(cacheKey), hashErr)
-			a.deleteCacheEntry(cacheKey)
+			a.deleteCacheEntry(cacheKey) // Delete invalid entry.
 			if hashErr != nil {
 				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr))
 			}
@@ -839,17 +836,17 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			log.Printf("DEBUG: Cache miss or invalid for key: %s. Loading via packages.Load...", string(cacheKey))
 		}
 
-		// 1. Load Package Info
+		// 1. Load Go package information.
 		loadStart := time.Now()
 		fset := token.NewFileSet()
 		targetPkg, targetFileAST, targetFile, loadErrors := loadPackageInfo(ctx, absFilename, fset)
 		loadDuration = time.Since(loadStart)
 		log.Printf("DEBUG: packages.Load completed in %v", loadDuration)
 		for _, loadErr := range loadErrors {
-			addAnalysisError(info, loadErr)
+			addAnalysisError(info, loadErr) // Add errors from package loading.
 		}
 
-		// 2. Perform Detailed Analysis Steps
+		// 2. Perform detailed AST/Type analysis steps if loading was successful enough.
 		if targetFile != nil && fset != nil {
 			stepsStart := time.Now()
 			analyzeStepErr := a.performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, info)
@@ -859,6 +856,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 				addAnalysisError(info, analyzeStepErr)
 			}
 		} else {
+			// Log if analysis cannot proceed due to load failures.
 			if targetFile == nil {
 				addAnalysisError(info, errors.New("cannot perform analysis steps: missing target file after load"))
 			}
@@ -867,12 +865,13 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			}
 		}
 
-		// 3. Build Preamble
-		var qualifier types.Qualifier
+		// 3. Build the context preamble string from analysis results.
+		var qualifier types.Qualifier // Used for formatting type names relative to the package.
 		if targetPkg != nil && targetPkg.Types != nil {
 			info.PackageName = targetPkg.Types.Name()
 			qualifier = types.RelativeTo(targetPkg.Types)
 		} else {
+			// Fallback qualifier if type info is missing.
 			qualifier = func(other *types.Package) string {
 				if other != nil {
 					return other.Path()
@@ -886,13 +885,15 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 		preambleDuration = time.Since(preambleStart)
 		log.Printf("DEBUG: buildPreamble completed in %v", preambleDuration)
 
-		// 4. Save to Cache
-		if a.db != nil && info.PromptPreamble != "" && len(loadErrors) == 0 { // Only cache if load was clean
+		// 4. Save results to cache if enabled, preamble generated, and no load errors.
+		// Only cache results from successful loads to avoid caching partial/incorrect data.
+		if a.db != nil && info.PromptPreamble != "" && len(loadErrors) == 0 {
 			log.Printf("DEBUG: Attempting to save analysis results to bbolt cache. Key: %s", string(cacheKey))
 			saveStart := time.Now()
-			// Use the loaded package info for hashing now
+			// Use the loaded package info for hashing now.
 			inputHashes, hashErr := calculateInputHashes(dir, targetPkg)
 			if hashErr == nil {
+				// Prepare data for gob encoding.
 				analysisDataToCache := CachedAnalysisData{
 					PackageName:    info.PackageName,
 					PromptPreamble: info.PromptPreamble,
@@ -901,6 +902,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 				encoder := gob.NewEncoder(&gobBuf)
 				if encodeErr := encoder.Encode(&analysisDataToCache); encodeErr == nil {
 					analysisGob := gobBuf.Bytes()
+					// Prepare the full cache entry with metadata.
 					entryToSave := CachedAnalysisEntry{
 						SchemaVersion:   cacheSchemaVersion,
 						GoModHash:       goModHash,
@@ -911,9 +913,11 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 					entryEncoder := gob.NewEncoder(&entryBuf)
 					if entryEncodeErr := entryEncoder.Encode(&entryToSave); entryEncodeErr == nil {
 						encodedBytes := entryBuf.Bytes()
+						// Write to bbolt database.
 						saveErr := a.db.Update(func(tx *bbolt.Tx) error {
 							b := tx.Bucket(cacheBucketName)
 							if b == nil {
+								// Should not happen if initialization succeeded.
 								return fmt.Errorf("%w: cache bucket %s disappeared during save", ErrCacheWrite, string(cacheBucketName))
 							}
 							log.Printf("DEBUG: Writing %d bytes to cache for key %s", len(encodedBytes), string(cacheKey))
@@ -938,39 +942,41 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr))
 			}
 		} else if a.db != nil {
+			// Log why caching was skipped.
 			log.Printf("DEBUG: Skipping cache save for key %s (Load Errors: %d, Preamble Empty: %t)",
 				string(cacheKey), len(loadErrors), info.PromptPreamble == "")
 		}
 	}
 
-	// Log final state
+	// Log final state and errors.
 	logAnalysisErrors(info.AnalysisErrors)
-	analysisErr = errors.Join(info.AnalysisErrors...)
+	analysisErr = errors.Join(info.AnalysisErrors...) // Combine all non-fatal errors.
 
+	// Log summary timing.
 	if cacheHit {
 		log.Printf("Context analysis finished (Decode: %v, Cache Hit: %t)", loadDuration, cacheHit)
 	} else {
 		log.Printf("Context analysis finished (Load: %v, Steps: %v, Preamble: %v, Cache Hit: %t)",
 			loadDuration, stepsDuration, preambleDuration, cacheHit)
 	}
+	// Log truncated preamble for context.
 	if len(info.PromptPreamble) > 500 {
 		log.Printf("Final Context Preamble (length %d):\n---\n%s\n... (preamble truncated in log)\n---", len(info.PromptPreamble), info.PromptPreamble[:500])
 	} else {
 		log.Printf("Final Context Preamble (length %d):\n---\n%s\n---", len(info.PromptPreamble), info.PromptPreamble)
 	}
 
-	// Determine final return error
-	if len(info.AnalysisErrors) > 0 && info.PromptPreamble == "" {
-		return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr) // Fatal if errors and no preamble
-	} else if len(info.AnalysisErrors) > 0 {
-		return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr) // Non-fatal if errors but preamble exists
+	// Determine final return error: Wrap combined non-fatal errors in ErrAnalysisFailed.
+	if analysisErr != nil {
+		// Return non-fatal error even if preamble was generated.
+		return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr)
 	}
-	return info, nil // Success
+	return info, nil // Success.
 }
 
-// --- InvalidateCache Method ---
+// InvalidateCache removes the cached entry for a given directory.
 func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
-	a.mu.Lock()
+	a.mu.Lock() // Lock needed only if db handle itself could change, which it doesn't here. Minimal impact.
 	db := a.db
 	a.mu.Unlock()
 	if db == nil {
@@ -981,21 +987,24 @@ func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	goModHash := calculateGoModHash(dir)
 	cacheKey := []byte(dir + "::" + goModHash)
 	log.Printf("DEBUG: Invalidating cache for key: %s", string(cacheKey))
+
 	err := db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(cacheBucketName)
 		if b == nil {
 			log.Printf("Warning: Cache bucket %s not found during invalidation.", string(cacheBucketName))
-			return nil
+			return nil // Not an error if bucket doesn't exist.
 		}
+		// Check if key exists before attempting delete.
 		if b.Get(cacheKey) == nil {
 			log.Printf("DEBUG: Cache entry for key %s already deleted or never existed.", string(cacheKey))
-			return nil
+			return nil // Not an error if key doesn't exist.
 		}
 		log.Printf("DEBUG: Deleting cache entry for key: %s", string(cacheKey))
 		return b.Delete(cacheKey)
 	})
 	if err != nil {
 		log.Printf("Warning: Failed to delete cache entry %s: %v", string(cacheKey), err)
+		// Wrap error for clarity.
 		return fmt.Errorf("%w: failed to delete entry %s: %w", ErrCacheWrite, string(cacheKey), err)
 	}
 	log.Printf("DEBUG: Successfully invalidated cache entry for key: %s", string(cacheKey))
@@ -1015,22 +1024,27 @@ func (a *GoPackagesAnalyzer) performAnalysisSteps(
 		return errors.New("performAnalysisSteps requires non-nil targetFile and fset")
 	}
 
+	// Calculate cursor position offset.
 	cursorPos, posErr := calculateCursorPos(targetFile, line, col)
 	if posErr != nil {
-		return fmt.Errorf("%w: %w", ErrPositionConversion, posErr) // Wrap specific error
-	} // calculateCursorPos now returns wrapped errors
+		// calculateCursorPos now returns wrapped errors.
+		return fmt.Errorf("%w: %w", ErrPositionConversion, posErr)
+	}
 	info.CursorPos = cursorPos
 	log.Printf("Calculated cursor token.Pos: %d (%s)", info.CursorPos, fset.PositionFor(info.CursorPos, true))
 
+	// Perform AST-based analysis if AST is available.
 	if targetFileAST != nil {
 		path := findEnclosingPath(targetFileAST, info.CursorPos, info)
-		findContextNodes(path, info.CursorPos, targetPkg, fset, info)
-		gatherScopeContext(path, targetPkg, fset, info)
-		findRelevantComments(targetFileAST, path, info.CursorPos, fset, info)
+		findContextNodes(path, info.CursorPos, targetPkg, fset, info)         // Find nodes like CallExpr, SelectorExpr etc.
+		gatherScopeContext(path, targetPkg, fset, info)                       // Find enclosing func, block, vars in scope.
+		findRelevantComments(targetFileAST, path, info.CursorPos, fset, info) // Find associated comments.
 	} else {
 		addAnalysisError(info, errors.New("cannot perform detailed AST analysis: targetFileAST is nil"))
-		gatherScopeContext(nil, targetPkg, fset, info) // Still try to get package scope
+		// Still try to get package scope even without specific file AST.
+		gatherScopeContext(nil, targetPkg, fset, info)
 	}
+	// Consolidate errors gathered during steps? Currently handled by returning joined info.AnalysisErrors.
 	return nil
 }
 
@@ -1039,57 +1053,65 @@ type templateFormatter struct{}
 
 func newTemplateFormatter() *templateFormatter { return &templateFormatter{} }
 
+// FormatPrompt combines context and snippet into the final LLM prompt, applying truncation.
 func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx SnippetContext, config Config) string {
 	var finalPrompt string
 	template := config.PromptTemplate
+	// Use limits from config.
 	maxPreambleLen := config.MaxPreambleLen
 	maxSnippetLen := config.MaxSnippetLen
-	maxFIMPartLen := maxSnippetLen / 2
+	maxFIMPartLen := maxSnippetLen / 2 // Split snippet budget for FIM.
 
-	// Truncate preamble (keep end)
+	// Truncate preamble (keeping the end, as it often contains more specific context).
 	if len(contextPreamble) > maxPreambleLen {
 		log.Printf("Warning: Truncating context preamble from %d to %d bytes.", len(contextPreamble), maxPreambleLen)
-		startByte := len(contextPreamble) - maxPreambleLen + len("... (context truncated)\n")
+		// Calculate start index to keep the last maxPreambleLen bytes, accounting for marker length.
+		marker := "... (context truncated)\n"
+		startByte := len(contextPreamble) - maxPreambleLen + len(marker)
 		if startByte < 0 {
 			startByte = 0
-		}
-		contextPreamble = "... (context truncated)\n" + contextPreamble[startByte:]
+		} // Ensure start index is not negative.
+		contextPreamble = marker + contextPreamble[startByte:]
 	}
 
-	if config.UseFim {
+	if config.UseFim { // Format for Fill-in-the-Middle.
 		template = config.FimTemplate
 		prefix := snippetCtx.Prefix
 		suffix := snippetCtx.Suffix
 
-		// Truncate FIM prefix (keep end)
+		// Truncate FIM prefix (keep end).
 		if len(prefix) > maxFIMPartLen {
 			log.Printf("Warning: Truncating FIM prefix from %d to %d bytes.", len(prefix), maxFIMPartLen)
-			startByte := len(prefix) - maxFIMPartLen + len("...(prefix truncated)")
+			marker := "...(prefix truncated)"
+			startByte := len(prefix) - maxFIMPartLen + len(marker)
 			if startByte < 0 {
 				startByte = 0
 			}
-			prefix = "...(prefix truncated)" + prefix[startByte:]
+			prefix = marker + prefix[startByte:]
 		}
-		// Truncate FIM suffix (keep start)
+		// Truncate FIM suffix (keep start).
 		if len(suffix) > maxFIMPartLen {
 			log.Printf("Warning: Truncating FIM suffix from %d to %d bytes.", len(suffix), maxFIMPartLen)
-			endByte := maxFIMPartLen - len("(suffix truncated)...")
+			marker := "(suffix truncated)..."
+			endByte := maxFIMPartLen - len(marker)
 			if endByte < 0 {
 				endByte = 0
 			}
-			suffix = suffix[:endByte] + "(suffix truncated)..."
+			suffix = suffix[:endByte] + marker
 		}
 		finalPrompt = fmt.Sprintf(template, contextPreamble, prefix, suffix)
-	} else { // Standard completion
-		snippet := snippetCtx.Prefix
-		// Truncate snippet (keep end)
+
+	} else { // Format for standard completion.
+		snippet := snippetCtx.Prefix // Use only code before cursor.
+		// Truncate snippet (keep end).
 		if len(snippet) > maxSnippetLen {
 			log.Printf("Warning: Truncating code snippet from %d to %d bytes.", len(snippet), maxSnippetLen)
-			startByte := len(snippet) - maxSnippetLen + len("...(code truncated)\n")
+			marker := "...(code truncated)\n"
+			startByte := len(snippet) - maxSnippetLen + len(marker)
 			if startByte < 0 {
 				startByte = 0
 			}
-			snippet = "...(code truncated)\n" + snippet[startByte:]
+			snippet = marker + snippet[startByte:]
 		}
 		finalPrompt = fmt.Sprintf(template, contextPreamble, snippet)
 	}
@@ -1099,52 +1121,62 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 // =============================================================================
 // DeepCompleter Service
 // =============================================================================
+
+// DeepCompleter orchestrates analysis, formatting, and LLM interaction.
 type DeepCompleter struct {
 	client    LLMClient
 	analyzer  Analyzer
 	formatter PromptFormatter
 	config    Config
+	configMu  sync.RWMutex // Protects concurrent read/write access to config.
 }
 
+// NewDeepCompleter creates a new DeepCompleter service with default config.
 func NewDeepCompleter() (*DeepCompleter, error) {
-	cfg, configErr := LoadConfig()
+	cfg, configErr := LoadConfig() // Load initial config.
+	// Handle fatal vs non-fatal config load errors.
 	if configErr != nil && !errors.Is(configErr, ErrConfig) {
-		return nil, configErr
-	} // Fatal config error
+		return nil, configErr // Fatal error during initial load.
+	}
 	if configErr != nil {
-		log.Printf("Warning during config load: %v", configErr)
-	} // Non-fatal config error
+		log.Printf("Warning during initial config load: %v", configErr) // Log non-fatal errors.
+	}
 
-	// Ensure config is valid even if load had non-fatal errors
+	// Ensure loaded config is valid, fallback to pure defaults if necessary.
 	if err := cfg.Validate(); err != nil {
-		log.Printf("Warning: Config after load/merge is invalid: %v. Using pure defaults.", err)
+		log.Printf("Warning: Initial config is invalid after load/merge: %v. Using pure defaults.", err)
 		cfg = DefaultConfig
+		// This should not fail, but check defensively.
 		if valErr := cfg.Validate(); valErr != nil {
 			return nil, fmt.Errorf("default config validation failed: %w", valErr)
 		}
 	}
 
-	analyzer := NewGoPackagesAnalyzer()
+	analyzer := NewGoPackagesAnalyzer() // Initialize analyzer (handles its own cache setup).
 	dc := &DeepCompleter{
 		client:    newHttpOllamaClient(),
 		analyzer:  analyzer,
 		formatter: newTemplateFormatter(),
 		config:    cfg,
+		// configMu is initialized automatically.
 	}
-	// Return non-fatal errors from LoadConfig if any occurred
+	// Return the non-fatal config load error if one occurred.
 	if configErr != nil && errors.Is(configErr, ErrConfig) {
 		return dc, configErr
 	}
 	return dc, nil
 }
 
+// NewDeepCompleterWithConfig creates a new DeepCompleter service with provided config.
 func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
+	// Ensure internal templates are set if not provided.
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
 	}
 	if config.FimTemplate == "" {
 		config.FimTemplate = fimPromptTemplate
 	}
+	// Validate the provided config.
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
@@ -1158,6 +1190,7 @@ func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 	}, nil
 }
 
+// Close cleans up resources, primarily the analyzer's cache DB.
 func (dc *DeepCompleter) Close() error {
 	if dc.analyzer != nil {
 		return dc.analyzer.Close()
@@ -1165,23 +1198,55 @@ func (dc *DeepCompleter) Close() error {
 	return nil
 }
 
+// UpdateConfig atomically updates the completer's configuration after validation.
+func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
+	// Ensure internal templates are preserved/set.
+	if newConfig.PromptTemplate == "" {
+		newConfig.PromptTemplate = promptTemplate
+	}
+	if newConfig.FimTemplate == "" {
+		newConfig.FimTemplate = fimPromptTemplate
+	}
+
+	// Validate the incoming configuration.
+	if err := newConfig.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+
+	// Acquire write lock to update config safely.
+	dc.configMu.Lock()
+	defer dc.configMu.Unlock()
+	dc.config = newConfig
+	log.Printf("DeepCompleter configuration updated: %+v", newConfig)
+	return nil
+}
+
+// GetCompletion provides basic completion for a direct code snippet (no AST analysis).
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
 	log.Println("DeepCompleter.GetCompletion called for basic prompt.")
+	// Use read lock to access config safely.
+	dc.configMu.RLock()
+	currentConfig := dc.config // Make a copy while holding lock.
+	dc.configMu.RUnlock()
+
+	// Basic preamble for non-AST context.
 	contextPreamble := "// Provide Go code completion below."
 	snippetCtx := SnippetContext{Prefix: codeSnippet}
-	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, dc.config)
+	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig)
 
-	reader, err := dc.client.GenerateStream(ctx, prompt, dc.config)
+	// Call LLM via stream.
+	reader, err := dc.client.GenerateStream(ctx, prompt, currentConfig)
 	if err != nil {
-		if errors.Is(err, ErrOllamaUnavailable) {
-			return "", err
-		}
-		return "", fmt.Errorf("failed to call Ollama API for basic prompt: %w", err)
+		// Error already wrapped by client.
+		return "", err
 	}
+
+	// Buffer the streaming response.
 	var buffer bytes.Buffer
-	streamCtx, cancelStream := context.WithTimeout(ctx, 50*time.Second)
+	streamCtx, cancelStream := context.WithTimeout(ctx, 50*time.Second) // Timeout for stream processing.
 	defer cancelStream()
 	if streamErr := streamCompletion(streamCtx, reader, &buffer); streamErr != nil {
+		// Handle stream context errors vs processing errors.
 		if errors.Is(streamErr, context.DeadlineExceeded) || errors.Is(streamErr, context.Canceled) {
 			return "", fmt.Errorf("%w: streaming context error: %w", ErrOllamaUnavailable, streamErr)
 		}
@@ -1190,157 +1255,207 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 	return strings.TrimSpace(buffer.String()), nil
 }
 
+// GetCompletionStreamFromFile provides context-aware completion using analysis, streaming the result.
 func (dc *DeepCompleter) GetCompletionStreamFromFile(
 	ctx context.Context,
-	filename string,
-	row, col int,
-	w io.Writer,
+	filename string, // Use URI as filename for consistency with LSP.
+	row, col int, // 1-based line/column.
+	w io.Writer, // Writer for streaming output.
 ) error {
-	var contextPreamble string = "// Basic file context only."
-	var analysisInfo *AstContextInfo
-	var analysisErr error
+	// Use read lock to access config safely.
+	dc.configMu.RLock()
+	currentConfig := dc.config // Make a copy while holding lock.
+	dc.configMu.RUnlock()
 
-	if dc.config.UseAst {
+	var contextPreamble string = "// Basic file context only." // Default preamble.
+	var analysisInfo *AstContextInfo
+	var analysisErr error // Store non-fatal analysis errors.
+
+	// Perform AST analysis if enabled.
+	if currentConfig.UseAst {
 		log.Printf("Analyzing context (or checking cache) for %s:%d:%d", filename, row, col)
-		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 30*time.Second)
+		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 30*time.Second) // Timeout for analysis.
 		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, filename, row, col)
 		cancelAnalysis()
 
-		// Handle fatal analysis errors
+		// Check for FATAL analysis errors (errors other than ErrAnalysisFailed/ErrCache).
+		// ErrAnalysisFailed itself indicates non-fatal issues occurred.
 		if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) && !errors.Is(analysisErr, ErrCache) {
+			// If Analyze returns a different error type, it's likely fatal (e.g., file read error).
 			return fmt.Errorf("analysis failed fatally: %w", analysisErr)
 		}
-		// Log non-fatal errors
-		if analysisErr != nil && analysisInfo != nil {
-			logAnalysisErrors(analysisInfo.AnalysisErrors)
-			log.Printf("Non-fatal error during analysis/cache check: %v", analysisErr)
+		// Log non-fatal errors if they occurred.
+		if analysisErr != nil {
+			// logAnalysisErrors is called within Analyze, but log context here too.
+			log.Printf("Non-fatal error during analysis/cache check for %s: %v", filename, analysisErr)
 		}
 
-		// Use preamble from analysisInfo (could be from cache or fresh analysis)
+		// Use preamble from analysis results if available.
 		if analysisInfo != nil && analysisInfo.PromptPreamble != "" {
 			contextPreamble = analysisInfo.PromptPreamble
 		} else if analysisErr != nil {
+			// Add warning to preamble if analysis had errors but produced no context.
 			contextPreamble += fmt.Sprintf("\n// Warning: Context analysis completed with errors and no preamble: %v\n", analysisErr)
 		} else {
+			// Add warning if analysis succeeded but produced no context.
 			contextPreamble += "\n// Warning: Context analysis returned no specific context preamble.\n"
 		}
 	} else {
 		log.Println("AST analysis disabled by config.")
 	}
 
-	// Extract code snippet around the cursor
-	snippetCtx, err := extractSnippetContext(filename, row, col) // Restored call
+	// Extract code snippet around the cursor. This can fail (e.g., file not found).
+	snippetCtx, err := extractSnippetContext(filename, row, col)
 	if err != nil {
+		// Snippet extraction failure is fatal for file-based completion.
 		return fmt.Errorf("failed to extract code snippet context: %w", err)
 	}
 
-	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, dc.config)
+	// Format the final prompt using potentially updated preamble and snippet.
+	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig)
+	// Log truncated prompt for debugging.
 	if len(prompt) > 1000 {
 		log.Printf("Generated Prompt (length %d):\n---\n%s\n... (prompt truncated in log)\n---", len(prompt), prompt[:1000])
 	} else {
 		log.Printf("Generated Prompt (length %d):\n---\n%s\n---", len(prompt), prompt)
 	}
 
-	// Retryable API call function
+	// --- Call Ollama API with Retry Logic ---
 	apiCallFunc := func() error {
+		// Use a separate context with timeout for each API attempt.
 		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
 		defer cancelApi()
-		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, dc.config)
+
+		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig)
 		if apiErr != nil {
+			// Check if the error is retryable (e.g., timeout, specific HTTP codes).
 			var oe *OllamaError
 			isRetryable := errors.As(apiErr, &oe) &&
 				(oe.Status == http.StatusServiceUnavailable || oe.Status == http.StatusTooManyRequests)
 			isRetryable = isRetryable || errors.Is(apiErr, context.DeadlineExceeded)
+			// Return raw error if retryable, wrap if fatal.
 			if isRetryable {
-				return apiErr
+				return apiErr // Signal retry logic to retry.
 			}
-			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, apiErr)
+			// Wrap non-retryable client errors. ErrOllamaUnavailable is already wrapped.
+			return apiErr
 		}
-		PrettyPrint(ColorGreen, "Completion:\n") // Print header before streaming to stderr
+
+		// Stream the response directly to the provided writer.
+		// Add header only if writing to stderr (for CLI). Check writer type?
+		// if w == os.Stderr { // This check is fragile. Assume caller handles headers.
+		// 	PrettyPrint(ColorGreen, "Completion:\n")
+		// }
 		streamErr := streamCompletion(apiCtx, reader, w)
-		fmt.Fprintln(w) // Add newline after stream to stdout
+		// Add newline after stream if writing to stdout/stderr? Assume caller handles.
+		// if w == os.Stdout || w == os.Stderr {
+		// 	fmt.Fprintln(w)
+		// }
+
 		if streamErr != nil {
+			// Check for context errors during streaming (retryable).
 			if errors.Is(streamErr, context.DeadlineExceeded) || errors.Is(streamErr, context.Canceled) {
-				return streamErr
+				return streamErr // Retryable context error during streaming.
 			}
+			// Wrap non-retryable stream processing errors.
 			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
 		}
 		log.Println("Completion stream finished successfully for this attempt.")
-		return nil
+		return nil // Success for this attempt.
 	}
 
-	// Execute with retry logic
+	// Execute the API call with retry logic.
 	err = retry(ctx, apiCallFunc, maxRetries, retryDelay)
 	if err != nil {
+		// Check final error type after retries.
 		var oe *OllamaError
 		if errors.As(err, &oe) || errors.Is(err, ErrOllamaUnavailable) ||
 			errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			// Wrap final Ollama/network/timeout errors.
 			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 		}
 		if errors.Is(err, ErrStreamProcessing) {
-			return err
+			return err // Return stream processing error directly.
 		}
+		// General failure after retries.
 		return fmt.Errorf("failed to get completion stream after retries: %w", err)
 	}
 
-	// Log analysis errors again as a final warning
+	// Log analysis errors again as a final warning if completion succeeded.
 	if analysisErr != nil {
 		log.Printf("Warning: Completion succeeded, but context analysis/cache check encountered non-fatal errors: %v", analysisErr)
 	}
-	return nil // Success
+	return nil // Overall success.
 }
 
 // =============================================================================
-// Internal Helpers (Unexported package-level functions)
+// Internal Helpers (Split Point)
+// =============================================================================
+
+// ... (streamCompletion, processLine, retry, analysis helpers, etc. follow)
+// =============================================================================
+// Internal Helpers
 // =============================================================================
 
 // --- Ollama Stream Processing Helpers ---
+
+// streamCompletion reads the Ollama stream response and writes it to w.
 func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 	defer r.Close()
 	reader := bufio.NewReader(r)
 	for {
+		// Check for context cancellation before reading.
 		select {
 		case <-ctx.Done():
 			log.Println("Context cancelled during streaming")
 			return ctx.Err()
 		default:
 		}
+
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
+			// Handle EOF cleanly. Process any remaining data before returning.
 			if err == io.EOF {
 				if len(line) > 0 {
 					if procErr := processLine(line, w); procErr != nil {
-						return procErr
+						return procErr // Return error from final processing.
 					}
 				}
-				return nil // Successful end of stream
+				return nil // Successful end of stream.
 			}
-			select { // Check if error is due to context cancellation
+			// Check if error is due to context cancellation after read attempt.
+			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
+				// Return other read errors.
 				return fmt.Errorf("error reading from Ollama stream: %w", err)
 			}
 		}
+		// Process each line received.
 		if procErr := processLine(line, w); procErr != nil {
-			return procErr
+			return procErr // Return error from line processing.
 		}
 	}
 }
 
+// processLine decodes a single line from the Ollama stream and writes the content.
 func processLine(line []byte, w io.Writer) error {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
-		return nil
+		return nil // Ignore empty lines.
 	}
 	var resp OllamaResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
+		// Tolerate potential non-JSON lines (e.g., debugging info from Ollama?).
 		log.Printf("Debug: Ignoring non-JSON line from Ollama stream: %s", string(line))
-		return nil // Tolerate non-JSON lines
+		return nil
 	}
+	// Check for errors reported within the stream response itself.
 	if resp.Error != "" {
 		return fmt.Errorf("ollama stream error: %s", resp.Error)
 	}
+	// Write the actual completion text chunk.
 	if _, err := fmt.Fprint(w, resp.Response); err != nil {
 		return fmt.Errorf("error writing to output: %w", err)
 	}
@@ -1348,10 +1463,13 @@ func processLine(line []byte, w io.Writer) error {
 }
 
 // --- Retry Helper ---
+
+// retry executes an operation function with backoff and retry logic.
 func retry(ctx context.Context, operation func() error, maxRetries int, initialDelay time.Duration) error {
 	var lastErr error
 	currentDelay := initialDelay
 	for i := 0; i < maxRetries; i++ {
+		// Check context before each attempt.
 		select {
 		case <-ctx.Done():
 			log.Printf("Context cancelled before attempt %d: %v", i+1, ctx.Err())
@@ -1361,23 +1479,27 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 
 		lastErr = operation()
 		if lastErr == nil {
-			return nil // Success
+			return nil // Success.
 		}
 
+		// Do not retry if context was cancelled during operation.
 		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
 			log.Printf("Attempt %d failed due to context error: %v. Not retrying.", i+1, lastErr)
 			return lastErr
 		}
+
+		// Check if the error is considered retryable.
 		var ollamaErr *OllamaError
 		isRetryable := errors.As(lastErr, &ollamaErr) &&
 			(ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests)
-		isRetryable = isRetryable || errors.Is(lastErr, ErrOllamaUnavailable)
+		isRetryable = isRetryable || errors.Is(lastErr, ErrOllamaUnavailable) // Also retry general unavailability.
 
 		if !isRetryable {
 			log.Printf("Attempt %d failed with non-retryable error: %v", i+1, lastErr)
-			return lastErr
+			return lastErr // Return non-retryable error immediately.
 		}
 
+		// Wait before retrying, respecting context cancellation.
 		waitDuration := currentDelay
 		log.Printf("Attempt %d failed with retryable error: %v. Retrying in %v...", i+1, lastErr, waitDuration)
 		select {
@@ -1385,17 +1507,21 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 			log.Printf("Context cancelled during retry wait: %v", ctx.Err())
 			return ctx.Err()
 		case <-time.After(waitDuration):
-			// Consider exponential backoff: currentDelay *= 2
+			// Optionally implement exponential backoff: currentDelay *= 2
 		}
 	}
 	log.Printf("Operation failed after %d retries.", maxRetries)
+	// Return the last error encountered after all retries failed.
 	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
 }
 
 // --- Analysis Helpers ---
+
+// loadPackageInfo loads package information using go/packages.
 func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSet) (*packages.Package, *ast.File, *token.File, []error) {
 	dir := filepath.Dir(absFilename)
 	var loadErrors []error
+	// Configure packages.Load: request necessary modes for analysis.
 	cfg := &packages.Config{
 		Context: ctx,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
@@ -1403,28 +1529,30 @@ func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSe
 			packages.NeedTypesInfo | packages.NeedTypesSizes | packages.NeedDeps,
 		Dir:  dir,
 		Fset: fset,
+		// Allow parsing files with errors to proceed with partial ASTs.
 		ParseFile: func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
 			const mode = parser.ParseComments | parser.AllErrors
 			file, err := parser.ParseFile(fset, filename, src, mode)
+			// Log parser errors but don't return them here; let packages.Load collect them.
 			if err != nil {
 				log.Printf("Parser error in %s (proceeding with partial AST): %v", filename, err)
-				// Don't return the error, let packages.Load handle it in pkg.Errors
 			}
-			return file, nil // Return potentially partial AST
+			return file, nil
 		},
-		Tests: true,
+		Tests: true, // Include test packages.
 	}
-	pkgs, loadErr := packages.Load(cfg, ".") // Load packages in the target directory
+	pkgs, loadErr := packages.Load(cfg, ".") // Load packages in the target directory.
 	if loadErr != nil {
 		log.Printf("Error loading packages for %s: %v", dir, loadErr)
 		loadErrors = append(loadErrors, fmt.Errorf("package loading failed: %w", loadErr))
 	}
 
-	// Collect all errors from loaded packages
+	// Collect all errors reported by packages.Load.
 	if len(pkgs) > 0 {
 		packages.Visit(pkgs, nil, func(pkg *packages.Package) {
 			for _, err := range pkg.Errors {
 				errMsg := err.Error()
+				// Avoid duplicate error messages.
 				found := false
 				for _, existing := range loadErrors {
 					if existing.Error() == errMsg {
@@ -1439,16 +1567,12 @@ func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSe
 		})
 		if len(loadErrors) > 0 {
 			log.Printf("Detailed errors encountered during package loading for %s", dir)
-			// Log individual errors for better debugging
-			// for _, e := range loadErrors {
-			// 	log.Printf("  - %v", e)
-			// }
 		}
 	} else if loadErr == nil {
 		loadErrors = append(loadErrors, fmt.Errorf("no packages found in directory %s", dir))
 	}
 
-	// Find the specific package and AST file corresponding to the target filename
+	// Find the specific package and AST file corresponding to the target filename.
 	for _, pkg := range pkgs {
 		if pkg == nil || pkg.Fset == nil || pkg.Syntax == nil {
 			continue
@@ -1459,10 +1583,10 @@ func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSe
 			}
 			tokenFile := pkg.Fset.File(syntaxFile.Pos())
 			if tokenFile != nil && tokenFile.Name() != "" {
-				// Normalize paths for comparison
+				// Normalize paths for reliable comparison.
 				normSyntaxFileName, _ := filepath.Abs(tokenFile.Name())
 				if normSyntaxFileName == absFilename {
-					// Found the target file's AST
+					// Found the target file's AST. Check for required info.
 					if pkg.TypesInfo == nil {
 						log.Printf("Warning: Type info missing for target package %s", pkg.PkgPath)
 						loadErrors = append(loadErrors, fmt.Errorf("type info missing for package %s", pkg.PkgPath))
@@ -1477,13 +1601,14 @@ func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSe
 		}
 	}
 
-	// If the target file wasn't found in any loaded package
-	if len(loadErrors) == 0 { // Only add this error if no other load errors occurred
+	// If the target file wasn't found in any loaded package.
+	if len(loadErrors) == 0 { // Only add this error if no other load errors occurred.
 		loadErrors = append(loadErrors, fmt.Errorf("target file %s not found within loaded packages for directory %s", absFilename, dir))
 	}
 	return nil, nil, nil, loadErrors
 }
 
+// findEnclosingPath finds the AST node path from the root to the node enclosing the cursor.
 func findEnclosingPath(targetFileAST *ast.File, cursorPos token.Pos, info *AstContextInfo) []ast.Node {
 	if targetFileAST == nil {
 		addAnalysisError(info, errors.New("cannot find enclosing path: targetFileAST is nil"))
@@ -1493,6 +1618,7 @@ func findEnclosingPath(targetFileAST *ast.File, cursorPos token.Pos, info *AstCo
 		addAnalysisError(info, errors.New("cannot find enclosing path: invalid cursor position"))
 		return nil
 	}
+	// Use astutil to find the path.
 	path, _ := astutil.PathEnclosingInterval(targetFileAST, cursorPos, cursorPos)
 	if path == nil {
 		log.Printf("DEBUG: No AST path found enclosing cursor position %v", cursorPos)
@@ -1500,24 +1626,25 @@ func findEnclosingPath(targetFileAST *ast.File, cursorPos token.Pos, info *AstCo
 	return path
 }
 
+// gatherScopeContext walks the enclosing path to find relevant scope information.
 func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *token.FileSet, info *AstContextInfo) {
-	// Removed unused qualifier variable declaration
 	if fset == nil && path != nil {
 		log.Println("Warning: Cannot format receiver type - fset is nil in gatherScopeContext.")
 	}
 
 	if path != nil {
-		// Traverse path from outermost to innermost to find enclosing elements
+		// Traverse path from outermost to innermost to find enclosing elements.
 		for i := len(path) - 1; i >= 0; i-- {
 			node := path[i]
 			switch n := node.(type) {
 			case *ast.FuncDecl:
-				// Capture the first FuncDecl encountered as the enclosing one
+				// Capture the first FuncDecl encountered as the enclosing one.
 				if info.EnclosingFuncNode == nil {
 					info.EnclosingFuncNode = n
-					// Try to format receiver type if present
+					// Try to format receiver type if present.
 					if fset != nil && n.Recv != nil && len(n.Recv.List) > 0 && n.Recv.List[0].Type != nil {
 						var buf bytes.Buffer
+						// Use go/format to get canonical type string.
 						if err := format.Node(&buf, fset, n.Recv.List[0].Type); err == nil {
 							info.ReceiverType = buf.String()
 						} else {
@@ -1527,26 +1654,26 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *toke
 						}
 					}
 				}
-				// Try to find the corresponding types.Func object
+				// Try to find the corresponding types.Func object using type info.
 				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Defs != nil && n.Name != nil {
 					if obj, ok := targetPkg.TypesInfo.Defs[n.Name]; ok && obj != nil {
 						if fn, ok := obj.(*types.Func); ok {
-							// Capture the first types.Func found
+							// Capture the first types.Func found.
 							if info.EnclosingFunc == nil {
 								info.EnclosingFunc = fn
-								// Add function parameters/results to scope
+								// Add function parameters/results to scope map.
 								if sig, ok := fn.Type().(*types.Signature); ok {
 									addSignatureToScope(sig, info.VariablesInScope)
 								}
 							}
 						}
 					} else {
-						// Log if definition not found (only for the first enclosing func node found)
+						// Log if definition not found (only for the first enclosing func node found).
 						if info.EnclosingFunc == nil && n.Name != nil {
 							addAnalysisError(info, fmt.Errorf("definition for func '%s' not found in TypesInfo", n.Name.Name))
 						}
 					}
-				} else if info.EnclosingFuncNode != nil && info.EnclosingFunc == nil { // Log if type info is generally unavailable
+				} else if info.EnclosingFuncNode != nil && info.EnclosingFunc == nil { // Log if type info is generally unavailable.
 					reason := "type info unavailable"
 					if targetPkg != nil && targetPkg.TypesInfo == nil {
 						reason = "TypesInfo is nil"
@@ -1561,11 +1688,11 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *toke
 					addAnalysisError(info, fmt.Errorf("type info for enclosing func '%s' unavailable: %s", funcName, reason))
 				}
 			case *ast.BlockStmt:
-				// Capture the innermost block statement containing the cursor
+				// Capture the innermost block statement containing the cursor.
 				if info.EnclosingBlock == nil {
 					info.EnclosingBlock = n
 				}
-				// Add variables declared in this block to the scope
+				// Add variables declared in this block to the scope.
 				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Scopes != nil {
 					if scope := targetPkg.TypesInfo.Scopes[n]; scope != nil {
 						addScopeVariables(scope, info.CursorPos, info.VariablesInScope)
@@ -1575,16 +1702,16 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *toke
 		}
 	}
 
-	// Always add package-level scope variables
+	// Always add package-level scope variables.
 	addPackageScope(targetPkg, info)
 }
 
+// addPackageScope adds package-level identifiers to the scope map.
 func addPackageScope(targetPkg *packages.Package, info *AstContextInfo) {
 	if targetPkg != nil && targetPkg.Types != nil {
 		pkgScope := targetPkg.Types.Scope()
 		if pkgScope != nil {
-			// Add package scope variables (cursorPos doesn't matter here)
-			addScopeVariables(pkgScope, token.NoPos, info.VariablesInScope)
+			addScopeVariables(pkgScope, token.NoPos, info.VariablesInScope) // No cursor pos needed for package scope.
 		} else {
 			addAnalysisError(info, fmt.Errorf("package scope missing for pkg %s", targetPkg.PkgPath))
 		}
@@ -1597,8 +1724,7 @@ func addPackageScope(targetPkg *packages.Package, info *AstContextInfo) {
 	}
 }
 
-// addScopeVariables adds variables from a types.Scope to the scopeMap if they are declared
-// before the cursorPos (or if cursorPos is invalid).
+// addScopeVariables adds identifiers from a types.Scope if declared before cursorPos.
 func addScopeVariables(typeScope *types.Scope, cursorPos token.Pos, scopeMap map[string]types.Object) {
 	if typeScope == nil {
 		return
@@ -1608,16 +1734,13 @@ func addScopeVariables(typeScope *types.Scope, cursorPos token.Pos, scopeMap map
 		if obj == nil {
 			continue
 		}
-		// Include if:
-		// 1. Cursor position is invalid (e.g., for package scope) OR
-		// 2. Object position is invalid (e.g., built-ins) OR
-		// 3. Object is declared before the cursor
+		// Include if cursor position is invalid (package scope) or object declared before cursor.
 		include := !cursorPos.IsValid() || !obj.Pos().IsValid() || obj.Pos() < cursorPos
 
 		if include {
-			// Add to map only if not already present (inner scopes override outer)
+			// Add if not already present (inner scopes override outer).
 			if _, exists := scopeMap[name]; !exists {
-				// Filter to relevant object types
+				// Filter to relevant object kinds.
 				switch obj.(type) {
 				case *types.Var, *types.Const, *types.TypeName, *types.Func, *types.Label, *types.PkgName, *types.Builtin, *types.Nil:
 					scopeMap[name] = obj
@@ -1627,7 +1750,7 @@ func addScopeVariables(typeScope *types.Scope, cursorPos token.Pos, scopeMap map
 	}
 }
 
-// addSignatureToScope adds parameters and results from a function signature to the scope map.
+// addSignatureToScope adds named parameters and results to the scope map.
 func addSignatureToScope(sig *types.Signature, scopeMap map[string]types.Object) {
 	if sig == nil {
 		return
@@ -1636,15 +1759,14 @@ func addSignatureToScope(sig *types.Signature, scopeMap map[string]types.Object)
 	addTupleToScope(sig.Results(), scopeMap)
 }
 
-// addTupleToScope adds variables from a types.Tuple (like params or results) to the scope map.
+// addTupleToScope adds named variables from a types.Tuple to the scope map.
 func addTupleToScope(tuple *types.Tuple, scopeMap map[string]types.Object) {
 	if tuple == nil {
 		return
 	}
 	for j := 0; j < tuple.Len(); j++ {
 		v := tuple.At(j)
-		// Add only named variables from the tuple
-		if v != nil && v.Name() != "" {
+		if v != nil && v.Name() != "" { // Only add named variables.
 			if _, exists := scopeMap[v.Name()]; !exists {
 				scopeMap[v.Name()] = v
 			}
@@ -1652,6 +1774,7 @@ func addTupleToScope(tuple *types.Tuple, scopeMap map[string]types.Object) {
 	}
 }
 
+// findRelevantComments uses ast.CommentMap to find comments near the cursor.
 func findRelevantComments(targetFileAST *ast.File, path []ast.Node, cursorPos token.Pos, fset *token.FileSet, info *AstContextInfo) {
 	if targetFileAST == nil || fset == nil {
 		addAnalysisError(info, errors.New("cannot find comments: targetFileAST or fset is nil"))
@@ -1661,8 +1784,7 @@ func findRelevantComments(targetFileAST *ast.File, path []ast.Node, cursorPos to
 	info.CommentsNearCursor = findCommentsWithMap(cmap, path, cursorPos, fset)
 }
 
-// findCommentsWithMap tries to find comments immediately preceding the cursor line,
-// or falls back to the doc comment of the most relevant enclosing node.
+// findCommentsWithMap implements the logic to find preceding or enclosing doc comments.
 func findCommentsWithMap(cmap ast.CommentMap, path []ast.Node, cursorPos token.Pos, fset *token.FileSet) []string {
 	var comments []string
 	if cmap == nil || !cursorPos.IsValid() || fset == nil {
@@ -1673,70 +1795,63 @@ func findCommentsWithMap(cmap ast.CommentMap, path []ast.Node, cursorPos token.P
 	foundPreceding := false
 	var precedingComments []string
 
-	// Strategy 1: Find comments ending on the line immediately before the cursor
-	// Iterate through the comment map keys (AST nodes)
+	// Strategy 1: Find comments ending on the line immediately before the cursor.
 	for node := range cmap {
 		if node == nil {
 			continue
 		}
-		// Iterate through comment groups associated with the node
 		for _, cg := range cmap[node] {
 			if cg == nil {
 				continue
 			}
-			// Check if the comment group ends on the line before the cursor
 			if cg.End().IsValid() && fset.Position(cg.End()).Line == cursorLine-1 {
-				// Collect all comments in this group
 				for _, c := range cg.List {
 					if c != nil {
 						precedingComments = append(precedingComments, c.Text)
 					}
 				}
 				foundPreceding = true
-				break // Found relevant preceding group for this node
+				break
 			}
 		}
 		if foundPreceding {
-			break // Found relevant preceding group, stop searching nodes
+			break
 		}
 	}
 
 	if foundPreceding {
 		comments = append(comments, precedingComments...)
 	} else {
-		// Strategy 2: If no preceding comment found, look for Doc comments on enclosing path
+		// Strategy 2: Fallback to Doc comments on the enclosing path.
 		if path != nil {
-			// Iterate path from innermost to outermost
-			for i := 0; i < len(path); i++ {
+			for i := 0; i < len(path); i++ { // Check innermost nodes first.
 				node := path[i]
 				var docComment *ast.CommentGroup
-				// Check node types that commonly have Doc comments
 				switch n := node.(type) {
 				case *ast.FuncDecl:
 					docComment = n.Doc
-				case *ast.GenDecl: // For var, const, type declarations
+				case *ast.GenDecl:
 					docComment = n.Doc
 				case *ast.TypeSpec:
 					docComment = n.Doc
-				case *ast.Field: // For struct fields
+				case *ast.Field:
 					docComment = n.Doc
-				case *ast.ValueSpec: // For individual var/const in a GenDecl
+				case *ast.ValueSpec:
 					docComment = n.Doc
 				}
-				// If a Doc comment is found, use it and stop searching the path
 				if docComment != nil {
 					for _, c := range docComment.List {
 						if c != nil {
 							comments = append(comments, c.Text)
 						}
 					}
-					goto cleanup // Use goto to break out of the outer loop cleanly
+					goto cleanup // Found doc comment, stop searching path.
 				}
 			}
 		}
 	}
 
-cleanup: // Deduplicate final list
+cleanup: // Deduplicate comments.
 	seen := make(map[string]struct{})
 	uniqueComments := make([]string, 0, len(comments))
 	for _, c := range comments {
@@ -1748,14 +1863,14 @@ cleanup: // Deduplicate final list
 	return uniqueComments
 }
 
-// buildPreamble constructs the context string sent to the LLM.
+// buildPreamble constructs the context string sent to the LLM from analysis info.
 func buildPreamble(info *AstContextInfo, qualifier types.Qualifier) string {
 	var preamble strings.Builder
-	// Set a generous internal limit, final truncation happens in FormatPrompt
+	// Internal limit for building, final truncation happens later.
 	const internalPreambleLimit = 8192
 	currentLen := 0
 
-	// Helper to add string if within limit
+	// Helper to add string if within limit. Returns false if limit reached.
 	addToPreamble := func(s string) bool {
 		if currentLen+len(s) < internalPreambleLimit {
 			preamble.WriteString(s)
@@ -1764,7 +1879,7 @@ func buildPreamble(info *AstContextInfo, qualifier types.Qualifier) string {
 		}
 		return false
 	}
-	// Helper to add truncation marker
+	// Helper to add truncation marker if within limit.
 	addTruncMarker := func(section string) {
 		msg := fmt.Sprintf("//   ... (%s truncated)\n", section)
 		if currentLen+len(msg) < internalPreambleLimit {
@@ -1773,65 +1888,54 @@ func buildPreamble(info *AstContextInfo, qualifier types.Qualifier) string {
 		}
 	}
 
-	// 1. Basic File/Package Info
+	// Build preamble section by section, checking limits.
 	if !addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), info.PackageName)) {
 		return preamble.String()
 	}
-
-	// 2. Imports
 	if !formatImportsSection(&preamble, info, addToPreamble, addTruncMarker) {
 		return preamble.String()
 	}
-
-	// 3. Enclosing Function/Method
 	if !formatEnclosingFuncSection(&preamble, info, qualifier, addToPreamble) {
 		return preamble.String()
 	}
-
-	// 4. Relevant Comments
 	if !formatCommentsSection(&preamble, info, addToPreamble, addTruncMarker) {
 		return preamble.String()
 	}
-
-	// 5. Specific Cursor Context (Call, Selector, Literal, Identifier)
 	if !formatCursorContextSection(&preamble, info, qualifier, addToPreamble) {
 		return preamble.String()
 	}
-
-	// 6. Variables in Scope
-	formatScopeSection(&preamble, info, qualifier, addToPreamble, addTruncMarker)
+	formatScopeSection(&preamble, info, qualifier, addToPreamble, addTruncMarker) // Format scope last.
 
 	return preamble.String()
 }
 
-// formatImportsSection formats the import list for the preamble.
+// formatImportsSection formats the import list, respecting limits.
 func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add func(string) bool, addTrunc func(string)) bool {
 	if len(info.Imports) == 0 {
-		return true // Nothing to add, continue successfully
+		return true
 	}
-	header := "// Imports:\n"
-	if !add(header) {
-		return false // Limit reached
+	if !add("// Imports:\n") {
+		return false
 	}
 	count := 0
-	maxImports := 20 // Limit number of imports shown
+	maxImports := 20
 	for _, imp := range info.Imports {
 		if imp == nil || imp.Path == nil {
 			continue
 		}
 		if count >= maxImports {
 			addTrunc("imports")
-			return true // Reached max count, stop adding but continue successfully
-		}
-		path := imp.Path.Value // Path is usually quoted, e.g., "\"fmt\""
+			return true
+		} // Stop adding but return success.
+		path := imp.Path.Value
 		name := ""
 		if imp.Name != nil {
-			name = imp.Name.Name + " " // Add alias if present
+			name = imp.Name.Name + " "
 		}
 		line := fmt.Sprintf("//   import %s%s\n", name, path)
 		if !add(line) {
-			return false // Limit reached
-		}
+			return false
+		} // Limit reached.
 		count++
 	}
 	return true
@@ -1847,45 +1951,41 @@ func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo,
 	}
 
 	var funcHeader string
-	if info.EnclosingFunc != nil { // Prefer type info if available
+	if info.EnclosingFunc != nil { // Prefer type info.
 		name := info.EnclosingFunc.Name()
 		sigStr := types.TypeString(info.EnclosingFunc.Type(), qualifier)
-		// Adjust signature string if it's a method to avoid duplicating receiver
 		if info.ReceiverType != "" && strings.HasPrefix(sigStr, "func(") {
 			sigStr = "func" + strings.TrimPrefix(sigStr, "func")
 		}
 		funcHeader = fmt.Sprintf("// Enclosing %s: %s%s%s\n", funcOrMethod, receiverStr, name, sigStr)
-	} else if info.EnclosingFuncNode != nil { // Fallback to AST node
+	} else if info.EnclosingFuncNode != nil { // Fallback to AST.
 		name := "[anonymous]"
 		if info.EnclosingFuncNode.Name != nil {
 			name = info.EnclosingFuncNode.Name.Name
 		}
-		// Can't get full signature from AST easily, use placeholder
 		funcHeader = fmt.Sprintf("// Enclosing %s (AST only): %s%s(...)\n", funcOrMethod, receiverStr, name)
 	} else {
-		return true // No enclosing function found, continue successfully
+		return true // No enclosing function found.
 	}
-
-	return add(funcHeader) // Add the header if within limit
+	return add(funcHeader)
 }
 
-// formatCommentsSection formats relevant comments for the preamble.
+// formatCommentsSection formats relevant comments, respecting limits.
 func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo, add func(string) bool, addTrunc func(string)) bool {
 	if len(info.CommentsNearCursor) == 0 {
 		return true
 	}
-	header := "// Relevant Comments:\n"
-	if !add(header) {
+	if !add("// Relevant Comments:\n") {
 		return false
 	}
 	count := 0
-	maxComments := 5 // Limit number of comments shown
+	maxComments := 5
 	for _, c := range info.CommentsNearCursor {
 		if count >= maxComments {
 			addTrunc("comments")
 			return true
 		}
-		// Basic cleaning of comment markers
+		// Clean comment markers.
 		cleanComment := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(c, "//")), "*/")), "/*"))
 		if len(cleanComment) > 0 {
 			line := fmt.Sprintf("//   %s\n", cleanComment)
@@ -1903,7 +2003,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 	// --- Function Call Context ---
 	if info.CallExpr != nil {
 		funcName := "[unknown function]"
-		// Try to get function name from AST
 		switch fun := info.CallExpr.Fun.(type) {
 		case *ast.Ident:
 			funcName = fun.Name
@@ -1915,12 +2014,11 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Inside function call: %s (Arg %d)\n", funcName, info.CallArgIndex+1)) {
 			return false
 		}
-		// Add signature if available
-		if sig := info.CallExprFuncType; sig != nil {
+
+		if sig := info.CallExprFuncType; sig != nil { // Add signature details if available.
 			if !add(fmt.Sprintf("// Function Signature: %s\n", types.TypeString(sig, qualifier))) {
 				return false
 			}
-			// Add parameters with cursor highlighting
 			params := sig.Params()
 			if params != nil && params.Len() > 0 {
 				if !add("//   Parameters:\n") {
@@ -1932,11 +2030,11 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						continue
 					}
 					highlight := ""
-					// Highlight current argument or variadic argument
-					if i == info.CallArgIndex || (sig.Variadic() && i == params.Len()-1 && info.CallArgIndex >= i) {
+					isVariadic := sig.Variadic() && i == params.Len()-1
+					if i == info.CallArgIndex || (isVariadic && info.CallArgIndex >= i) {
 						highlight = " // <-- cursor here"
-						if sig.Variadic() && i == params.Len()-1 {
-							highlight = " // <-- cursor here (variadic)"
+						if isVariadic {
+							highlight += " (variadic)"
 						}
 					}
 					if !add(fmt.Sprintf("//     - %s%s\n", types.ObjectString(p, qualifier), highlight)) {
@@ -1948,7 +2046,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 					return false
 				}
 			}
-			// Add results
 			results := sig.Results()
 			if results != nil && results.Len() > 0 {
 				if !add("//   Returns:\n") {
@@ -1968,12 +2065,12 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 					return false
 				}
 			}
-		} else { // Fallback if signature unavailable
+		} else {
 			if !add("// Function Signature: (unknown - type analysis failed for call expression)\n") {
 				return false
 			}
 		}
-		return true // Handled call context
+		return true // Handled call context.
 	}
 
 	// --- Selector Expression Context ---
@@ -1989,21 +2086,19 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Selector context: expr type = %s (selecting '%s')\n", typeName, selName)) {
 			return false
 		}
-		// List members if type info is available
-		if info.SelectorExprType != nil {
+
+		if info.SelectorExprType != nil { // List members if type info available.
 			members := listTypeMembers(info.SelectorExprType, info.SelectorExpr.X, qualifier)
 			var fields, methods []MemberInfo
 			if members != nil {
-				for _, member := range members {
-					if member.Kind == FieldMember {
-						fields = append(fields, member)
-					}
-					if member.Kind == MethodMember {
-						methods = append(methods, member)
+				for _, m := range members {
+					if m.Kind == FieldMember {
+						fields = append(fields, m)
+					} else if m.Kind == MethodMember {
+						methods = append(methods, m)
 					}
 				}
 			}
-			// Add Fields
 			if len(fields) > 0 {
 				if !add("//   Available Fields:\n") {
 					return false
@@ -2015,35 +2110,33 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 					}
 				}
 			}
-			// Add Methods
 			if len(methods) > 0 {
 				if !add("//   Available Methods:\n") {
 					return false
 				}
 				sort.Slice(methods, func(i, j int) bool { return methods[i].Name < methods[j].Name })
 				for _, method := range methods {
-					methodSig := strings.TrimPrefix(method.TypeString, "func") // Remove "func" prefix for brevity
+					methodSig := strings.TrimPrefix(method.TypeString, "func")
 					if !add(fmt.Sprintf("//     - %s%s\n", method.Name, methodSig)) {
 						return false
 					}
 				}
 			}
-			// Add message if no members found or analysis failed
 			if len(fields) == 0 && len(methods) == 0 {
 				msg := "//   (No exported fields or methods found)\n"
-				if members == nil { // Check if member listing itself failed
+				if members == nil {
 					msg = "//   (Could not determine members)\n"
 				}
 				if !add(msg) {
 					return false
 				}
 			}
-		} else { // Fallback if base type unavailable
+		} else {
 			if !add("//   (Cannot list members: type analysis failed for base expression)\n") {
 				return false
 			}
 		}
-		return true // Handled selector context
+		return true // Handled selector context.
 	}
 
 	// --- Composite Literal Context ---
@@ -2055,22 +2148,20 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Inside composite literal of type: %s\n", typeName)) {
 			return false
 		}
-		// Try to list missing fields if it's a struct literal
-		if info.CompositeLitType != nil {
+
+		if info.CompositeLitType != nil { // Try to list missing struct fields.
 			var st *types.Struct
-			// Handle pointer to struct if necessary
 			currentType := info.CompositeLitType.Underlying()
 			if ptr, ok := currentType.(*types.Pointer); ok {
 				if ptr.Elem() != nil {
 					currentType = ptr.Elem().Underlying()
 				} else {
-					currentType = nil // Invalid pointer element
+					currentType = nil
 				}
 			}
-			st, _ = currentType.(*types.Struct) // Check if underlying type is a struct
+			st, _ = currentType.(*types.Struct)
 
 			if st != nil {
-				// Find fields already present in the literal
 				presentFields := make(map[string]bool)
 				for _, elt := range info.CompositeLit.Elts {
 					if kv, ok := elt.(*ast.KeyValueExpr); ok {
@@ -2079,7 +2170,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						}
 					}
 				}
-				// Find missing exported fields
 				var missingFields []string
 				for i := 0; i < st.NumFields(); i++ {
 					field := st.Field(i)
@@ -2087,7 +2177,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						missingFields = append(missingFields, types.ObjectString(field, qualifier))
 					}
 				}
-				// Add missing fields to preamble
 				if len(missingFields) > 0 {
 					if !add("//   Missing Exported Fields (candidates for completion):\n") {
 						return false
@@ -2103,17 +2192,17 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						return false
 					}
 				}
-			} else { // Not a struct literal
+			} else {
 				if !add("//   (Underlying type is not a struct)\n") {
 					return false
 				}
 			}
-		} else { // Fallback if literal type unavailable
+		} else {
 			if !add("//   (Cannot determine missing fields: type analysis failed)\n") {
 				return false
 			}
 		}
-		return true // Handled composite literal context
+		return true // Handled composite literal context.
 	}
 
 	// --- Identifier Context ---
@@ -2126,32 +2215,28 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Identifier at cursor: %s %s\n", identName, identTypeStr)) {
 			return false
 		}
-		return true // Handled identifier context
+		return true // Handled identifier context.
 	}
 
-	// No specific cursor context found
-	return true
+	return true // No specific cursor context found.
 }
 
-// formatScopeSection formats the variables/types/etc. in scope.
+// formatScopeSection formats variables/constants/types in scope, respecting limits.
 func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, addTrunc func(string)) bool {
 	if len(info.VariablesInScope) == 0 {
 		return true
 	}
-	header := "// Variables/Constants/Types in Scope:\n"
-	if !add(header) {
+	if !add("// Variables/Constants/Types in Scope:\n") {
 		return false
 	}
 	var items []string
 	for name := range info.VariablesInScope {
 		obj := info.VariablesInScope[name]
-		// Format object string (e.g., "var name type", "const name type", "type Name underlying")
 		items = append(items, fmt.Sprintf("//   %s\n", types.ObjectString(obj, qualifier)))
 	}
-	sort.Strings(items) // Sort alphabetically
-
+	sort.Strings(items) // Sort for deterministic output.
 	count := 0
-	maxScopeItems := 30 // Limit number of scope items shown
+	maxScopeItems := 30
 	for _, item := range items {
 		if count >= maxScopeItems {
 			addTrunc("scope")
@@ -2166,14 +2251,11 @@ func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifi
 }
 
 // calculateCursorPos converts 1-based line/col to 0-based token.Pos offset.
-// Handles clamping and returns specific errors. (Cycle 1 Change: Refined Errors)
 func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	if line <= 0 {
-		// Cycle 1 Change: More specific error message
 		return token.NoPos, fmt.Errorf("%w: line number %d must be >= 1", ErrInvalidPositionInput, line)
 	}
 	if col <= 0 {
-		// Cycle 1 Change: More specific error message
 		return token.NoPos, fmt.Errorf("%w: column number %d must be >= 1", ErrInvalidPositionInput, col)
 	}
 	if file == nil {
@@ -2181,68 +2263,57 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	}
 
 	fileLineCount := file.LineCount()
-	// Check if line is completely out of bounds
 	if line > fileLineCount {
-		// Allow cursor at the very beginning of the line *after* the last line
 		if line == fileLineCount+1 && col == 1 {
-			return file.Pos(file.Size()), nil // Position at end of file
-		}
-		// Cycle 1 Change: More specific error message
+			return file.Pos(file.Size()), nil
+		} // Allow cursor at start of line after last line.
 		return token.NoPos, fmt.Errorf("%w: line number %d exceeds file line count %d", ErrPositionOutOfRange, line, fileLineCount)
 	}
 
-	// Get the starting position (offset) of the target line
 	lineStartPos := file.LineStart(line)
 	if !lineStartPos.IsValid() {
-		// This should be rare if line number is valid
 		return token.NoPos, fmt.Errorf("%w: cannot get start offset for line %d in file '%s'", ErrPositionConversion, line, file.Name())
 	}
 
 	lineStartOffset := file.Offset(lineStartPos)
-	// Calculate the target offset based on 1-based column
-	cursorOffset := lineStartOffset + col - 1 // col is 1-based, offset is 0-based
+	cursorOffset := lineStartOffset + col - 1 // Calculate target offset.
 
-	// Determine the end offset of the current line (start of next line or EOF)
-	lineEndOffset := file.Size() // Default to end of file for the last line
+	// Determine end offset of the line.
+	lineEndOffset := file.Size()
 	if line < fileLineCount {
 		nextLineStartPos := file.LineStart(line + 1)
 		if nextLineStartPos.IsValid() {
-			lineEndOffset = file.Offset(nextLineStartPos) // End is start of next line
+			lineEndOffset = file.Offset(nextLineStartPos)
 		}
-		// Note: lineEndOffset might include the newline character(s)
 	}
 
-	// Clamp the calculated offset to be within the line bounds (or file bounds)
+	// Clamp offset to line boundaries.
 	finalOffset := cursorOffset
 	if cursorOffset < lineStartOffset {
-		// Should not happen if col >= 1, but check anyway
-		log.Printf("Warning: column %d resulted in offset %d before line start %d. Clamping to line start.", col, cursorOffset, lineStartOffset)
 		finalOffset = lineStartOffset
-	} else if cursorOffset > lineEndOffset {
-		// If cursor column is beyond the line's content length, clamp to line end
-		log.Printf("Warning: column %d resulted in offset %d beyond line end %d. Clamping to line end.", col, cursorOffset, lineEndOffset)
+		log.Printf("Warning: column %d resulted in offset %d before line start %d. Clamping.", col, cursorOffset, lineStartOffset)
+	}
+	if cursorOffset > lineEndOffset {
 		finalOffset = lineEndOffset
+		log.Printf("Warning: column %d resulted in offset %d beyond line end %d. Clamping.", col, cursorOffset, lineEndOffset)
 	}
 
-	// Convert final offset back to token.Pos
 	pos := file.Pos(finalOffset)
-	if !pos.IsValid() {
-		// Fallback if clamping still results in invalid pos (should be rare)
+	if !pos.IsValid() { // Fallback if clamped offset is still invalid.
 		log.Printf("Error: Clamped offset %d resulted in invalid token.Pos. Using line start %d.", finalOffset, lineStartPos)
 		return lineStartPos, fmt.Errorf("%w: failed to calculate valid token.Pos for offset %d", ErrPositionConversion, finalOffset)
 	}
 	return pos, nil
 }
 
-// findContextNodes identifies specific AST nodes at or enclosing the cursor.
+// findContextNodes identifies specific AST nodes (call, selector, literal, ident) at/near the cursor.
 func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Package, fset *token.FileSet, info *AstContextInfo) {
 	if len(path) == 0 || fset == nil {
 		if fset == nil {
 			addAnalysisError(info, errors.New("Fset is nil in findContextNodes"))
 		}
-		return // Need path and fileset
+		return
 	}
-	// Helper to get position string for logging
 	posStr := func(p token.Pos) string {
 		if p.IsValid() {
 			return fset.Position(p).String()
@@ -2250,7 +2321,6 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 		return fmt.Sprintf("Pos(%d)", p)
 	}
 
-	// Check if type info is available
 	hasTypeInfo := pkg != nil && pkg.TypesInfo != nil
 	var typesMap map[ast.Expr]types.TypeAndValue
 	var defsMap map[*ast.Ident]types.Object
@@ -2259,7 +2329,6 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 		typesMap = pkg.TypesInfo.Types
 		defsMap = pkg.TypesInfo.Defs
 		usesMap = pkg.TypesInfo.Uses
-		// Log if maps are unexpectedly nil (can happen with partial load errors)
 		if typesMap == nil {
 			addAnalysisError(info, errors.New("type info map 'Types' is nil"))
 		}
@@ -2271,14 +2340,13 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 		}
 	} else if pkg == nil {
 		addAnalysisError(info, errors.New("cannot perform type analysis: target package is nil"))
-	} else { // pkg != nil but TypesInfo == nil
+	} else {
 		addAnalysisError(info, errors.New("cannot perform type analysis: pkg.TypesInfo is nil"))
 	}
 
-	// Check innermost node first for specific contexts
-
-	// 1. Composite Literal?
+	// Check innermost node first.
 	innermostNode := path[0]
+	// 1. Composite Literal?
 	if compLit, ok := innermostNode.(*ast.CompositeLit); ok && cursorPos >= compLit.Lbrace && cursorPos <= compLit.Rbrace {
 		info.CompositeLit = compLit
 		if hasTypeInfo && typesMap != nil {
@@ -2290,77 +2358,64 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 			} else {
 				addAnalysisError(info, fmt.Errorf("missing type info for composite literal at %s", posStr(compLit.Pos())))
 			}
-		} else if hasTypeInfo && typesMap == nil {
+		} else if hasTypeInfo {
 			addAnalysisError(info, errors.New("cannot analyze composite literal: Types map is nil"))
 		}
-		return // Handled composite literal context
+		return
 	}
-
-	// 2. Function Call? Check path[0] and path[1]
+	// 2. Function Call? Check path[0] and path[1].
 	callExpr, callExprOk := path[0].(*ast.CallExpr)
 	if !callExprOk && len(path) > 1 {
-		callExpr, callExprOk = path[1].(*ast.CallExpr) // Check parent node as well
+		callExpr, callExprOk = path[1].(*ast.CallExpr)
 	}
-	// Ensure cursor is within the parentheses
 	if callExprOk && cursorPos > callExpr.Lparen && cursorPos <= callExpr.Rparen {
 		info.CallExpr = callExpr
 		info.CallArgIndex = calculateArgIndex(callExpr.Args, cursorPos)
-		// Try to resolve function signature
 		if hasTypeInfo && typesMap != nil {
 			if tv, ok := typesMap[callExpr.Fun]; ok && tv.Type != nil {
-				// Check if the resolved type is a signature
 				if sig, ok := tv.Type.Underlying().(*types.Signature); ok {
 					info.CallExprFuncType = sig
-					// Determine expected type for the current argument index
 					info.ExpectedArgType = determineExpectedArgType(sig, info.CallArgIndex)
 				} else {
 					addAnalysisError(info, fmt.Errorf("type of call func (%T) at %s is %T, not signature", callExpr.Fun, posStr(callExpr.Fun.Pos()), tv.Type))
 				}
 			} else {
-				// Log specific reasons for missing type info
-				if ok && tv.Type == nil { // Found entry but type is nil
+				if ok && tv.Type == nil {
 					addAnalysisError(info, fmt.Errorf("type info resolved to nil for call func (%T) at %s", callExpr.Fun, posStr(callExpr.Fun.Pos())))
-				} else { // No entry found in typesMap
+				} else {
 					addAnalysisError(info, fmt.Errorf("missing type info for call func (%T) at %s", callExpr.Fun, posStr(callExpr.Fun.Pos())))
 				}
 			}
-		} else if hasTypeInfo && typesMap == nil {
+		} else if hasTypeInfo {
 			addAnalysisError(info, errors.New("cannot analyze call expr: Types map is nil"))
 		}
-		return // Handled call expression context
+		return
 	}
-
-	// 3. Selector Expression? Check path[0] and path[1]
-	// Look for X.Sel where cursor is after the dot
-	for i := 0; i < len(path) && i < 2; i++ { // Check current node and parent
-		if selExpr, ok := path[i].(*ast.SelectorExpr); ok && cursorPos > selExpr.X.End() { // Cursor must be after the base expression
+	// 3. Selector Expression? Check path[0] and path[1].
+	for i := 0; i < len(path) && i < 2; i++ {
+		if selExpr, ok := path[i].(*ast.SelectorExpr); ok && cursorPos > selExpr.X.End() {
 			info.SelectorExpr = selExpr
-			// Try to resolve the type of the base expression (X)
 			if hasTypeInfo && typesMap != nil {
 				if tv, ok := typesMap[selExpr.X]; ok {
 					info.SelectorExprType = tv.Type
-					if tv.Type == nil { // Check if resolved type is nil
+					if tv.Type == nil {
 						addAnalysisError(info, fmt.Errorf("missing type for selector base expr (%T) starting at %s", selExpr.X, posStr(selExpr.X.Pos())))
 					}
-				} else { // No type info found for the base expression
+				} else {
 					addAnalysisError(info, fmt.Errorf("missing type info entry for selector base expr (%T) starting at %s", selExpr.X, posStr(selExpr.X.Pos())))
 				}
-			} else if hasTypeInfo && typesMap == nil {
+			} else if hasTypeInfo {
 				addAnalysisError(info, errors.New("cannot analyze selector expr: Types map is nil"))
 			}
-			return // Handled selector expression context
+			return
 		}
 	}
-
-	// 4. Identifier? Check path[0] and path[1]
+	// 4. Identifier? Check path[0] and path[1].
 	var ident *ast.Ident
-	// Check if innermost node is an identifier and cursor is at its end (common for completion)
 	if id, ok := path[0].(*ast.Ident); ok && cursorPos == id.End() {
 		ident = id
 	} else if len(path) > 1 {
-		// Check if parent is an identifier and cursor is within it
 		if id, ok := path[1].(*ast.Ident); ok && cursorPos >= id.Pos() && cursorPos <= id.End() {
-			// Avoid capturing the 'Sel' part of a SelectorExpr as the primary identifier here
 			if _, pIsSel := path[0].(*ast.SelectorExpr); !pIsSel || path[0].(*ast.SelectorExpr).Sel != id {
 				ident = id
 			}
@@ -2368,98 +2423,72 @@ func findContextNodes(path []ast.Node, cursorPos token.Pos, pkg *packages.Packag
 	}
 	if ident != nil {
 		info.IdentifierAtCursor = ident
-		// Try to resolve the identifier's type and object
 		if hasTypeInfo {
 			var obj types.Object
-			// Check Uses map first (most common for identifiers in expressions)
 			if usesMap != nil {
 				obj = usesMap[ident]
 			}
-			// If not found in Uses, check Defs map (for declarations)
 			if obj == nil && defsMap != nil {
 				obj = defsMap[ident]
 			}
-
 			if obj != nil {
 				info.IdentifierObject = obj
 				info.IdentifierType = obj.Type()
-				if info.IdentifierType == nil { // Should be rare if object exists
+				if info.IdentifierType == nil {
 					addAnalysisError(info, fmt.Errorf("object '%s' at %s found but type is nil", obj.Name(), posStr(obj.Pos())))
 				}
 			} else {
-				// If no object found, try getting type directly from Types map (less common for idents)
 				if typesMap != nil {
 					if tv, ok := typesMap[ident]; ok && tv.Type != nil {
 						info.IdentifierType = tv.Type
 					} else {
-						// Log if no info found and maps were checked
-						if defsMap != nil && usesMap != nil { // Only log if maps were expected
+						if defsMap != nil && usesMap != nil {
 							addAnalysisError(info, fmt.Errorf("missing object and type info for identifier '%s' at %s", ident.Name, posStr(ident.Pos())))
 						}
 					}
-				} else if defsMap == nil && usesMap == nil { // Log if maps were nil
+				} else if defsMap == nil && usesMap == nil {
 					addAnalysisError(info, fmt.Errorf("missing object info for identifier '%s' at %s (defs/uses/types maps nil)", ident.Name, posStr(ident.Pos())))
-				} else { // Log if maps existed but object wasn't found
+				} else {
 					addAnalysisError(info, fmt.Errorf("missing object info for identifier '%s' at %s", ident.Name, posStr(ident.Pos())))
 				}
 			}
-		} else { // Log if type info was generally unavailable
+		} else {
 			addAnalysisError(info, errors.New("missing type info for identifier analysis"))
 		}
-		// Note: We don't return here, as other context might still be relevant
 	}
 }
 
-// calculateArgIndex determines which argument (0-based) the cursor is likely in.
+// calculateArgIndex determines the 0-based index of the argument the cursor is in.
 func calculateArgIndex(args []ast.Expr, cursorPos token.Pos) int {
 	if len(args) == 0 {
-		return 0 // No args, cursor must be at index 0
+		return 0
 	}
-
-	// Iterate through arguments
 	for i, arg := range args {
 		if arg == nil {
-			continue // Should not happen in valid AST
+			continue
 		}
 		argStart := arg.Pos()
 		argEnd := arg.End()
-
-		// Define the "slot" for this argument: from end of previous arg (or Lparen) to end of this arg.
-		slotStart := argStart // Default start is the argument itself
+		slotStart := argStart
 		if i > 0 && args[i-1] != nil {
-			// Start slot after the comma following the previous argument
-			slotStart = args[i-1].End() + 1 // Position after previous arg
+			slotStart = args[i-1].End() + 1
 		}
-
-		// If cursor is within this argument's "slot" (inclusive end)
 		if cursorPos >= slotStart && cursorPos <= argEnd {
 			return i
-		}
-
-		// If cursor is immediately after this argument (before next comma or Rparen)
-		// This handles cases like fmt.Println(a,| b) or fmt.Println(a|)
-		if cursorPos > argEnd {
-			// If it's the last argument, the cursor is likely for the next (non-existent) arg index
+		} // Cursor within arg or its preceding comma space.
+		if cursorPos > argEnd { // Cursor is after this argument.
 			if i == len(args)-1 {
 				return i + 1
-			}
-			// Otherwise, check if it's before the *start* of the next argument.
-			// If the next arg exists and cursor is before it, we are still in the slot *after* current arg 'i'.
+			} // After last arg.
 			if args[i+1] != nil && cursorPos < args[i+1].Pos() {
 				return i + 1
-			}
-			// If cursor is >= next arg's start, the loop will handle it in the next iteration.
+			} // Between this arg and next.
 		}
 	}
-
-	// Edge cases: Cursor before the first argument or after the last one.
 	if len(args) > 0 && args[0] != nil && cursorPos < args[0].Pos() {
-		return 0 // Cursor before the first argument
-	}
-	// This case is handled implicitly by the loop returning len(args) if cursor is after the last arg.
-
-	// Default fallback (should ideally be covered by logic above)
-	return 0
+		return 0
+	} // Before first arg.
+	return 0 // Default fallback.
 }
 
 // determineExpectedArgType finds the expected type for a given argument index in a signature.
@@ -2473,29 +2502,26 @@ func determineExpectedArgType(sig *types.Signature, argIndex int) types.Type {
 	}
 	numParams := params.Len()
 	if numParams == 0 {
-		return nil // No parameters
+		return nil
 	}
-
 	if sig.Variadic() {
-		// If index is before the variadic param, return that param's type
-		if argIndex < numParams-1 {
-			param := params.At(argIndex)
-			if param == nil {
+		if argIndex >= numParams-1 { // At or after variadic parameter.
+			lastParam := params.At(numParams - 1)
+			if lastParam == nil {
 				return nil
 			}
-			return param.Type()
-		}
-		// If index is at or after the variadic param, return the element type of the variadic slice
-		lastParam := params.At(numParams - 1)
-		if lastParam == nil {
+			if slice, ok := lastParam.Type().(*types.Slice); ok {
+				return slice.Elem()
+			} // Return element type.
 			return nil
 		}
-		if slice, ok := lastParam.Type().(*types.Slice); ok {
-			return slice.Elem() // Return the element type
+		// Before variadic parameter.
+		param := params.At(argIndex)
+		if param == nil {
+			return nil
 		}
-		return nil // Should not happen for valid variadic signature
-	} else {
-		// Non-variadic: check if index is within bounds
+		return param.Type()
+	} else { // Non-variadic.
 		if argIndex < numParams {
 			param := params.At(argIndex)
 			if param == nil {
@@ -2504,30 +2530,24 @@ func determineExpectedArgType(sig *types.Signature, argIndex int) types.Type {
 			return param.Type()
 		}
 	}
-
-	// Argument index is out of bounds for non-variadic function
-	return nil
+	return nil // Index out of bounds.
 }
 
-// listTypeMembers attempts to list fields and methods for a given type.
+// listTypeMembers attempts to list exported fields and methods for a given type.
 func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier) []MemberInfo {
 	if typ == nil {
 		return nil
 	}
-
 	var members []MemberInfo
 	currentType := typ
 	isPointer := false
-
-	// If it's a pointer, get the element type
 	if ptr, ok := typ.(*types.Pointer); ok {
 		if ptr.Elem() == nil {
-			return nil // Invalid pointer type
+			return nil
 		}
 		currentType = ptr.Elem()
 		isPointer = true
 	}
-
 	if currentType == nil {
 		return nil
 	}
@@ -2536,105 +2556,64 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier) [
 		return nil
 	}
 
-	// Handle different kinds of underlying types
+	// Handle members based on underlying type kind.
 	switch u := underlying.(type) {
-	case *types.Basic:
-		// Basic types have no user-defined members
-		members = append(members, MemberInfo{Name: u.String(), Kind: OtherMember, TypeString: "(basic type)"})
-	case *types.Map:
-		// Suggest common map operations (as comments/placeholders)
-		members = append(members, MemberInfo{Name: "// map operations", Kind: OtherMember, TypeString: "make, len, delete, range"})
-	case *types.Slice:
-		// Suggest common slice operations
-		members = append(members, MemberInfo{Name: "// slice operations", Kind: OtherMember, TypeString: "make, len, cap, append, copy, range"})
-	case *types.Chan:
-		// Suggest common channel operations
-		members = append(members, MemberInfo{Name: "// channel operations", Kind: OtherMember, TypeString: "make, len, cap, close, send (<-), receive (<-)"})
 	case *types.Struct:
-		// List exported fields of the struct
 		members = append(members, listStructFields(u, qualifier)...)
 	case *types.Interface:
-		// List explicit methods of the interface
 		for i := 0; i < u.NumExplicitMethods(); i++ {
 			method := u.ExplicitMethod(i)
 			if method != nil && method.Exported() {
-				members = append(members, MemberInfo{
-					Name:       method.Name(),
-					Kind:       MethodMember,
-					TypeString: types.TypeString(method.Type(), qualifier),
-				})
+				members = append(members, MemberInfo{Name: method.Name(), Kind: MethodMember, TypeString: types.TypeString(method.Type(), qualifier)})
 			}
 		}
-		// List embedded types (interfaces)
 		for i := 0; i < u.NumEmbeddeds(); i++ {
 			embeddedType := u.EmbeddedType(i)
 			if embeddedType != nil {
-				// Indicate embedding for clarity
-				members = append(members, MemberInfo{
-					Name:       "// embeds", // Placeholder name
-					Kind:       OtherMember,
-					TypeString: types.TypeString(embeddedType, qualifier),
-				})
-				// Recursively list members of embedded interfaces? Could be complex.
+				members = append(members, MemberInfo{Name: "// embeds", Kind: OtherMember, TypeString: types.TypeString(embeddedType, qualifier)})
 			}
 		}
+		// Basic, Map, Slice, Chan: No user-defined members to list here.
 	}
 
-	// Add methods from the method set (handles methods defined on named types or pointers)
-	// Use the original type (typ) which might be a pointer
+	// Add methods from the method set of the original type (value or pointer receiver).
 	mset := types.NewMethodSet(typ)
 	for i := 0; i < mset.Len(); i++ {
 		sel := mset.At(i)
 		if sel != nil {
 			methodObj := sel.Obj()
-			// Ensure it's a function/method
 			if method, ok := methodObj.(*types.Func); ok {
 				if method != nil && method.Exported() {
-					members = append(members, MemberInfo{
-						Name:       method.Name(),
-						Kind:       MethodMember,
-						TypeString: types.TypeString(method.Type(), qualifier),
-					})
+					members = append(members, MemberInfo{Name: method.Name(), Kind: MethodMember, TypeString: types.TypeString(method.Type(), qualifier)})
 				}
 			}
 		}
 	}
 
-	// If the original type was NOT a pointer, also check the method set of a pointer TO that type
-	// This finds methods with pointer receivers when the variable itself is not a pointer.
+	// If original type was not a pointer, also check pointer receiver methods.
 	if !isPointer {
 		var ptrType types.Type
-		// Create pointer type only for named types or basic types (where pointer receivers are common)
 		if _, isNamed := currentType.(*types.Named); isNamed {
 			ptrType = types.NewPointer(currentType)
 		} else if _, isBasic := currentType.(*types.Basic); isBasic {
-			// Allow checking pointer methods for basic types too? Less common but possible.
 			ptrType = types.NewPointer(currentType)
 		}
-
 		if ptrType != nil {
 			msetPtr := types.NewMethodSet(ptrType)
-			// Keep track of methods already added from the value receiver method set
 			existingMethods := make(map[string]struct{})
 			for _, m := range members {
 				if m.Kind == MethodMember {
 					existingMethods[m.Name] = struct{}{}
 				}
 			}
-			// Add pointer receiver methods if they weren't already found
 			for i := 0; i < msetPtr.Len(); i++ {
 				sel := msetPtr.At(i)
 				if sel != nil {
 					methodObj := sel.Obj()
 					if method, ok := methodObj.(*types.Func); ok {
 						if method != nil && method.Exported() {
-							// Add only if not already present from value receiver check
 							if _, exists := existingMethods[method.Name()]; !exists {
-								members = append(members, MemberInfo{
-									Name:       method.Name(),
-									Kind:       MethodMember,
-									TypeString: types.TypeString(method.Type(), qualifier),
-								})
+								members = append(members, MemberInfo{Name: method.Name(), Kind: MethodMember, TypeString: types.TypeString(method.Type(), qualifier)})
 							}
 						}
 					}
@@ -2643,12 +2622,12 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier) [
 		}
 	}
 
-	// Deduplicate members (e.g., if a method exists in both value and pointer receiver sets somehow)
+	// Deduplicate members.
 	if len(members) > 0 {
 		seen := make(map[string]struct{})
 		uniqueMembers := make([]MemberInfo, 0, len(members))
 		for _, m := range members {
-			key := string(m.Kind) + ":" + m.Name // Unique key based on kind and name
+			key := string(m.Kind) + ":" + m.Name
 			if _, ok := seen[key]; !ok {
 				seen[key] = struct{}{}
 				uniqueMembers = append(uniqueMembers, m)
@@ -2656,7 +2635,6 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier) [
 		}
 		members = uniqueMembers
 	}
-
 	return members
 }
 
@@ -2668,39 +2646,31 @@ func listStructFields(st *types.Struct, qualifier types.Qualifier) []MemberInfo 
 	}
 	for i := 0; i < st.NumFields(); i++ {
 		field := st.Field(i)
-		// Add only exported fields
 		if field != nil && field.Exported() {
-			fields = append(fields, MemberInfo{
-				Name:       field.Name(),
-				Kind:       FieldMember,
-				TypeString: types.TypeString(field.Type(), qualifier),
-			})
+			fields = append(fields, MemberInfo{Name: field.Name(), Kind: FieldMember, TypeString: types.TypeString(field.Type(), qualifier)})
 		}
 	}
 	return fields
 }
 
-// logAnalysisErrors logs joined analysis errors if any exist.
+// logAnalysisErrors logs joined non-fatal analysis errors.
 func logAnalysisErrors(errs []error) {
 	if len(errs) > 0 {
-		// Use errors.Join for potentially cleaner output if Go version supports it well
 		combinedErr := errors.Join(errs...)
 		log.Printf("Context analysis completed with %d non-fatal error(s): %v", len(errs), combinedErr)
 	}
 }
 
-// addAnalysisError adds a non-fatal error to the AstContextInfo, avoiding duplicates.
+// addAnalysisError adds a non-fatal error, avoiding duplicates based on message.
 func addAnalysisError(info *AstContextInfo, err error) {
 	if err != nil && info != nil {
 		errMsg := err.Error()
-		// Check if the exact error message already exists
 		for _, existing := range info.AnalysisErrors {
 			if existing.Error() == errMsg {
-				return // Avoid logging/adding duplicate error messages
+				return
 			}
-		}
-		// Log the warning and add the error
-		log.Printf("Analysis Warning: %v", err)
+		} // Skip duplicates.
+		log.Printf("Analysis Warning: %v", err) // Log the warning.
 		info.AnalysisErrors = append(info.AnalysisErrors, err)
 	}
 }
@@ -2715,11 +2685,8 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 	if content == nil {
 		return 0, 0, -1, fmt.Errorf("%w: file content is nil", ErrPositionConversion)
 	}
-	// LSP positions are 0-based
 	targetLine := int(lspPos.Line)
 	targetUTF16Char := int(lspPos.Character)
-
-	// Validate inputs
 	if targetLine < 0 {
 		return 0, 0, -1, fmt.Errorf("%w: line number %d must be >= 0", ErrInvalidPositionInput, targetLine)
 	}
@@ -2727,63 +2694,46 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 		return 0, 0, -1, fmt.Errorf("%w: character offset %d must be >= 0", ErrInvalidPositionInput, targetUTF16Char)
 	}
 
-	currentLine := 0       // 0-based line counter
-	currentByteOffset := 0 // 0-based byte offset from start of file
-
-	// Use a scanner to efficiently process lines
+	currentLine := 0
+	currentByteOffset := 0
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	for scanner.Scan() {
-		lineTextBytes := scanner.Bytes() // Bytes of the current line (excluding newline)
+		lineTextBytes := scanner.Bytes()
 		lineLengthBytes := len(lineTextBytes)
-		newlineLengthBytes := 1 // Assume '\n' for offset calculation between lines
-
+		newlineLengthBytes := 1
 		if currentLine == targetLine {
-			// Found the target line, convert UTF-16 offset to byte offset within this line
 			byteOffsetInLine, convErr := Utf16OffsetToBytes(lineTextBytes, targetUTF16Char)
 			if convErr != nil {
-				// If offset is out of range, clamp to line end (common LSP client behavior)
-				if errors.Is(convErr, ErrPositionOutOfRange) {
+				if errors.Is(convErr, ErrPositionOutOfRange) { // Clamp to line end on out-of-range error.
 					log.Printf("Warning: utf16OffsetToBytes reported offset out of range (line %d, char %d): %v. Clamping to line end.", targetLine, targetUTF16Char, convErr)
-					byteOffsetInLine = lineLengthBytes // Clamp to the end of the line content
+					byteOffsetInLine = lineLengthBytes
 				} else {
-					// Other conversion error (e.g., invalid UTF-8)
 					return 0, 0, -1, fmt.Errorf("failed converting UTF16 to byte offset on line %d: %w", currentLine, convErr)
 				}
 			}
-
-			// Convert to 1-based Go line/col
 			line = currentLine + 1
 			col = byteOffsetInLine + 1
-			// Calculate final 0-based byte offset from start of file
 			byteOffset = currentByteOffset + byteOffsetInLine
-			return line, col, byteOffset, nil // Success
+			return line, col, byteOffset, nil // Success.
 		}
-
-		// Move to the start of the next line
-		currentByteOffset += lineLengthBytes + newlineLengthBytes // Add line length + newline
+		currentByteOffset += lineLengthBytes + newlineLengthBytes
 		currentLine++
 	}
-
-	// Check for scanner errors (e.g., token too long)
 	if err := scanner.Err(); err != nil {
 		return 0, 0, -1, fmt.Errorf("%w: error scanning file content: %w", ErrPositionConversion, err)
 	}
 
-	// Handle case where the cursor is on the line *after* the last line of content
-	// (This happens if the file ends with a newline)
+	// Handle cursor on the line after the last line of content.
 	if currentLine == targetLine {
-		if targetUTF16Char == 0 { // Only valid position is column 0 on this virtual line
+		if targetUTF16Char == 0 {
 			line = currentLine + 1
 			col = 1
-			byteOffset = currentByteOffset // Offset is at the end of the file content
+			byteOffset = currentByteOffset
 			return line, col, byteOffset, nil
-		} else {
-			// Any character offset > 0 is invalid on the line after the last content line
-			return 0, 0, -1, fmt.Errorf("%w: invalid character offset %d on line %d (after last line with content)", ErrPositionOutOfRange, targetUTF16Char, targetLine)
 		}
+		return 0, 0, -1, fmt.Errorf("%w: invalid character offset %d on line %d (after last line with content)", ErrPositionOutOfRange, targetUTF16Char, targetLine)
 	}
-
-	// If the loop finished and the target line was never reached
+	// Target line not found.
 	return 0, 0, -1, fmt.Errorf("%w: LSP line %d not found in file (total lines scanned %d)", ErrPositionOutOfRange, targetLine, currentLine)
 }
 
@@ -2793,114 +2743,90 @@ func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
 		return 0, fmt.Errorf("%w: invalid utf16Offset: %d (must be >= 0)", ErrInvalidPositionInput, utf16Offset)
 	}
 	if utf16Offset == 0 {
-		return 0, nil // No offset needed
+		return 0, nil
 	}
 
 	byteOffset := 0
 	currentUTF16Offset := 0
 	for byteOffset < len(line) {
-		// Stop if we've reached or passed the target UTF-16 offset
 		if currentUTF16Offset >= utf16Offset {
 			break
-		}
-
-		// Decode the next rune and get its byte size
+		} // Reached target.
 		r, size := utf8.DecodeRune(line[byteOffset:])
 		if r == utf8.RuneError && size <= 1 {
-			// Handle invalid UTF-8 sequence
 			return byteOffset, fmt.Errorf("%w at byte offset %d", ErrInvalidUTF8, byteOffset)
 		}
-
-		// Determine how many UTF-16 code units this rune requires (1 or 2 for surrogates)
 		utf16Units := 1
-		if r > 0xFFFF { // Rune requires a surrogate pair in UTF-16
+		if r > 0xFFFF {
 			utf16Units = 2
-		}
-
-		// Check if adding this rune would exceed the target offset
-		// If it does, the target position is *within* this rune's byte sequence,
-		// so the correct byte offset is the beginning of this rune.
+		} // Surrogate pairs require 2 units.
+		// If adding this rune exceeds target, current byteOffset is the answer.
 		if currentUTF16Offset+utf16Units > utf16Offset {
 			break
 		}
-
-		// Add the units and advance the byte offset
 		currentUTF16Offset += utf16Units
 		byteOffset += size
-
-		// Optimization: if we land exactly on the offset, break early
 		if currentUTF16Offset == utf16Offset {
 			break
-		}
+		} // Exact match.
 	}
-
-	// After the loop, check if we actually reached the target UTF-16 offset
-	// If not, it means the requested offset was beyond the line's length in UTF-16 units.
+	// Check if target offset was beyond the actual line length in UTF-16.
 	if currentUTF16Offset < utf16Offset {
-		// Return the end of the line and an error indicating out of range
 		return len(line), fmt.Errorf("%w: utf16Offset %d is beyond the line length in UTF-16 units (%d)", ErrPositionOutOfRange, utf16Offset, currentUTF16Offset)
 	}
-
-	// Return the calculated byte offset
 	return byteOffset, nil
 }
 
 // ============================================================================
-// Cache Helper Functions (Restored)
+// Cache Helper Functions
 // ============================================================================
 
-// calculateGoModHash calculates the SHA256 hash of the go.mod file in the given directory.
+// calculateGoModHash calculates the SHA256 hash of the go.mod file.
 func calculateGoModHash(dir string) string {
 	goModPath := filepath.Join(dir, "go.mod")
 	f, err := os.Open(goModPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "no-gomod" // Special value if go.mod doesn't exist
+			return "no-gomod"
 		}
 		log.Printf("Warning: Error reading %s: %v", goModPath, err)
-		return "read-error" // Special value on read error
+		return "read-error"
 	}
 	defer f.Close()
-
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		log.Printf("Warning: Error hashing %s: %v", goModPath, err)
-		return "hash-error" // Special value on hash error
+		return "hash-error"
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// calculateInputHashes calculates SHA256 hashes for relevant files (go.mod, go.sum, *.go).
-// Uses pkg.CompiledGoFiles if available, otherwise scans the directory.
+// calculateInputHashes calculates hashes for go.mod, go.sum, and Go files.
 func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string, error) {
 	hashes := make(map[string]string)
-	filesToHash := make(map[string]struct{}) // Use a map to avoid duplicate paths
+	filesToHash := make(map[string]struct{})
 
-	// 1. Always check for go.mod and go.sum in the base directory
+	// Always check for go.mod/go.sum.
 	for _, fname := range []string{"go.mod", "go.sum"} {
 		fpath := filepath.Join(dir, fname)
 		if _, err := os.Stat(fpath); err == nil {
-			// File exists, get absolute path
-			absPath, absErr := filepath.Abs(fpath)
-			if absErr == nil {
+			if absPath, absErr := filepath.Abs(fpath); absErr == nil {
 				filesToHash[absPath] = struct{}{}
 			} else {
 				log.Printf("Warning: Could not get absolute path for %s: %v", fpath, absErr)
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			// Error other than not existing
 			return nil, fmt.Errorf("failed to stat %s: %w", fpath, err)
 		}
 	}
 
-	// 2. Get Go files: Prefer using package info if available
+	// Use compiled files from package info if available.
 	filesFromPkg := false
 	if pkg != nil && len(pkg.CompiledGoFiles) > 0 {
 		filesFromPkg = true
 		log.Printf("DEBUG: Hashing based on %d CompiledGoFiles from package %s", len(pkg.CompiledGoFiles), pkg.PkgPath)
 		for _, fpath := range pkg.CompiledGoFiles {
-			absPath, err := filepath.Abs(fpath) // CompiledGoFiles should already be absolute, but double-check
-			if err == nil {
+			if absPath, err := filepath.Abs(fpath); err == nil {
 				filesToHash[absPath] = struct{}{}
 			} else {
 				log.Printf("Warning: Could not get absolute path for compiled file %s: %v", fpath, err)
@@ -2908,7 +2834,7 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		}
 	}
 
-	// 3. Fallback: Scan directory if package info was unavailable or had no Go files listed
+	// Fallback: Scan directory for .go files if package info unavailable/empty.
 	if !filesFromPkg {
 		log.Printf("DEBUG: Calculating input hashes by scanning directory %s (pkg info unavailable or empty)", dir)
 		entries, err := os.ReadDir(dir)
@@ -2916,12 +2842,9 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 			return nil, fmt.Errorf("failed to scan directory %s for hashing: %w", dir, err)
 		}
 		for _, entry := range entries {
-			// Include only .go files, ignore directories
 			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") {
 				absPath := filepath.Join(dir, entry.Name())
-				// Ensure absolute path
-				absPath, absErr := filepath.Abs(absPath)
-				if absErr == nil {
+				if absPath, absErr := filepath.Abs(absPath); absErr == nil {
 					filesToHash[absPath] = struct{}{}
 				} else {
 					log.Printf("Warning: Could not get absolute path for %s: %v", entry.Name(), absErr)
@@ -2930,21 +2853,20 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		}
 	}
 
-	// 4. Calculate hashes for all collected files
+	// Calculate hash for each unique file path.
 	for absPath := range filesToHash {
-		// Use relative path for the map key
 		relPath, err := filepath.Rel(dir, absPath)
 		if err != nil {
 			log.Printf("Warning: Could not get relative path for %s in %s: %v. Using base name.", absPath, dir, err)
-			relPath = filepath.Base(absPath) // Fallback to base name
+			relPath = filepath.Base(absPath)
 		}
+		relPath = filepath.ToSlash(relPath) // Use forward slashes for consistent keys.
 
 		hash, err := hashFileContent(absPath)
 		if err != nil {
-			// Handle file reading errors during hashing
 			if errors.Is(err, os.ErrNotExist) {
 				log.Printf("Warning: File %s disappeared during hashing. Skipping.", absPath)
-				continue // Skip file if it disappeared
+				continue
 			}
 			return nil, fmt.Errorf("%w: failed to hash input file %s: %w", ErrCacheHash, absPath, err)
 		}
@@ -2954,27 +2876,24 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 	return hashes, nil
 }
 
-// hashFileContent calculates the SHA256 hash of a single file's content.
+// hashFileContent calculates the SHA256 hash of a single file.
 func hashFileContent(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return "", err // Propagate error (e.g., os.ErrNotExist)
+		return "", err
 	}
 	defer f.Close()
-
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", err // Propagate I/O error during hashing
+		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// compareFileHashes compares current and cached file hashes, logging specific differences.
-// (Cycle 2 Change: Added specific logging)
+// compareFileHashes compares current and cached file hashes, logging differences.
 func compareFileHashes(current, cached map[string]string) bool {
 	if len(current) != len(cached) {
 		log.Printf("DEBUG: Cache invalid: File count mismatch (Current: %d, Cached: %d)", len(current), len(cached))
-		// Log specific differences for debugging
 		for relPath := range current {
 			if _, ok := cached[relPath]; !ok {
 				log.Printf("DEBUG:   - File '%s' exists now but was not in cache.", relPath)
@@ -2987,54 +2906,46 @@ func compareFileHashes(current, cached map[string]string) bool {
 		}
 		return false
 	}
-
-	// Check hashes for files present in both
 	for relPath, currentHash := range current {
 		cachedHash, ok := cached[relPath]
-		// This check should ideally not fail if counts match, but check defensively
 		if !ok {
 			log.Printf("DEBUG: Cache invalid: File '%s' missing in cache despite matching counts.", relPath)
 			return false
-		}
+		} // Should not happen if counts match.
 		if currentHash != cachedHash {
 			log.Printf("DEBUG: Cache invalid: Hash mismatch for file '%s'.", relPath)
 			return false
 		}
 	}
-	// Since counts match and all current files match cache, the sets must be identical.
-	// The check for cached files missing locally (done above if counts mismatch) is not needed here.
-	return true
+	return true // Counts match and all hashes match.
 }
 
 // deleteCacheEntry removes an entry from the bbolt cache.
 func (a *GoPackagesAnalyzer) deleteCacheEntry(cacheKey []byte) {
 	if a.db == nil {
-		return // Cache disabled
-	}
+		return
+	} // Cache disabled.
 	err := a.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(cacheBucketName)
 		if b == nil {
-			// Bucket doesn't exist, nothing to delete
 			return nil
-		}
-		// Check if key exists before deleting
+		} // Bucket gone? Nothing to do.
 		if b.Get(cacheKey) == nil {
-			// Key doesn't exist, nothing to delete
 			return nil
-		}
+		} // Key doesn't exist.
 		log.Printf("DEBUG: Deleting cache entry for key: %s", string(cacheKey))
-		return b.Delete(cacheKey) // Delete the key
+		return b.Delete(cacheKey)
 	})
 	if err != nil {
-		// Log error during deletion attempt
 		log.Printf("Warning: Failed to delete cache entry %s: %v", string(cacheKey), err)
-		// Consider adding this error to AnalysisErrors? Maybe not, it's a cache side effect.
 	}
 }
 
 // ============================================================================
 // Spinner & File Helpers
 // ============================================================================
+
+// Spinner provides simple terminal spinner feedback.
 type Spinner struct {
 	chars    []string
 	message  string
@@ -3048,6 +2959,8 @@ type Spinner struct {
 func NewSpinner() *Spinner {
 	return &Spinner{chars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}, index: 0}
 }
+
+// Start begins the spinner animation in a separate goroutine.
 func (s *Spinner) Start(initialMessage string) {
 	s.mu.Lock()
 	if s.running {
@@ -3062,41 +2975,41 @@ func (s *Spinner) Start(initialMessage string) {
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		defer func() {
+		defer func() { // Cleanup function.
 			s.mu.Lock()
 			isRunning := s.running
-			s.running = false // Mark as not running *before* clearing line
+			s.running = false
 			s.mu.Unlock()
-			if isRunning { // Only clear line if it was actually running
-				fmt.Fprintf(os.Stderr, "\r\033[K") // Clear the spinner line
-			}
-			// Signal completion
+			if isRunning {
+				fmt.Fprintf(os.Stderr, "\r\033[K")
+			} // Clear line only if running.
 			select {
 			case s.doneChan <- struct{}{}:
-			default: // Avoid blocking if Stop() already timed out
-			}
-			close(s.doneChan) // Close channel after signaling
+			default:
+			} // Signal done.
+			close(s.doneChan)
 		}()
 		for {
 			select {
 			case <-s.stopChan:
-				return // Exit goroutine when stopped
+				return // Exit on stop signal.
 			case <-ticker.C:
 				s.mu.Lock()
-				if !s.running { // Double check running status
+				if !s.running {
 					s.mu.Unlock()
 					return
-				}
-				// Update spinner character and message
+				} // Check running status again.
 				char := s.chars[s.index]
 				msg := s.message
 				s.index = (s.index + 1) % len(s.chars)
-				fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg) // \033[K clears rest of line
+				fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg) // Update spinner line.
 				s.mu.Unlock()
 			}
 		}
 	}()
 }
+
+// UpdateMessage changes the text displayed next to the spinner.
 func (s *Spinner) UpdateMessage(newMessage string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3104,68 +3017,61 @@ func (s *Spinner) UpdateMessage(newMessage string) {
 		s.message = newMessage
 	}
 }
+
+// Stop halts the spinner animation and cleans up.
 func (s *Spinner) Stop() {
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
-		return // Already stopped
+		return
 	}
-	// Signal the goroutine to stop
 	select {
-	case <-s.stopChan: // Already closed
+	case <-s.stopChan:
 	default:
 		close(s.stopChan)
-	}
-	doneChan := s.doneChan // Get doneChan while holding lock
-	s.mu.Unlock()          // Release lock before waiting
-
-	// Wait for the goroutine to finish cleaning up
-	if doneChan != nil {
+	} // Close stopChan safely.
+	doneChan := s.doneChan
+	s.mu.Unlock()
+	if doneChan != nil { // Wait for goroutine cleanup with timeout.
 		select {
-		case <-doneChan: // Wait for signal
-			// Goroutine finished cleanup
-		case <-time.After(500 * time.Millisecond): // Timeout for safety
+		case <-doneChan:
+		case <-time.After(500 * time.Millisecond):
 			log.Println("Warning: Timeout waiting for spinner goroutine cleanup")
 		}
 	}
-	// Final clear line just in case goroutine didn't manage before timeout/exit
-	fmt.Fprintf(os.Stderr, "\r\033[K")
+	fmt.Fprintf(os.Stderr, "\r\033[K") // Final clear line.
 }
 
 // ============================================================================
-// Snippet Extraction Helper (Restored)
+// Snippet Extraction Helper
 // ============================================================================
 
-// extractSnippetContext extracts the code prefix, suffix, and full line around the cursor.
+// extractSnippetContext extracts code prefix, suffix, and full line around the cursor.
 func extractSnippetContext(filename string, row, col int) (SnippetContext, error) {
 	var ctx SnippetContext
 	contentBytes, err := os.ReadFile(filename)
 	if err != nil {
-		return ctx, fmt.Errorf("error reading file '%s': %w", filename, err) // Keep os error
+		return ctx, fmt.Errorf("error reading file '%s': %w", filename, err)
 	}
 	content := string(contentBytes)
 
-	// Use a temporary FileSet for position calculation
 	fset := token.NewFileSet()
-	// Add file with non-zero base and correct size
-	file := fset.AddFile(filename, 1, len(contentBytes))
+	file := fset.AddFile(filename, 1, len(contentBytes)) // Base 1, correct size.
 	if file == nil {
 		return ctx, fmt.Errorf("failed to add file '%s' to fileset", filename)
 	}
 
-	// Calculate the 0-based byte offset for the cursor
+	// Calculate 0-based byte offset.
 	cursorPos, posErr := calculateCursorPos(file, row, col)
 	if posErr != nil {
-		// calculateCursorPos now returns specific wrapped errors
 		return ctx, fmt.Errorf("cannot determine valid cursor position: %w", posErr)
 	}
 	if !cursorPos.IsValid() {
-		// Should be caught by posErr, but double-check
 		return ctx, fmt.Errorf("%w: invalid cursor position calculated (Pos: %d)", ErrPositionConversion, cursorPos)
 	}
 
 	offset := file.Offset(cursorPos)
-	// Ensure offset is within bounds of the content length
+	// Clamp offset to content bounds.
 	if offset < 0 {
 		offset = 0
 	}
@@ -3173,40 +3079,33 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 		offset = len(content)
 	}
 
-	// Split content into prefix and suffix at the calculated offset
 	ctx.Prefix = content[:offset]
 	ctx.Suffix = content[offset:]
 
-	// Extract the full line content where the cursor resides
-	lineStartPos := file.LineStart(row) // Get start position of the target line
+	// Extract the full line content.
+	lineStartPos := file.LineStart(row)
 	if !lineStartPos.IsValid() {
-		// This might happen if the file is empty or line number is somehow invalid despite earlier checks
 		log.Printf("Warning: Could not get start position for line %d in %s", row, filename)
-		return ctx, nil // Return context with prefix/suffix, but no full line
+		return ctx, nil
 	}
 	startOffset := file.Offset(lineStartPos)
 
-	// Determine the end offset of the line
-	lineEndOffset := file.Size() // Default for the last line
+	lineEndOffset := file.Size()
 	fileLineCount := file.LineCount()
-	if row < fileLineCount { // If not the last line
-		nextLineStartPos := file.LineStart(row + 1) // Get start of the next line
-		if nextLineStartPos.IsValid() {
-			lineEndOffset = file.Offset(nextLineStartPos) // End is start of next line
+	if row < fileLineCount {
+		if nextLineStartPos := file.LineStart(row + 1); nextLineStartPos.IsValid() {
+			lineEndOffset = file.Offset(nextLineStartPos)
 		}
 	}
 
-	// Extract the line content, ensuring offsets are valid
 	if startOffset >= 0 && lineEndOffset >= startOffset && lineEndOffset <= len(content) {
 		lineContent := content[startOffset:lineEndOffset]
-		// Trim trailing newline characters (\n or \r\n)
+		// Trim trailing newline characters.
 		lineContent = strings.TrimRight(lineContent, "\n")
 		lineContent = strings.TrimRight(lineContent, "\r")
 		ctx.FullLine = lineContent
 	} else {
-		// Log warning if line extraction failed due to offset issues
-		log.Printf("Warning: Could not extract full line for row %d (start %d, end %d, content len %d) in %s",
-			row, startOffset, lineEndOffset, len(content), filename)
+		log.Printf("Warning: Could not extract full line for row %d (start %d, end %d, content len %d) in %s", row, startOffset, lineEndOffset, len(content), filename)
 	}
 	return ctx, nil
 }

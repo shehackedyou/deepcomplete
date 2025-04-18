@@ -2,22 +2,42 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"runtime/debug"
 	"strings"
-	"sync" // Added in Cycle 2
-	// Import the core deepcomplete package to use its exported functions/types
-	// "github.com/shehackedyou/deepcomplete" // Use your actual module path
+	"sync"
+	"time"
+
+	// NOTE: Replace with your actual module path
+	"github.com/shehackedyou/deepcomplete"
 )
 
-// JSON-RPC message structures (basic)
+// ============================================================================
+// Global Variables
+// ============================================================================
+
+var (
+	// completer is initialized in main and used by handlers.
+	completer *deepcomplete.DeepCompleter
+
+	// documentStore holds the content of open documents, keyed by URI.
+	documentStore = make(map[DocumentURI][]byte)
+	docStoreMutex sync.RWMutex // Protects concurrent access to documentStore.
+)
+
+// ============================================================================
+// JSON-RPC Structures
+// ============================================================================
+
 type RequestMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      interface{}     `json:"id,omitempty"` // Can be string, int, or null
+	ID      interface{}     `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
 }
@@ -41,72 +61,41 @@ type ErrorObject struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
-// LSP Specific Structures (Simplified)
-// --- Document URI ---
-type DocumentURI string
-
-// --- Initialize ---
-type InitializeParams struct {
-	ProcessID    int                `json:"processId,omitempty"`
-	RootURI      DocumentURI        `json:"rootUri,omitempty"`
-	ClientInfo   *ClientInfo        `json:"clientInfo,omitempty"`
-	Capabilities ClientCapabilities `json:"capabilities"`
-	// ... other fields
-}
-
-type ClientInfo struct {
-	Name    string `json:"name,omitempty"`
-	Version string `json:"version,omitempty"`
-}
-
-// Define a minimal set of capabilities for now
-type ClientCapabilities struct {
-	// We'll add more specific capabilities later
-}
-
-type InitializeResult struct {
-	Capabilities ServerCapabilities `json:"capabilities"`
-	ServerInfo   *ServerInfo        `json:"serverInfo,omitempty"`
-}
-
-type ServerCapabilities struct {
-	TextDocumentSync   *TextDocumentSyncOptions `json:"textDocumentSync,omitempty"`
-	CompletionProvider *CompletionOptions       `json:"completionProvider,omitempty"`
-	// Add other capabilities as needed
-}
-
-type TextDocumentSyncOptions struct {
-	OpenClose bool                 `json:"openClose,omitempty"` // Supports didOpen/didClose notifications
-	Change    TextDocumentSyncKind `json:"change,omitempty"`    // Specifies how changes are synced (None, Full, Incremental)
-}
-
-type TextDocumentSyncKind int
-
+// JSON-RPC Standard Error Codes
 const (
-	// TextDocumentSyncKindNone Documents should not be synced at all.
-	TextDocumentSyncKindNone TextDocumentSyncKind = 0
-	// TextDocumentSyncKindFull Documents are synced by sending the full content of the document.
-	TextDocumentSyncKindFull TextDocumentSyncKind = 1
-	// TextDocumentSyncKindIncremental Documents are synced by sending incremental changes.
-	TextDocumentSyncKindIncremental TextDocumentSyncKind = 2
+	ParseError     int = -32700
+	InvalidRequest int = -32600
+	MethodNotFound int = -32601
+	InvalidParams  int = -32602
+	InternalError  int = -32603
+	// Server specific codes
+	RequestFailed int = -32000 // General request failure
 )
 
-type CompletionOptions struct {
-	// We might add trigger characters, resolveProvider etc. later
+// ============================================================================
+// LSP Specific Structures (Simplified Local Definitions)
+// ============================================================================
+// These are simplified versions. A full implementation might use an LSP library.
+
+type DocumentURI string
+
+type Position struct {
+	Line      uint32 `json:"line"`      // 0-based
+	Character uint32 `json:"character"` // 0-based, UTF-16 offset
 }
 
-type ServerInfo struct {
-	Name    string `json:"name"`
-	Version string `json:"version,omitempty"`
+type Range struct {
+	Start Position `json:"start"`
+	End   Position `json:"end"`
 }
 
-// --- Text Document Sync ---
-type DidOpenTextDocumentParams struct {
-	TextDocument TextDocumentItem `json:"textDocument"`
+type Location struct {
+	URI   DocumentURI `json:"uri"`
+	Range Range       `json:"range"`
 }
 
-type DidCloseTextDocumentParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
+type TextDocumentIdentifier struct {
+	URI DocumentURI `json:"uri"`
 }
 
 type TextDocumentItem struct {
@@ -116,14 +105,153 @@ type TextDocumentItem struct {
 	Text       string      `json:"text"`
 }
 
-type TextDocumentIdentifier struct {
-	URI DocumentURI `json:"uri"`
+type InitializeParams struct {
+	ProcessID             int                `json:"processId,omitempty"`
+	RootURI               DocumentURI        `json:"rootUri,omitempty"`
+	ClientInfo            *ClientInfo        `json:"clientInfo,omitempty"`
+	Capabilities          ClientCapabilities `json:"capabilities"`
+	InitializationOptions json.RawMessage    `json:"initializationOptions,omitempty"`
 }
 
-// --- Document Store (Added in Cycle 2) ---
-var (
-	documentStore = make(map[DocumentURI][]byte)
-	docStoreMutex sync.RWMutex
+type ClientInfo struct {
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// ClientCapabilities represents the capabilities provided by the LSP client.
+type ClientCapabilities struct {
+	Workspace    *WorkspaceClientCapabilities    `json:"workspace,omitempty"`
+	TextDocument *TextDocumentClientCapabilities `json:"textDocument,omitempty"`
+}
+type WorkspaceClientCapabilities struct {
+	Configuration bool `json:"configuration,omitempty"` // Client supports workspace/configuration requests.
+}
+type TextDocumentClientCapabilities struct {
+	Completion *CompletionClientCapabilities `json:"completion,omitempty"`
+}
+type CompletionClientCapabilities struct {
+	CompletionItem *CompletionItemClientCapabilities `json:"completionItem,omitempty"`
+}
+type CompletionItemClientCapabilities struct {
+	SnippetSupport bool `json:"snippetSupport,omitempty"` // Client supports snippet formats.
+}
+
+type InitializeResult struct {
+	Capabilities ServerCapabilities `json:"capabilities"`
+	ServerInfo   *ServerInfo        `json:"serverInfo,omitempty"`
+}
+
+// ServerCapabilities defines the capabilities provided by this LSP server.
+type ServerCapabilities struct {
+	TextDocumentSync   *TextDocumentSyncOptions `json:"textDocumentSync,omitempty"`   // How documents are synced.
+	CompletionProvider *CompletionOptions       `json:"completionProvider,omitempty"` // Advertise completion support.
+}
+
+type TextDocumentSyncOptions struct {
+	OpenClose bool                 `json:"openClose,omitempty"` // Supports didOpen/didClose notifications.
+	Change    TextDocumentSyncKind `json:"change,omitempty"`    // Specifies how changes are synced.
+}
+
+// TextDocumentSyncKind defines the type of text document synchronization.
+type TextDocumentSyncKind int
+
+const (
+	TextDocumentSyncKindNone TextDocumentSyncKind = 0 // Not synced.
+	TextDocumentSyncKindFull TextDocumentSyncKind = 1 // Synced by sending full content.
+	// TextDocumentSyncKindIncremental TextDocumentSyncKind = 2 // Incremental changes (not implemented yet).
+)
+
+type CompletionOptions struct {
+	// TriggerCharacters []string `json:"triggerCharacters,omitempty"` // Future: Characters to trigger completion.
+	// ResolveProvider bool `json:"resolveProvider,omitempty"` // Future: Support completionItem/resolve.
+}
+
+type ServerInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+}
+
+type DidOpenTextDocumentParams struct {
+	TextDocument TextDocumentItem `json:"textDocument"`
+}
+
+type DidCloseTextDocumentParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+}
+
+type DidChangeTextDocumentParams struct {
+	TextDocument   VersionedTextDocumentIdentifier  `json:"textDocument"`
+	ContentChanges []TextDocumentContentChangeEvent `json:"contentChanges"`
+}
+
+type VersionedTextDocumentIdentifier struct {
+	TextDocumentIdentifier
+	Version int `json:"version"` // Document version after the change.
+}
+
+// TextDocumentContentChangeEvent represents a change to a text document.
+// For full sync, this contains the entire new text content.
+type TextDocumentContentChangeEvent struct {
+	// Range *Range `json:"range,omitempty"` // Omitted for full sync.
+	// RangeLength uint32 `json:"rangeLength,omitempty"` // Omitted for full sync.
+	Text string `json:"text"` // The new full content for full sync.
+}
+
+type DidChangeConfigurationParams struct {
+	Settings json.RawMessage `json:"settings"` // The new configuration settings. Structure depends on client.
+}
+
+type CompletionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	Context      *CompletionContext     `json:"context,omitempty"` // Information about why completion was triggered.
+}
+
+type CompletionContext struct {
+	TriggerKind      CompletionTriggerKind `json:"triggerKind"`
+	TriggerCharacter string                `json:"triggerCharacter,omitempty"`
+}
+
+// CompletionTriggerKind indicates how completion was triggered.
+type CompletionTriggerKind int
+
+const (
+	CompletionTriggerKindInvoked              CompletionTriggerKind = 1 // Explicitly invoked (e.g., Ctrl+Space).
+	CompletionTriggerKindTriggerChar          CompletionTriggerKind = 2 // Triggered by typing a trigger character.
+	CompletionTriggerKindTriggerForIncomplete CompletionTriggerKind = 3 // Retriggered completion on existing list.
+)
+
+type CompletionList struct {
+	IsIncomplete bool             `json:"isIncomplete"` // True if list is potentially incomplete.
+	Items        []CompletionItem `json:"items"`
+}
+
+type CompletionItem struct {
+	Label            string             `json:"label"`                      // Text shown in the UI list.
+	Kind             CompletionItemKind `json:"kind,omitempty"`             // Type of completion item (e.g., Function, Variable).
+	Detail           string             `json:"detail,omitempty"`           // Additional info shown in the UI.
+	Documentation    string             `json:"documentation,omitempty"`    // Documentation shown on hover/selection.
+	InsertTextFormat InsertTextFormat   `json:"insertTextFormat,omitempty"` // Format of the InsertText (PlainText or Snippet).
+	InsertText       string             `json:"insertText,omitempty"`       // The text/snippet to insert.
+}
+
+// CompletionItemKind represents the type of a completion item.
+type CompletionItemKind int // Simplified, see LSP spec for full list
+
+const (
+	CompletionItemKindText     CompletionItemKind = 1
+	CompletionItemKindFunction CompletionItemKind = 3
+	CompletionItemKindVariable CompletionItemKind = 6
+	CompletionItemKindKeyword  CompletionItemKind = 14
+	// Add more kinds as needed...
+)
+
+// InsertTextFormat indicates whether InsertText is plain text or a snippet.
+type InsertTextFormat int
+
+const (
+	PlainTextFormat InsertTextFormat = 1
+	SnippetFormat   InsertTextFormat = 2 // Supports placeholders like $1, $0.
 )
 
 // ============================================================================
@@ -131,7 +259,7 @@ var (
 // ============================================================================
 
 func main() {
-	// Set up logging
+	// Setup logging to a file.
 	logFile, err := os.OpenFile("deepcomplete-lsp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
@@ -142,55 +270,76 @@ func main() {
 
 	log.Println("DeepComplete LSP server starting...")
 
-	// TODO: Initialize DeepCompleter core service
-	// completer, err := deepcomplete.NewDeepCompleter()
-	// if err != nil { ... handle error ... }
-	// defer completer.Close()
+	// Initialize the core DeepCompleter service.
+	var initErr error
+	completer, initErr = deepcomplete.NewDeepCompleter()
+	if initErr != nil {
+		log.Fatalf("Failed to initialize DeepCompleter service: %v", initErr)
+	}
+	defer func() {
+		log.Println("Closing DeepCompleter service...")
+		if err := completer.Close(); err != nil {
+			log.Printf("Error closing completer: %v", err)
+		}
+	}()
+	log.Println("DeepCompleter service initialized.")
 
 	reader := bufio.NewReader(os.Stdin)
 	writer := os.Stdout
 
+	// Main message processing loop.
 	for {
-		// Read JSON-RPC message
-		content, err := readMessage(reader)
-		if err != nil {
-			if err == io.EOF {
-				log.Println("Client closed connection (EOF).")
-				break // Exit loop on EOF
+		var panicErr error
+		func() {
+			// Recover from panics within message handling to keep server running.
+			defer func() {
+				if r := recover(); r != nil {
+					panicErr = fmt.Errorf("lsp handler panicked: %v\n%s", r, string(debug.Stack()))
+					log.Printf("PANIC: %v", panicErr)
+				}
+			}()
+
+			content, err := readMessage(reader)
+			if err != nil {
+				if err == io.EOF {
+					log.Println("Client closed connection (EOF). Exiting.")
+					os.Exit(0)
+				}
+				log.Printf("Error reading message: %v", err)
+				return // Continue loop after read error.
 			}
-			log.Printf("Error reading message: %v", err)
-			continue // Continue reading? Or should we exit? Decide error strategy.
-		}
 
-		log.Printf("Received message: %s", string(content))
+			log.Printf("Received message: %s", string(content))
 
-		// Decode JSON-RPC message
-		var baseMessage RequestMessage // Use RequestMessage first to check for ID
-		if err := json.Unmarshal(content, &baseMessage); err != nil {
-			log.Printf("Error decoding base JSON message: %v", err)
-			// TODO: Send parse error response if ID exists?
-			continue
-		}
+			// Decode base message to distinguish request vs notification.
+			var baseMessage RequestMessage
+			if err := json.Unmarshal(content, &baseMessage); err != nil {
+				log.Printf("Error decoding base JSON message: %v", err)
+				// Cannot send error response without ID.
+				return // Continue loop.
+			}
 
-		ctx := context.Background() // Create a new context for each request/notification
+			ctx := context.Background()
 
-		// Handle Request or Notification
-		if baseMessage.ID != nil {
-			// It's a request
-			handleRequest(ctx, baseMessage, writer)
-		} else {
-			// It's a notification
-			handleNotification(ctx, baseMessage)
+			// Dispatch based on presence of ID.
+			if baseMessage.ID != nil {
+				handleRequest(ctx, baseMessage, writer)
+			} else {
+				handleNotification(ctx, baseMessage)
+			}
+		}() // End of deferred recovery function call
+
+		if panicErr != nil {
+			log.Println("Continuing after recovered panic.")
+			// Potentially send an error notification to the client?
 		}
 	}
-
-	log.Println("DeepComplete LSP server shutting down.")
 }
 
 // readMessage reads a single JSON-RPC message based on Content-Length header.
 func readMessage(reader *bufio.Reader) ([]byte, error) {
-	var contentLength int
-	// Read headers
+	var contentLength int = -1
+	// Read headers until an empty line is encountered.
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -198,20 +347,25 @@ func readMessage(reader *bufio.Reader) ([]byte, error) {
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
-			// End of headers
-			break
+			break // End of headers.
 		}
-		if _, err := fmt.Sscanf(line, "Content-Length: %d", &contentLength); err == nil {
-			// Found Content-Length
+		// Parse Content-Length.
+		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+			_, err := fmt.Sscanf(line, "Content-Length: %d", &contentLength)
+			if err != nil {
+				log.Printf("Warning: Failed to parse Content-Length header '%s': %v", line, err)
+			}
 		}
-		// Ignore other headers for now
 	}
 
-	if contentLength <= 0 {
+	if contentLength < 0 {
 		return nil, fmt.Errorf("missing or invalid Content-Length header")
 	}
+	if contentLength == 0 {
+		return []byte{}, nil // Valid empty message.
+	}
 
-	// Read body
+	// Read the specified number of bytes for the message body.
 	body := make([]byte, contentLength)
 	n, err := io.ReadFull(reader, body)
 	if err != nil {
@@ -221,14 +375,12 @@ func readMessage(reader *bufio.Reader) ([]byte, error) {
 	return body, nil
 }
 
-// writeMessage encodes and writes a JSON-RPC message with headers.
+// writeMessage encodes a message to JSON and writes it to the writer with headers.
 func writeMessage(writer io.Writer, message interface{}) error {
 	content, err := json.Marshal(message)
 	if err != nil {
-		// Log internally, don't send marshalling errors back to client easily
-		log.Printf("Error marshalling response: %v (Message: %+v)", err, message)
-		// Optionally send a generic error response if possible?
-		return fmt.Errorf("error marshalling response: %w", err)
+		log.Printf("CRITICAL: Error marshalling message: %v (Message: %+v)", err, message)
+		return fmt.Errorf("error marshalling message: %w", err)
 	}
 
 	log.Printf("Sending message: %s", string(content))
@@ -236,76 +388,164 @@ func writeMessage(writer io.Writer, message interface{}) error {
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(content))
 	_, err = writer.Write([]byte(header))
 	if err != nil {
+		log.Printf("Error writing message header: %v", err)
 		return fmt.Errorf("error writing header: %w", err)
 	}
 	_, err = writer.Write(content)
 	if err != nil {
+		log.Printf("Error writing message content: %v", err)
 		return fmt.Errorf("error writing content: %w", err)
 	}
-	// Flush if writer is buffered? Depends on os.Stdout behavior. Usually not needed.
 	return nil
 }
 
-// handleRequest routes incoming requests based on method.
+// handleRequest processes incoming requests and sends responses.
 func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
-	var response ResponseMessage
-	response.JSONRPC = "2.0"
-	response.ID = req.ID
+	response := ResponseMessage{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+	}
 
 	switch req.Method {
 	case "initialize":
 		log.Println("Handling 'initialize' request...")
 		var params InitializeParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			response.Error = &ErrorObject{Code: -32602, Message: "Invalid params for initialize"}
+			response.Error = &ErrorObject{Code: InvalidParams, Message: fmt.Sprintf("Invalid params for initialize: %v", err)}
 		} else {
-			// Basic capabilities for now
+			if params.ClientInfo != nil {
+				log.Printf("Client Info: Name=%s, Version=%s", params.ClientInfo.Name, params.ClientInfo.Version)
+			}
+			// Advertise server capabilities.
 			response.Result = InitializeResult{
 				Capabilities: ServerCapabilities{
 					TextDocumentSync: &TextDocumentSyncOptions{
-						OpenClose: true,                     // We handle didOpen/didClose (Cycle 2)
-						Change:    TextDocumentSyncKindFull, // Start with Full sync
+						OpenClose: true,
+						Change:    TextDocumentSyncKindFull, // Supports full document sync on change.
 					},
-					// CompletionProvider: &CompletionOptions{}, // Advertise later
+					CompletionProvider: &CompletionOptions{}, // Supports completion requests.
 				},
 				ServerInfo: &ServerInfo{
 					Name:    "DeepComplete LSP",
-					Version: "0.0.1", // TODO: Get version properly
+					Version: "0.0.1", // TODO: Link to actual version.
 				},
 			}
-			log.Printf("Client Info: Name=%s, Version=%s", params.ClientInfo.Name, params.ClientInfo.Version)
 		}
 
 	case "shutdown":
 		log.Println("Handling 'shutdown' request...")
-		// Perform cleanup if needed before exit notification
-		response.Result = nil // Success is null result
+		// Cleanup resources if necessary before exiting.
+		response.Result = nil // Success is null result.
 
-	// TODO: Add other request handlers (e.g., textDocument/completion)
+	case "textDocument/completion":
+		log.Println("Handling 'textDocument/completion' request...")
+		var params CompletionParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			response.Error = &ErrorObject{Code: InvalidParams, Message: fmt.Sprintf("Invalid params for completion: %v", err)}
+			break
+		}
+
+		if params.Context != nil {
+			log.Printf("Completion Context: TriggerKind=%d, TriggerChar=%q", params.Context.TriggerKind, params.Context.TriggerCharacter)
+		}
+
+		// Get document content from the store.
+		docStoreMutex.RLock()
+		contentBytes, ok := documentStore[params.TextDocument.URI]
+		docStoreMutex.RUnlock()
+		if !ok {
+			log.Printf("Error: Document not found for completion: %s", params.TextDocument.URI)
+			response.Error = &ErrorObject{Code: RequestFailed, Message: fmt.Sprintf("Document not found: %s", params.TextDocument.URI)}
+			break
+		}
+
+		// Convert LSP position to Go line/column.
+		line, col, _, err := deepcomplete.LspPositionToBytePosition(contentBytes, params.Position)
+		if err != nil {
+			log.Printf("Error converting LSP position for %s: %v", params.TextDocument.URI, err)
+			response.Error = &ErrorObject{Code: RequestFailed, Message: fmt.Sprintf("Failed to convert position: %v", err)}
+			break
+		}
+
+		// Call the core completion logic.
+		var completionBuf bytes.Buffer
+		completionCtx, cancel := context.WithTimeout(ctx, 60*time.Second) // Timeout for completion.
+		defer cancel()
+		// The core function now handles logging non-fatal analysis errors internally.
+		err = completer.GetCompletionStreamFromFile(completionCtx, string(params.TextDocument.URI), line, col, &completionBuf)
+
+		if err != nil {
+			// If the core function returns an error, it's likely fatal (Ollama unavailable, etc.)
+			log.Printf("Error getting completion from core for %s (%d:%d): %v", params.TextDocument.URI, line, col, err)
+			response.Error = &ErrorObject{Code: RequestFailed, Message: fmt.Sprintf("Completion failed: %v", err)}
+			break
+		}
+
+		// Format the completion result into an LSP CompletionItem.
+		completionText := completionBuf.String()
+		if completionText == "" {
+			response.Result = CompletionList{IsIncomplete: false, Items: []CompletionItem{}}
+			break
+		}
+
+		// Create label (first line, truncated).
+		label := strings.TrimSpace(completionText)
+		if firstNewline := strings.Index(label, "\n"); firstNewline != -1 {
+			label = label[:firstNewline]
+		}
+		if len(label) > 50 {
+			label = label[:50] + "..."
+		}
+
+		// Basic heuristic for completion kind.
+		kind := CompletionItemKindText
+		trimmedCompletion := strings.TrimSpace(completionText)
+		// Simple checks for common Go constructs.
+		if strings.HasPrefix(trimmedCompletion, "func ") {
+			kind = CompletionItemKindFunction
+		} else if strings.HasPrefix(trimmedCompletion, "var ") || strings.HasPrefix(trimmedCompletion, "const ") {
+			kind = CompletionItemKindVariable
+		} else if strings.HasPrefix(trimmedCompletion, "type ") {
+			kind = CompletionItemKindKeyword // Could refine to Struct/Interface later.
+		} // Add more keyword checks if needed.
+
+		completionItem := CompletionItem{
+			Label:            label,
+			Kind:             kind,
+			Detail:           "DeepComplete Suggestion",
+			Documentation:    "Generated by DeepComplete", // Placeholder documentation.
+			InsertTextFormat: SnippetFormat,               // Use snippet format.
+			InsertText:       completionText + "$0",       // Insert completion text + final cursor stop.
+		}
+		response.Result = CompletionList{
+			IsIncomplete: false, // Assume complete results for now.
+			Items:        []CompletionItem{completionItem},
+		}
 
 	default:
 		log.Printf("Received unhandled request method: %s", req.Method)
-		response.Error = &ErrorObject{Code: -32601, Message: fmt.Sprintf("Method not found: %s", req.Method)}
+		response.Error = &ErrorObject{Code: MethodNotFound, Message: fmt.Sprintf("Method not found: %s", req.Method)}
 	}
 
+	// Send the response back to the client.
 	if err := writeMessage(writer, response); err != nil {
 		log.Printf("Error sending response for ID %v: %v", req.ID, err)
 	}
 }
 
-// handleNotification routes incoming notifications based on method.
+// handleNotification processes incoming notifications.
 func handleNotification(ctx context.Context, notif NotificationMessage) {
 	switch notif.Method {
 	case "initialized":
-		// Client confirms initialization. Maybe start background tasks?
 		log.Println("Received 'initialized' notification from client.")
+		// Can perform actions after client confirms initialization here.
 
 	case "exit":
 		log.Println("Handling 'exit' notification. Server exiting.")
-		// Specification requires server process to exit cleanly.
-		os.Exit(0) // TODO: Check if shutdown was received first? Error code?
+		// Per LSP spec, exit immediately. Assume shutdown was received.
+		os.Exit(0)
 
-	case "textDocument/didOpen": // Added in Cycle 2
+	case "textDocument/didOpen":
 		log.Println("Handling 'textDocument/didOpen' notification...")
 		var params DidOpenTextDocumentParams
 		if err := json.Unmarshal(notif.Params, &params); err != nil {
@@ -315,10 +555,10 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 		docStoreMutex.Lock()
 		documentStore[params.TextDocument.URI] = []byte(params.TextDocument.Text)
 		docStoreMutex.Unlock()
-		log.Printf("Opened and stored document: %s (Version: %d, Length: %d)",
-			params.TextDocument.URI, params.TextDocument.Version, len(params.TextDocument.Text))
+		log.Printf("Opened and stored document: %s (Version: %d, Language: %s, Length: %d)",
+			params.TextDocument.URI, params.TextDocument.Version, params.TextDocument.LanguageID, len(params.TextDocument.Text))
 
-	case "textDocument/didClose": // Added in Cycle 2
+	case "textDocument/didClose":
 		log.Println("Handling 'textDocument/didClose' notification...")
 		var params DidCloseTextDocumentParams
 		if err := json.Unmarshal(notif.Params, &params); err != nil {
@@ -326,18 +566,96 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 			return
 		}
 		docStoreMutex.Lock()
-		delete(documentStore, params.TextDocument.URI)
+		delete(documentStore, params.TextDocument.URI) // Remove document from store.
 		docStoreMutex.Unlock()
 		log.Printf("Closed and removed document: %s", params.TextDocument.URI)
 
-	// TODO: Add other notification handlers (e.g., textDocument/didChange, didSave, $/cancelRequest)
+	case "textDocument/didChange":
+		log.Println("Handling 'textDocument/didChange' notification...")
+		var params DidChangeTextDocumentParams
+		if err := json.Unmarshal(notif.Params, &params); err != nil {
+			log.Printf("Error decoding didChange params: %v", err)
+			return
+		}
+		// Currently only supports full document sync.
+		if len(params.ContentChanges) != 1 {
+			log.Printf("Warning: Expected exactly one content change for full sync, got %d for %s. Using first change.", len(params.ContentChanges), params.TextDocument.URI)
+			if len(params.ContentChanges) == 0 {
+				return // Ignore if no changes provided.
+			}
+		}
+		newText := params.ContentChanges[0].Text
+		docStoreMutex.Lock()
+		documentStore[params.TextDocument.URI] = []byte(newText) // Replace content.
+		docStoreMutex.Unlock()
+		log.Printf("Updated document via didChange (full sync): %s (Version: %d, New Length: %d)",
+			params.TextDocument.URI, params.TextDocument.Version, len(newText))
+
+	case "workspace/didChangeConfiguration":
+		log.Println("Handling 'workspace/didChangeConfiguration' notification...")
+		var params DidChangeConfigurationParams
+		if err := json.Unmarshal(notif.Params, &params); err != nil {
+			log.Printf("Error decoding didChangeConfiguration params: %v", err)
+			return
+		}
+		log.Printf("Received configuration change notification. Raw settings: %s", string(params.Settings))
+
+		// Attempt to parse settings into the FileConfig structure.
+		// Assumes settings are directly in the expected format. Needs refinement
+		// if settings are nested (e.g., under a "deepcomplete" key).
+		var fileCfg deepcomplete.FileConfig
+		if err := json.Unmarshal(params.Settings, &fileCfg); err != nil {
+			log.Printf("Warning: Could not unmarshal settings into FileConfig structure: %v. Config not updated.", err)
+			return
+		}
+
+		if completer != nil {
+			// Create a new config based on defaults and merge the partial FileConfig.
+			// This approach is simple but doesn't preserve previous non-default settings
+			// that weren't included in the notification. A better approach would be
+			// to get the *current* config from the completer and merge into that.
+			mergedConfig := deepcomplete.DefaultConfig // Base for merging.
+			// Apply partial settings from fileCfg...
+			if fileCfg.OllamaURL != nil {
+				mergedConfig.OllamaURL = *fileCfg.OllamaURL
+			}
+			if fileCfg.Model != nil {
+				mergedConfig.Model = *fileCfg.Model
+			}
+			if fileCfg.MaxTokens != nil {
+				mergedConfig.MaxTokens = *fileCfg.MaxTokens
+			}
+			if fileCfg.Stop != nil {
+				mergedConfig.Stop = *fileCfg.Stop
+			}
+			if fileCfg.Temperature != nil {
+				mergedConfig.Temperature = *fileCfg.Temperature
+			}
+			if fileCfg.UseAst != nil {
+				mergedConfig.UseAst = *fileCfg.UseAst
+			}
+			if fileCfg.UseFim != nil {
+				mergedConfig.UseFim = *fileCfg.UseFim
+			}
+			if fileCfg.MaxPreambleLen != nil {
+				mergedConfig.MaxPreambleLen = *fileCfg.MaxPreambleLen
+			}
+			if fileCfg.MaxSnippetLen != nil {
+				mergedConfig.MaxSnippetLen = *fileCfg.MaxSnippetLen
+			}
+
+			// Update the completer's config atomically.
+			if err := completer.UpdateConfig(mergedConfig); err != nil {
+				log.Printf("Error applying updated configuration: %v", err)
+			} else {
+				log.Println("Successfully applied updated configuration from client.")
+			}
+		} else {
+			log.Println("Warning: Cannot apply configuration changes, completer not initialized.")
+		}
 
 	default:
-		log.Printf("Received unhandled notification method: %s", notif.Method)
+		// Ignore other notifications.
+		// log.Printf("Received unhandled notification method: %s", notif.Method)
 	}
 }
-
-// --- Functions moved to deepcomplete.go ---
-// func lspPositionToBytePosition(...) { ... }
-// func utf16OffsetToBytes(...) { ... }
-// ---
