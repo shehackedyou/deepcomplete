@@ -5,186 +5,124 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io"
+	"log/slog" // Cycle 3: Added slog
 	"os"
-	"strings"
 	"time"
 
 	// NOTE: Replace with your actual module path
 	"github.com/shehackedyou/deepcomplete"
 )
 
-// Simple version string (update as needed).
-const version = "0.0.1" // Added in Cycle 4
-
 func main() {
-	// --- Configuration Loading ---
-	// Load config, using defaults as fallback and attempting to write default if none found.
-	config, configLoadErr := deepcomplete.LoadConfig()
-	if configLoadErr != nil && !errors.Is(configLoadErr, deepcomplete.ErrConfig) {
-		// Log fatal errors (e.g., cannot determine paths).
-		log.Fatalf("Fatal error loading initial config: %v", configLoadErr)
-	} else if configLoadErr != nil {
-		// Log non-fatal warnings (e.g., failed write, parse errors) but continue.
-		log.Printf("%sWarning during initial config load: %v. Using defaults and flags.%s", deepcomplete.ColorYellow, configLoadErr, deepcomplete.ColorReset)
-		// Ensure config is reset to default if load partially failed but wasn't fatal.
-		if err := config.Validate(); err != nil {
-			config = deepcomplete.DefaultConfig // Fallback to pure defaults.
-		}
-	}
+	// Cycle 3: Initialize slog for CLI (simple text handler to stderr)
+	logLevel := slog.LevelInfo                                            // Default level for CLI, could be flag-controlled
+	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false} // Source location less useful for CLI
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &handlerOpts))
+	slog.SetDefault(logger)
 
-	// --- Flag Definition ---
-	// Define flags using loaded config values as defaults.
-	ollamaURL := flag.String("ollama-url", config.OllamaURL, "URL of the Ollama API endpoint.")
-	model := flag.String("model", config.Model, "Name of the Ollama model to use.")
-	row := flag.Int("row", 0, "Cursor row number (1-based). Required with --file.")
-	col := flag.Int("col", 0, "Cursor column number (1-based, byte offset). Required with --file.")
-	filename := flag.String("file", "", "Path to Go file for context-aware completion.")
-	useAst := flag.Bool("ast", config.UseAst, "Enable AST/type analysis for richer context.")
-	useFim := flag.Bool("fim", config.UseFim, "Use Fill-in-the-Middle prompting.")
-	maxTokens := flag.Int("max-tokens", config.MaxTokens, "Max tokens for completion response.")
-	temperature := flag.Float64("temperature", config.Temperature, "Sampling temperature for Ollama.")
-	stop := flag.String("stop", strings.Join(config.Stop, ","), "Comma-separated stop sequences.")
-	maxPreambleLen := flag.Int("max-preamble-len", config.MaxPreambleLen, "Max bytes for context preamble.")
-	maxSnippetLen := flag.Int("max-snippet-len", config.MaxSnippetLen, "Max bytes for code snippet context.")
-	versionFlag := flag.Bool("version", false, "Print version information and exit.") // Added Cycle 4
+	// --- Flag Definitions ---
+	filePath := flag.String("file", "", "Path to the Go file")
+	line := flag.Int("line", 0, "Line number (1-based)")
+	col := flag.Int("col", 0, "Column number (1-based)")
+	stdin := flag.Bool("stdin", false, "Read code snippet from stdin instead of file")
+	// Add flags for other config options if needed, e.g.:
+	// model := flag.String("model", "", "Ollama model to use (overrides config)")
+	// ollamaURL := flag.String("url", "", "Ollama URL (overrides config)")
 
-	flag.Parse() // Parse command-line flags.
-
-	// --- Handle Version Flag (Added Cycle 4) ---
-	if *versionFlag {
-		fmt.Printf("deepcomplete-cli version %s\n", version)
-		os.Exit(0) // Exit immediately after printing version.
-	}
-
-	// --- Apply Parsed Flag Values to Config ---
-	// Update config struct with final values (Flag > Config File > Default).
-	config.OllamaURL = *ollamaURL
-	config.Model = *model
-	config.UseAst = *useAst
-	config.UseFim = *useFim
-	config.MaxTokens = *maxTokens
-	config.Temperature = *temperature
-	config.MaxPreambleLen = *maxPreambleLen
-	config.MaxSnippetLen = *maxSnippetLen
-
-	// Reprocess stop sequences based on final flag value.
-	stopSequences := strings.Split(*stop, ",")
-	validStopSequences := make([]string, 0, len(stopSequences))
-	for _, s := range stopSequences {
-		trimmed := strings.TrimSpace(s)
-		if trimmed != "" {
-			validStopSequences = append(validStopSequences, trimmed)
-		}
-	}
-	// Override config only if flag provided non-empty sequences OR was explicitly passed.
-	if len(validStopSequences) > 0 || isFlagPassed("stop") {
-		config.Stop = validStopSequences
-	}
-
-	// --- Final Config Validation ---
-	if err := config.Validate(); err != nil {
-		log.Fatalf("%sError in final configuration: %v%s", deepcomplete.ColorRed, err, deepcomplete.ColorReset)
-	}
-	log.Printf("Final config: %+v", config) // Log effective config.
-
-	// --- Determine Input Mode (File vs Prompt Args) ---
-	var promptArgs string
-	if *filename == "" && flag.NArg() > 0 {
-		promptArgs = strings.Join(flag.Args(), " ")
-		log.Printf("Using non-flag arguments as prompt: %q", promptArgs)
-	}
-
-	// Create background context.
-	ctx := context.Background()
-
-	// Create spinner for user feedback.
-	spinner := deepcomplete.NewSpinner()
+	flag.Parse()
 
 	// --- Input Validation ---
-	if *filename != "" && (*row <= 0 || *col <= 0) {
-		log.Fatalf("%sError: Both --row and --col must be positive integers when --file is provided.%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
-	}
-	if *filename == "" && promptArgs == "" {
-		log.Fatalf("%sError: Either provide a prompt as arguments or use --file (with --row and --col).%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
-	}
-	if *filename != "" { // Check if file exists if provided.
-		if _, err := os.Stat(*filename); errors.Is(err, os.ErrNotExist) {
-			log.Fatalf("%sError: File not found: %s%s", deepcomplete.ColorRed, *filename, deepcomplete.ColorReset)
-		} else if err != nil {
-			log.Fatalf("%sError checking file '%s': %v%s", deepcomplete.ColorRed, *filename, err, deepcomplete.ColorReset)
-		}
+	if !*stdin && (*filePath == "" || *line <= 0 || *col <= 0) {
+		fmt.Fprintf(os.Stderr, "Usage: %s -file <path> -line <num> -col <num> [flags]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "   or: %s -stdin [flags] < <snippet>\n", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(1)
 	}
 
-	// --- Initialize DeepCompleter Service ---
-	completer, err := deepcomplete.NewDeepCompleterWithConfig(config)
+	// --- Initialize Completer ---
+	// Load config implicitly via NewDeepCompleter (it calls LoadConfig)
+	completer, err := deepcomplete.NewDeepCompleter()
 	if err != nil {
-		log.Fatalf("%sError initializing completer: %v%s", deepcomplete.ColorRed, err, deepcomplete.ColorReset)
+		// Use slog for fatal errors
+		slog.Error("Failed to initialize DeepCompleter service", "error", err)
+		os.Exit(1)
 	}
-	defer func() { // Ensure resources are closed on exit.
-		log.Println("Closing completer resources...")
-		if closeErr := completer.Close(); closeErr != nil {
-			log.Printf("%sError closing completer: %v%s", deepcomplete.ColorRed, closeErr, deepcomplete.ColorReset)
+	defer func() {
+		slog.Info("Closing DeepCompleter service...")
+		if err := completer.Close(); err != nil {
+			slog.Error("Error closing completer", "error", err)
 		}
 	}()
+	slog.Info("DeepCompleter service initialized.")
 
-	// --- Execute Completion Logic ---
-	var completionErr error
+	// --- Execute Command ---
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second) // Add timeout
+	defer cancel()
 
-	switch {
-	case promptArgs != "": // Direct prompt input from args.
-		if config.UseFim {
-			log.Fatalf("%sError: Fill-in-the-Middle (-fim) requires file input (--file).%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
+	if *stdin {
+		// Read code from stdin
+		slog.Info("Reading code snippet from stdin...")
+		snippetBytes, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			slog.Error("Failed to read from stdin", "error", err)
+			os.Exit(1)
 		}
-		spinner.Start("Waiting for Ollama...")
-		var completion string
-		completion, completionErr = completer.GetCompletion(ctx, promptArgs)
-		spinner.Stop()
-		if completionErr != nil {
-			log.Fatalf("%sError getting completion: %v%s", deepcomplete.ColorRed, completionErr, deepcomplete.ColorReset)
-		}
-		deepcomplete.PrettyPrint(deepcomplete.ColorGreen, "Completion:\n")
-		fmt.Println(completion) // Print raw completion to stdout.
+		snippet := string(snippetBytes)
+		slog.Debug("Read snippet", "length", len(snippet))
 
-	case *filename != "": // File input (uses streaming and potentially AST/FIM).
-		initialSpinnerMsg := "Waiting for Ollama..."
-		if config.UseAst {
-			initialSpinnerMsg = "Analyzing context..."
+		// Use basic completion (no file context/analysis)
+		completion, err := completer.GetCompletion(ctx, snippet)
+		if err != nil {
+			slog.Error("Failed to get completion from stdin", "error", err)
+			os.Exit(1)
 		}
-		spinner.Start(initialSpinnerMsg)
+		fmt.Print(completion) // Print result directly to stdout
 
-		// Update spinner message after delay if analysis is enabled.
-		if config.UseAst {
-			go func() {
-				time.Sleep(750 * time.Millisecond)
-				// Spinner update is best-effort, might update after stop.
-				spinner.UpdateMessage("Waiting for Ollama...")
-			}()
+	} else {
+		// Get completion from file context
+		slog.Info("Getting completion from file", "path", *filePath, "line", *line, "col", *col)
+
+		// Use streaming completion, write result directly to stdout
+		err := completer.GetCompletionStreamFromFile(ctx, *filePath, *line, *col, os.Stdout)
+		if err != nil {
+			// Check if error is context cancellation or timeout
+			if errors.Is(err, context.DeadlineExceeded) {
+				slog.Error("Completion request timed out", "file", *filePath, "line", *line, "col", *col)
+			} else if errors.Is(err, context.Canceled) {
+				slog.Warn("Completion request cancelled", "file", *filePath, "line", *line, "col", *col)
+			} else {
+				// Log specific error types if needed (e.g., Ollama unavailable vs analysis error)
+				slog.Error("Failed to get completion stream from file", "error", err, "file", *filePath, "line", *line, "col", *col)
+			}
+			// Add a newline to stderr for errors to separate from potential stdout output
+			fmt.Fprintln(os.Stderr)
+			os.Exit(1)
 		}
-
-		// Call streaming completion, writing directly to os.Stdout.
-		completionErr = completer.GetCompletionStreamFromFile(ctx, *filename, *row, *col, os.Stdout)
-		spinner.Stop() // Stop spinner after streaming finishes or errors.
-		if completionErr != nil {
-			// Error message already includes color codes if coming from deepcomplete helpers.
-			log.Fatalf("Error getting completion from file: %v", completionErr)
-		}
-		// Output is already streamed, exit normally on success.
-		return
-
-	default:
-		// Should be unreachable due to validation above.
-		log.Fatalf("%sInternal Error: Invalid input combination.%s", deepcomplete.ColorRed, deepcomplete.ColorReset)
+		// Add a newline to stdout if completion was successful and didn't end with one
+		// (The stream might handle this, but ensures clean separation)
+		// Note: This might add an extra newline if the completion already ends with one.
+		// A more robust way would be to capture the output and check.
+		fmt.Println()
 	}
+
+	slog.Info("CLI command finished successfully.")
 }
 
-// isFlagPassed checks if a flag was explicitly set on the command line.
-func isFlagPassed(name string) bool {
-	found := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
+// Helper function to truncate strings for logging (if needed, maybe move to utils)
+func firstN(s string, n int) string {
+	if len(s) > n {
+		if n < 0 {
+			n = 0
 		}
-	})
-	return found
+		i := 0
+		for j := range s {
+			if i == n {
+				return s[:j] + "..."
+			}
+			i++
+		}
+		return s
+	}
+	return s
 }
