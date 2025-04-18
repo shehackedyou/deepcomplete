@@ -19,7 +19,7 @@ import (
 )
 
 // ============================================================================
-// Global Variables
+// Global Variables & Constants
 // ============================================================================
 
 var (
@@ -32,7 +32,123 @@ var (
 
 	// clientSupportsSnippets tracks if the connected client supports snippet format. (Set during initialize).
 	clientSupportsSnippets bool
+
+	// --- Event-Driven Architecture Components (Cycle 1, Step 1) ---
+
+	// eventQueue holds incoming LSP messages parsed into Event structs.
+	eventQueue chan Event
+	// responseQueue holds results/errors from processed requests waiting to be written.
+	responseQueue chan ResponseWorkItem
+
+	// Default buffer size for channels.
+	defaultQueueSize = 100
 )
+
+// JSON-RPC Standard Error Codes
+const (
+	ParseError     int = -32700
+	InvalidRequest int = -32600
+	MethodNotFound int = -32601
+	InvalidParams  int = -32602
+	InternalError  int = -32603
+	// Server specific codes
+	RequestFailed    int = -32000 // General request failure
+	RequestCancelled int = -32800 // LSP standard for cancelled request
+)
+
+// ============================================================================
+// Event Definitions (Cycle 1, Step 1)
+// ============================================================================
+
+// Event represents a parsed LSP message (request or notification).
+type Event interface {
+	GetType() string   // Returns the LSP method name.
+	GetRequestID() any // Returns the request ID (nil for notifications).
+}
+
+// BaseEvent provides common fields for events.
+type BaseEvent struct {
+	Type      string
+	RequestID any // nil for notifications
+}
+
+func (e BaseEvent) GetType() string {
+	return e.Type
+}
+func (e BaseEvent) GetRequestID() any {
+	return e.RequestID
+}
+
+// InitializeRequestEvent represents the 'initialize' request.
+type InitializeRequestEvent struct {
+	BaseEvent
+	Params InitializeParams
+}
+
+// ShutdownRequestEvent represents the 'shutdown' request.
+type ShutdownRequestEvent struct {
+	BaseEvent
+}
+
+// CompletionRequestEvent represents the 'textDocument/completion' request.
+type CompletionRequestEvent struct {
+	BaseEvent
+	Params CompletionParams
+}
+
+// DidOpenNotificationEvent represents the 'textDocument/didOpen' notification.
+type DidOpenNotificationEvent struct {
+	BaseEvent
+	Params DidOpenTextDocumentParams
+}
+
+// DidCloseNotificationEvent represents the 'textDocument/didClose' notification.
+type DidCloseNotificationEvent struct {
+	BaseEvent
+	Params DidCloseTextDocumentParams
+}
+
+// DidChangeNotificationEvent represents the 'textDocument/didChange' notification.
+type DidChangeNotificationEvent struct {
+	BaseEvent
+	Params DidChangeTextDocumentParams
+}
+
+// DidChangeConfigurationNotificationEvent represents the 'workspace/didChangeConfiguration' notification.
+type DidChangeConfigurationNotificationEvent struct {
+	BaseEvent
+	Params DidChangeConfigurationParams
+}
+
+// InitializedNotificationEvent represents the 'initialized' notification.
+type InitializedNotificationEvent struct {
+	BaseEvent
+}
+
+// ExitNotificationEvent represents the 'exit' notification.
+type ExitNotificationEvent struct {
+	BaseEvent
+}
+
+// CancelRequestEvent represents the '$/cancelRequest' notification.
+type CancelRequestEvent struct {
+	BaseEvent
+	Params CancelParams
+}
+
+// UnknownEvent represents an unhandled or unparseable message.
+type UnknownEvent struct {
+	BaseEvent
+	RawMessage json.RawMessage
+	ParseError error
+}
+
+// ResponseWorkItem holds the result or error for a completed request, ready to be sent.
+type ResponseWorkItem struct {
+	RequestID any          // Original request ID.
+	Result    any          `json:"result,omitempty"`
+	Error     *ErrorObject `json:"error,omitempty"`
+}
 
 // ============================================================================
 // JSON-RPC Structures
@@ -40,15 +156,15 @@ var (
 
 type RequestMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      interface{}     `json:"id,omitempty"`
+	ID      any             `json:"id,omitempty"` // Use 'any' for flexibility (number or string)
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
 type ResponseMessage struct {
 	JSONRPC string       `json:"jsonrpc"`
-	ID      interface{}  `json:"id,omitempty"`
-	Result  interface{}  `json:"result,omitempty"`
+	ID      any          `json:"id,omitempty"`
+	Result  any          `json:"result,omitempty"`
 	Error   *ErrorObject `json:"error,omitempty"`
 }
 
@@ -59,21 +175,10 @@ type NotificationMessage struct {
 }
 
 type ErrorObject struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
-
-// JSON-RPC Standard Error Codes
-const (
-	ParseError     int = -32700
-	InvalidRequest int = -32600
-	MethodNotFound int = -32601
-	InvalidParams  int = -32602
-	InternalError  int = -32603
-	// Server specific codes
-	RequestFailed int = -32000 // General request failure
-)
 
 // ============================================================================
 // LSP Specific Structures (Simplified Local Definitions)
@@ -255,6 +360,11 @@ const (
 	SnippetFormat   InsertTextFormat = 2 // Supports placeholders like $1, $0.
 )
 
+// CancelParams defines the parameters for the '$/cancelRequest' notification.
+type CancelParams struct {
+	ID any `json:"id"` // ID of the request to cancel.
+}
+
 // ============================================================================
 // Main Server Logic
 // ============================================================================
@@ -285,6 +395,14 @@ func main() {
 	}()
 	log.Println("DeepCompleter service initialized.")
 
+	// --- Initialize Event Queues (Cycle 1, Step 1) ---
+	eventQueue = make(chan Event, defaultQueueSize)
+	responseQueue = make(chan ResponseWorkItem, defaultQueueSize)
+	log.Printf("Initialized event and response queues (size: %d)", defaultQueueSize)
+
+	// TODO (Cycle 1): Start Reader, Dispatcher, Writer goroutines here.
+
+	// --- Current Synchronous Message Processing Loop (To be replaced in Cycle 1) ---
 	reader := bufio.NewReader(os.Stdin)
 	writer := os.Stdout
 
@@ -304,29 +422,44 @@ func main() {
 			if err != nil {
 				if err == io.EOF {
 					log.Println("Client closed connection (EOF). Exiting.")
+					// TODO (Cycle 1): Need graceful shutdown mechanism for goroutines.
 					os.Exit(0)
 				}
 				log.Printf("Error reading message: %v", err)
-				return // Continue loop after read error.
+				// In event-driven model, reader should continue trying to read.
+				// Error handling might involve sending an error response if possible.
+				return // Continue loop after read error (for now).
 			}
 			log.Printf("Received message: %s", string(content))
 
-			var baseMessage RequestMessage
+			var baseMessage RequestMessage // Using RequestMessage to easily get ID/Method first
 			if err := json.Unmarshal(content, &baseMessage); err != nil {
 				log.Printf("Error decoding base JSON message: %v", err)
-				return // Cannot send error response without ID.
+				// Cannot send error response without ID.
+				// TODO (Cycle 1): Decide how to handle parse errors in event model.
+				return
 			}
 
-			ctx := context.Background()
+			// TODO (Cycle 1): Instead of handling here, parse into specific Event struct
+			//                and send to eventQueue.
+			// Example (Conceptual):
+			// event := parseMessageToEvent(content, baseMessage)
+			// eventQueue <- event
+
+			// --- Existing Synchronous Handling (To be removed/refactored) ---
+			ctx := context.Background() // Context needs better management in event model
 			if baseMessage.ID != nil {
-				handleRequest(ctx, baseMessage, writer)
+				handleRequest(ctx, baseMessage, writer) // Will be handled by workers
 			} else {
-				handleNotification(ctx, baseMessage)
+				handleNotification(ctx, baseMessage) // Will be handled by dispatcher/quick workers
 			}
+			// --- End Existing Synchronous Handling ---
+
 		}() // End of deferred recovery function call
 
 		if panicErr != nil {
 			log.Println("Continuing after recovered panic.")
+			// TODO (Cycle 1): Consider how panics in workers/dispatcher are handled.
 		}
 	}
 }
@@ -366,14 +499,20 @@ func readMessage(reader *bufio.Reader) ([]byte, error) {
 }
 
 // writeMessage encodes a message to JSON and writes it to the writer with headers.
+// TODO (Cycle 1): This will be used by the Response Writer goroutine.
 func writeMessage(writer io.Writer, message interface{}) error {
 	content, err := json.Marshal(message)
 	if err != nil {
-		log.Printf("CRITICAL: Error marshalling message: %v (Message: %+v)", err, message)
-		return fmt.Errorf("error marshalling message: %w", err)
+		// Log critical error as this prevents sending a response/error back.
+		log.Printf("CRITICAL: Error marshalling message: %v (Message Type: %T)", err, message)
+		// Don't return error here, as the writer goroutine should continue trying to write other messages.
+		// Consider alternative error reporting if marshalling fails consistently.
+		return fmt.Errorf("error marshalling message: %w", err) // Or maybe just log and continue?
 	}
 	log.Printf("Sending message: %s", string(content))
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(content))
+	// Use a mutex if writer is shared (os.Stdout is generally safe for concurrent writes, but explicit locking is safer)
+	// For now, assume a single writer goroutine owns stdout.
 	if _, err := writer.Write([]byte(header)); err != nil {
 		log.Printf("Error writing message header: %v", err)
 		return fmt.Errorf("error writing header: %w", err)
@@ -385,7 +524,12 @@ func writeMessage(writer io.Writer, message interface{}) error {
 	return nil
 }
 
+// ----------------------------------------------------------------------------
+// --- Synchronous Handlers (To be refactored/moved into event handlers/workers in Cycle 1) ---
+// ----------------------------------------------------------------------------
+
 // handleRequest processes incoming requests and sends responses.
+// TODO (Cycle 1): This logic will move into worker goroutines.
 func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 	response := ResponseMessage{JSONRPC: "2.0", ID: req.ID}
 
@@ -423,6 +567,7 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 	case "shutdown":
 		log.Println("Handling 'shutdown' request...")
 		response.Result = nil // Success.
+		// TODO (Cycle 1): Initiate graceful shutdown of goroutines.
 
 	case "textDocument/completion":
 		log.Println("Handling 'textDocument/completion' request...")
@@ -444,6 +589,7 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 			break
 		}
 
+		// TODO (Cycle 1): This conversion and the completer call below should happen in a worker goroutine.
 		line, col, _, err := deepcomplete.LspPositionToBytePosition(contentBytes, params.Position)
 		if err != nil {
 			log.Printf("Error converting LSP position for %s: %v", params.TextDocument.URI, err)
@@ -453,6 +599,7 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 
 		// Call core completer.
 		var completionBuf bytes.Buffer
+		// Context needs to be managed per-request, potentially cancellable.
 		completionCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
 		err = completer.GetCompletionStreamFromFile(completionCtx, string(params.TextDocument.URI), line, col, &completionBuf)
@@ -507,20 +654,24 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 		response.Error = &ErrorObject{Code: MethodNotFound, Message: fmt.Sprintf("Method not found: %s", req.Method)}
 	}
 
+	// TODO (Cycle 1): This write needs to happen via the responseQueue and Writer goroutine.
 	if err := writeMessage(writer, response); err != nil {
 		log.Printf("Error sending response for ID %v: %v", req.ID, err)
 	}
 }
 
 // handleNotification processes incoming notifications.
+// TODO (Cycle 1): This logic will move into the dispatcher or quick worker goroutines.
 func handleNotification(ctx context.Context, notif NotificationMessage) {
 	switch notif.Method {
 	case "initialized":
 		log.Println("Received 'initialized' notification from client.")
+		// No action needed, just log.
 
 	case "exit":
 		log.Println("Handling 'exit' notification. Server exiting.")
-		os.Exit(0) // Assume clean exit.
+		// TODO (Cycle 1): Initiate graceful shutdown of all goroutines.
+		os.Exit(0) // Assume clean exit for now.
 
 	case "textDocument/didOpen":
 		log.Println("Handling 'textDocument/didOpen' notification...")
@@ -529,10 +680,12 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 			log.Printf("Error decoding didOpen params: %v", err)
 			return
 		}
+		// This state update needs to be thread-safe.
 		docStoreMutex.Lock()
 		documentStore[params.TextDocument.URI] = []byte(params.TextDocument.Text)
 		docStoreMutex.Unlock()
 		log.Printf("Opened and stored document: %s (Version: %d, Language: %s, Length: %d)", params.TextDocument.URI, params.TextDocument.Version, params.TextDocument.LanguageID, len(params.TextDocument.Text))
+		// TODO (Optional): Trigger background analysis?
 
 	case "textDocument/didClose":
 		log.Println("Handling 'textDocument/didClose' notification...")
@@ -541,10 +694,12 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 			log.Printf("Error decoding didClose params: %v", err)
 			return
 		}
+		// This state update needs to be thread-safe.
 		docStoreMutex.Lock()
 		delete(documentStore, params.TextDocument.URI)
 		docStoreMutex.Unlock()
 		log.Printf("Closed and removed document: %s", params.TextDocument.URI)
+		// TODO: Cancel any ongoing analysis/completion for this document?
 
 	case "textDocument/didChange":
 		log.Println("Handling 'textDocument/didChange' notification...")
@@ -561,10 +716,12 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 			}
 		}
 		newText := params.ContentChanges[0].Text
+		// This state update needs to be thread-safe.
 		docStoreMutex.Lock()
 		documentStore[params.TextDocument.URI] = []byte(newText)
 		docStoreMutex.Unlock()
 		log.Printf("Updated document via didChange (full sync): %s (Version: %d, New Length: %d)", params.TextDocument.URI, params.TextDocument.Version, len(newText))
+		// TODO (Optional): Trigger background analysis? Invalidate cache?
 
 	case "workspace/didChangeConfiguration":
 		log.Println("Handling 'workspace/didChangeConfiguration' notification...")
@@ -575,8 +732,7 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 		}
 		log.Printf("Received configuration change notification. Raw settings: %s", string(params.Settings))
 
-		// Attempt to parse settings into FileConfig structure.
-		// Assumes settings directly match FileConfig. Needs refinement for nested settings.
+		// TODO (Cycle 4): Use gjson for selective parsing here.
 		var fileCfg deepcomplete.FileConfig
 		if err := json.Unmarshal(params.Settings, &fileCfg); err != nil {
 			log.Printf("Warning: Could not unmarshal settings into FileConfig structure: %v. Config not updated.", err)
@@ -585,7 +741,12 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 
 		if completer != nil {
 			// Merge new settings with defaults (simple approach).
-			mergedConfig := deepcomplete.DefaultConfig
+			// This merging logic needs to be thread-safe if config can be read concurrently.
+			// completer.UpdateConfig handles locking internally.
+			mergedConfig := deepcomplete.DefaultConfig // Start with defaults
+			// Apply existing config from completer first (thread-safe read needed if not using UpdateConfig)
+			// currentCfg := completer.GetCurrentConfig() // Hypothetical thread-safe getter
+			// mergedConfig = currentCfg
 			if fileCfg.OllamaURL != nil {
 				mergedConfig.OllamaURL = *fileCfg.OllamaURL
 			}
@@ -614,7 +775,7 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 				mergedConfig.MaxSnippetLen = *fileCfg.MaxSnippetLen
 			}
 
-			// Update the completer's config.
+			// Update the completer's config (this handles locking).
 			if err := completer.UpdateConfig(mergedConfig); err != nil {
 				log.Printf("Error applying updated configuration: %v", err)
 			} else {
@@ -624,7 +785,20 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 			log.Println("Warning: Cannot apply configuration changes, completer not initialized.")
 		}
 
+	case "$/cancelRequest":
+		log.Println("Handling '$/cancelRequest' notification...")
+		var params CancelParams
+		if err := json.Unmarshal(notif.Params, &params); err != nil {
+			log.Printf("Error decoding cancelRequest params: %v", err)
+			return
+		}
+		log.Printf("Received cancellation request for ID: %v", params.ID)
+		// TODO (Cycle 1): Implement cancellation logic using contexts associated with request IDs.
+
 	default:
 		// Ignore other notifications.
+		log.Printf("Ignoring unhandled notification method: %s", notif.Method)
 	}
 }
+
+// ----------------------------------------------------------------------------

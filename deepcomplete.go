@@ -658,7 +658,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			decoder := gob.NewDecoder(bytes.NewReader(valBytes))
 			if err := decoder.Decode(&decoded); err != nil {
 				log.Printf("Warning: Failed to gob-decode cached entry header for key %s: %v. Treating as miss.", string(cacheKey), err)
-				// Phase 1 Fix: Correct call to deleteCacheEntryByKey
 				deleteErr := deleteCacheEntryByKey(a.db, cacheKey)
 				if deleteErr != nil {
 					log.Printf("Warning: Failed to delete invalid cache entry %s: %v", string(cacheKey), deleteErr)
@@ -667,7 +666,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			}
 			if decoded.SchemaVersion != cacheSchemaVersion {
 				log.Printf("Warning: Cache data for key %s has old schema version %d (want %d). Ignoring.", string(cacheKey), decoded.SchemaVersion, cacheSchemaVersion)
-				// Phase 1 Fix: Correct call to deleteCacheEntryByKey
 				deleteErr := deleteCacheEntryByKey(a.db, cacheKey)
 				if deleteErr != nil {
 					log.Printf("Warning: Failed to delete invalid cache entry %s: %v", string(cacheKey), deleteErr)
@@ -691,7 +689,8 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 	if cachedEntry != nil {
 		validationStart := time.Now()
 		log.Printf("DEBUG: Potential cache hit for key: %s. Validating file hashes...", string(cacheKey))
-		currentHashes, hashErr := calculateInputHashes(dir, nil) // Pass nil pkg here.
+		// Phase 2, Step 4: Pass nil for pkg during validation hash calculation
+		currentHashes, hashErr := calculateInputHashes(dir, nil)
 		if hashErr == nil && cachedEntry.GoModHash == goModHash && compareFileHashes(currentHashes, cachedEntry.InputFileHashes) {
 			log.Printf("DEBUG: Cache VALID for key: %s. Attempting to decode analysis data...", string(cacheKey))
 			decodeStart := time.Now()
@@ -707,7 +706,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			} else {
 				log.Printf("Warning: Failed to gob-decode cached analysis data: %v. Treating as miss.", decodeErr)
 				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr))
-				// Phase 1 Fix: Correct call to deleteCacheEntryByKey
 				deleteErr := deleteCacheEntryByKey(a.db, cacheKey)
 				if deleteErr != nil {
 					log.Printf("Warning: Failed to delete invalid cache entry %s: %v", string(cacheKey), deleteErr)
@@ -715,7 +713,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			}
 		} else {
 			log.Printf("DEBUG: Cache INVALID for key: %s (HashErr: %v). Treating as miss.", string(cacheKey), hashErr)
-			// Phase 1 Fix: Correct call to deleteCacheEntryByKey
 			deleteErr := deleteCacheEntryByKey(a.db, cacheKey)
 			if deleteErr != nil {
 				log.Printf("Warning: Failed to delete invalid cache entry %s: %v", string(cacheKey), deleteErr)
@@ -737,7 +734,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 
 		loadStart := time.Now()
 		fset := token.NewFileSet()
-		// Phase 1 Fix: Call defined loadPackageInfo function
 		targetPkg, targetFileAST, targetFile, loadErrors := loadPackageInfo(ctx, absFilename, fset)
 		loadDuration = time.Since(loadStart)
 		log.Printf("DEBUG: packages.Load completed in %v", loadDuration)
@@ -784,7 +780,8 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 		if a.db != nil && info.PromptPreamble != "" && len(loadErrors) == 0 {
 			log.Printf("DEBUG: Attempting to save analysis results to bbolt cache. Key: %s", string(cacheKey))
 			saveStart := time.Now()
-			inputHashes, hashErr := calculateInputHashes(dir, targetPkg) // Use loaded pkg info.
+			// Phase 2, Step 4: Pass loaded targetPkg to calculateInputHashes for saving.
+			inputHashes, hashErr := calculateInputHashes(dir, targetPkg)
 			if hashErr == nil {
 				analysisDataToCache := CachedAnalysisData{PackageName: info.PackageName, PromptPreamble: info.PromptPreamble}
 				var gobBuf bytes.Buffer
@@ -849,7 +846,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 
 // InvalidateCache removes the cached entry for a given directory.
 func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
-	// Phase 1 Fix: Correct call to deleteCacheEntryByKey
+	// Phase 2, Step 5: No changes needed here, already correct from Phase 1.
 	a.mu.Lock()
 	db := a.db
 	a.mu.Unlock()
@@ -862,7 +859,6 @@ func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	return deleteCacheEntryByKey(db, cacheKey)
 }
 
-// Phase 1 Fix: Define loadPackageInfo function
 // loadPackageInfo encapsulates the logic for loading package information.
 func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSet) (*packages.Package, *ast.File, *token.File, []error) {
 	var loadErrors []error
@@ -1212,7 +1208,6 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filena
 		log.Println("Completion stream finished successfully for this attempt.")
 		return nil
 	}
-	// Phase 1 Fix: Use defined constants for retry
 	err = retry(ctx, apiCallFunc, maxRetries, retryDelay) // Use helper from utils.go
 	if err != nil {
 		var oe *OllamaError

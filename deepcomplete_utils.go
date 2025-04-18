@@ -1,3 +1,4 @@
+// deepcomplete_utils.go
 package deepcomplete
 
 import (
@@ -179,6 +180,7 @@ func calculateGoModHash(dir string) string {
 
 // calculateInputHashes calculates hashes for go.mod, go.sum, and Go files.
 // Uses pkg.CompiledGoFiles if available, otherwise scans the directory (non-recursive).
+// Phase 2, Step 4: Added pkg argument.
 func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string, error) {
 	hashes := make(map[string]string)
 	filesToHash := make(map[string]struct{})
@@ -197,17 +199,14 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		}
 	}
 
-	// Use compiled files from package info if available.
+	// Phase 2, Step 4: Use compiled files from package info if available.
 	filesFromPkg := false
 	if pkg != nil && len(pkg.CompiledGoFiles) > 0 {
 		filesFromPkg = true
 		log.Printf("DEBUG: Hashing based on %d CompiledGoFiles from package %s", len(pkg.CompiledGoFiles), pkg.PkgPath)
 		for _, fpath := range pkg.CompiledGoFiles {
-			if absPath, err := filepath.Abs(fpath); err == nil {
-				filesToHash[absPath] = struct{}{}
-			} else {
-				log.Printf("Warning: Could not get absolute path for compiled file %s: %v", fpath, err)
-			}
+			// CompiledGoFiles should already be absolute paths.
+			filesToHash[fpath] = struct{}{}
 		}
 	}
 
@@ -221,11 +220,8 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		for _, entry := range entries {
 			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") {
 				absPath := filepath.Join(dir, entry.Name())
-				if absPath, absErr := filepath.Abs(absPath); absErr == nil {
-					filesToHash[absPath] = struct{}{}
-				} else {
-					log.Printf("Warning: Could not get absolute path for %s: %v", entry.Name(), absErr)
-				}
+				// No need for Abs here, Join already makes it absolute if dir is.
+				filesToHash[absPath] = struct{}{}
 			}
 		}
 	}
