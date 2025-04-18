@@ -29,6 +29,9 @@ var (
 	// documentStore holds the content of open documents, keyed by URI.
 	documentStore = make(map[DocumentURI][]byte)
 	docStoreMutex sync.RWMutex // Protects concurrent access to documentStore.
+
+	// clientSupportsSnippets tracks if the connected client supports snippet format. (Set during initialize).
+	clientSupportsSnippets bool
 )
 
 // ============================================================================
@@ -162,8 +165,8 @@ const (
 )
 
 type CompletionOptions struct {
-	// TriggerCharacters []string `json:"triggerCharacters,omitempty"` // Future: Characters to trigger completion.
-	// ResolveProvider bool `json:"resolveProvider,omitempty"` // Future: Support completionItem/resolve.
+	// TriggerCharacters []string `json:"triggerCharacters,omitempty"`
+	// ResolveProvider bool `json:"resolveProvider,omitempty"`
 }
 
 type ServerInfo struct {
@@ -192,8 +195,6 @@ type VersionedTextDocumentIdentifier struct {
 // TextDocumentContentChangeEvent represents a change to a text document.
 // For full sync, this contains the entire new text content.
 type TextDocumentContentChangeEvent struct {
-	// Range *Range `json:"range,omitempty"` // Omitted for full sync.
-	// RangeLength uint32 `json:"rangeLength,omitempty"` // Omitted for full sync.
 	Text string `json:"text"` // The new full content for full sync.
 }
 
@@ -308,20 +309,15 @@ func main() {
 				log.Printf("Error reading message: %v", err)
 				return // Continue loop after read error.
 			}
-
 			log.Printf("Received message: %s", string(content))
 
-			// Decode base message to distinguish request vs notification.
 			var baseMessage RequestMessage
 			if err := json.Unmarshal(content, &baseMessage); err != nil {
 				log.Printf("Error decoding base JSON message: %v", err)
-				// Cannot send error response without ID.
-				return // Continue loop.
+				return // Cannot send error response without ID.
 			}
 
 			ctx := context.Background()
-
-			// Dispatch based on presence of ID.
 			if baseMessage.ID != nil {
 				handleRequest(ctx, baseMessage, writer)
 			} else {
@@ -331,7 +327,6 @@ func main() {
 
 		if panicErr != nil {
 			log.Println("Continuing after recovered panic.")
-			// Potentially send an error notification to the client?
 		}
 	}
 }
@@ -339,17 +334,15 @@ func main() {
 // readMessage reads a single JSON-RPC message based on Content-Length header.
 func readMessage(reader *bufio.Reader) ([]byte, error) {
 	var contentLength int = -1
-	// Read headers until an empty line is encountered.
-	for {
+	for { // Read headers.
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, fmt.Errorf("failed reading header line: %w", err)
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
-			break // End of headers.
-		}
-		// Parse Content-Length.
+			break
+		} // End of headers.
 		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
 			_, err := fmt.Sscanf(line, "Content-Length: %d", &contentLength)
 			if err != nil {
@@ -357,21 +350,18 @@ func readMessage(reader *bufio.Reader) ([]byte, error) {
 			}
 		}
 	}
-
 	if contentLength < 0 {
 		return nil, fmt.Errorf("missing or invalid Content-Length header")
 	}
 	if contentLength == 0 {
-		return []byte{}, nil // Valid empty message.
-	}
+		return []byte{}, nil
+	} // Valid empty message.
 
-	// Read the specified number of bytes for the message body.
 	body := make([]byte, contentLength)
-	n, err := io.ReadFull(reader, body)
+	n, err := io.ReadFull(reader, body) // Read exact body length.
 	if err != nil {
 		return nil, fmt.Errorf("failed reading body (read %d/%d bytes): %w", n, contentLength, err)
 	}
-
 	return body, nil
 }
 
@@ -382,17 +372,13 @@ func writeMessage(writer io.Writer, message interface{}) error {
 		log.Printf("CRITICAL: Error marshalling message: %v (Message: %+v)", err, message)
 		return fmt.Errorf("error marshalling message: %w", err)
 	}
-
 	log.Printf("Sending message: %s", string(content))
-
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(content))
-	_, err = writer.Write([]byte(header))
-	if err != nil {
+	if _, err := writer.Write([]byte(header)); err != nil {
 		log.Printf("Error writing message header: %v", err)
 		return fmt.Errorf("error writing header: %w", err)
 	}
-	_, err = writer.Write(content)
-	if err != nil {
+	if _, err := writer.Write(content); err != nil {
 		log.Printf("Error writing message content: %v", err)
 		return fmt.Errorf("error writing content: %w", err)
 	}
@@ -401,10 +387,7 @@ func writeMessage(writer io.Writer, message interface{}) error {
 
 // handleRequest processes incoming requests and sends responses.
 func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
-	response := ResponseMessage{
-		JSONRPC: "2.0",
-		ID:      req.ID,
-	}
+	response := ResponseMessage{JSONRPC: "2.0", ID: req.ID}
 
 	switch req.Method {
 	case "initialize":
@@ -416,26 +399,30 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 			if params.ClientInfo != nil {
 				log.Printf("Client Info: Name=%s, Version=%s", params.ClientInfo.Name, params.ClientInfo.Version)
 			}
+			// Check client capabilities (Cycle 10).
+			clientSupportsSnippets = false // Default
+			if params.Capabilities.TextDocument != nil &&
+				params.Capabilities.TextDocument.Completion != nil &&
+				params.Capabilities.TextDocument.Completion.CompletionItem != nil &&
+				params.Capabilities.TextDocument.Completion.CompletionItem.SnippetSupport {
+				clientSupportsSnippets = true
+				log.Println("Client supports snippets.")
+			} else {
+				log.Println("Client does not support snippets.")
+			}
 			// Advertise server capabilities.
 			response.Result = InitializeResult{
 				Capabilities: ServerCapabilities{
-					TextDocumentSync: &TextDocumentSyncOptions{
-						OpenClose: true,
-						Change:    TextDocumentSyncKindFull, // Supports full document sync on change.
-					},
-					CompletionProvider: &CompletionOptions{}, // Supports completion requests.
+					TextDocumentSync:   &TextDocumentSyncOptions{OpenClose: true, Change: TextDocumentSyncKindFull},
+					CompletionProvider: &CompletionOptions{},
 				},
-				ServerInfo: &ServerInfo{
-					Name:    "DeepComplete LSP",
-					Version: "0.0.1", // TODO: Link to actual version.
-				},
+				ServerInfo: &ServerInfo{Name: "DeepComplete LSP", Version: "0.0.1" /* TODO: Version */},
 			}
 		}
 
 	case "shutdown":
 		log.Println("Handling 'shutdown' request...")
-		// Cleanup resources if necessary before exiting.
-		response.Result = nil // Success is null result.
+		response.Result = nil // Success.
 
 	case "textDocument/completion":
 		log.Println("Handling 'textDocument/completion' request...")
@@ -444,12 +431,10 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 			response.Error = &ErrorObject{Code: InvalidParams, Message: fmt.Sprintf("Invalid params for completion: %v", err)}
 			break
 		}
-
 		if params.Context != nil {
 			log.Printf("Completion Context: TriggerKind=%d, TriggerChar=%q", params.Context.TriggerKind, params.Context.TriggerCharacter)
 		}
 
-		// Get document content from the store.
 		docStoreMutex.RLock()
 		contentBytes, ok := documentStore[params.TextDocument.URI]
 		docStoreMutex.RUnlock()
@@ -459,7 +444,6 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 			break
 		}
 
-		// Convert LSP position to Go line/column.
 		line, col, _, err := deepcomplete.LspPositionToBytePosition(contentBytes, params.Position)
 		if err != nil {
 			log.Printf("Error converting LSP position for %s: %v", params.TextDocument.URI, err)
@@ -467,28 +451,24 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 			break
 		}
 
-		// Call the core completion logic.
+		// Call core completer.
 		var completionBuf bytes.Buffer
-		completionCtx, cancel := context.WithTimeout(ctx, 60*time.Second) // Timeout for completion.
+		completionCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
-		// The core function now handles logging non-fatal analysis errors internally.
 		err = completer.GetCompletionStreamFromFile(completionCtx, string(params.TextDocument.URI), line, col, &completionBuf)
-
 		if err != nil {
-			// If the core function returns an error, it's likely fatal (Ollama unavailable, etc.)
 			log.Printf("Error getting completion from core for %s (%d:%d): %v", params.TextDocument.URI, line, col, err)
 			response.Error = &ErrorObject{Code: RequestFailed, Message: fmt.Sprintf("Completion failed: %v", err)}
 			break
 		}
 
-		// Format the completion result into an LSP CompletionItem.
 		completionText := completionBuf.String()
 		if completionText == "" {
 			response.Result = CompletionList{IsIncomplete: false, Items: []CompletionItem{}}
 			break
 		}
 
-		// Create label (first line, truncated).
+		// Format completion item.
 		label := strings.TrimSpace(completionText)
 		if firstNewline := strings.Index(label, "\n"); firstNewline != -1 {
 			label = label[:firstNewline]
@@ -496,38 +476,37 @@ func handleRequest(ctx context.Context, req RequestMessage, writer io.Writer) {
 		if len(label) > 50 {
 			label = label[:50] + "..."
 		}
-
-		// Basic heuristic for completion kind.
 		kind := CompletionItemKindText
 		trimmedCompletion := strings.TrimSpace(completionText)
-		// Simple checks for common Go constructs.
 		if strings.HasPrefix(trimmedCompletion, "func ") {
 			kind = CompletionItemKindFunction
 		} else if strings.HasPrefix(trimmedCompletion, "var ") || strings.HasPrefix(trimmedCompletion, "const ") {
 			kind = CompletionItemKindVariable
 		} else if strings.HasPrefix(trimmedCompletion, "type ") {
-			kind = CompletionItemKindKeyword // Could refine to Struct/Interface later.
-		} // Add more keyword checks if needed.
+			kind = CompletionItemKindKeyword
+		}
 
-		completionItem := CompletionItem{
-			Label:            label,
-			Kind:             kind,
-			Detail:           "DeepComplete Suggestion",
-			Documentation:    "Generated by DeepComplete", // Placeholder documentation.
-			InsertTextFormat: SnippetFormat,               // Use snippet format.
-			InsertText:       completionText + "$0",       // Insert completion text + final cursor stop.
+		item := CompletionItem{
+			Label:         label,
+			Kind:          kind,
+			Detail:        "DeepComplete Suggestion",
+			Documentation: "Generated by DeepComplete",
 		}
-		response.Result = CompletionList{
-			IsIncomplete: false, // Assume complete results for now.
-			Items:        []CompletionItem{completionItem},
+		// Set insert text based on client snippet support (Cycle 10).
+		if clientSupportsSnippets {
+			item.InsertTextFormat = SnippetFormat
+			item.InsertText = completionText + "$0" // Add final cursor stop.
+		} else {
+			item.InsertTextFormat = PlainTextFormat
+			item.InsertText = completionText
 		}
+		response.Result = CompletionList{IsIncomplete: false, Items: []CompletionItem{item}}
 
 	default:
 		log.Printf("Received unhandled request method: %s", req.Method)
 		response.Error = &ErrorObject{Code: MethodNotFound, Message: fmt.Sprintf("Method not found: %s", req.Method)}
 	}
 
-	// Send the response back to the client.
 	if err := writeMessage(writer, response); err != nil {
 		log.Printf("Error sending response for ID %v: %v", req.ID, err)
 	}
@@ -538,12 +517,10 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 	switch notif.Method {
 	case "initialized":
 		log.Println("Received 'initialized' notification from client.")
-		// Can perform actions after client confirms initialization here.
 
 	case "exit":
 		log.Println("Handling 'exit' notification. Server exiting.")
-		// Per LSP spec, exit immediately. Assume shutdown was received.
-		os.Exit(0)
+		os.Exit(0) // Assume clean exit.
 
 	case "textDocument/didOpen":
 		log.Println("Handling 'textDocument/didOpen' notification...")
@@ -555,8 +532,7 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 		docStoreMutex.Lock()
 		documentStore[params.TextDocument.URI] = []byte(params.TextDocument.Text)
 		docStoreMutex.Unlock()
-		log.Printf("Opened and stored document: %s (Version: %d, Language: %s, Length: %d)",
-			params.TextDocument.URI, params.TextDocument.Version, params.TextDocument.LanguageID, len(params.TextDocument.Text))
+		log.Printf("Opened and stored document: %s (Version: %d, Language: %s, Length: %d)", params.TextDocument.URI, params.TextDocument.Version, params.TextDocument.LanguageID, len(params.TextDocument.Text))
 
 	case "textDocument/didClose":
 		log.Println("Handling 'textDocument/didClose' notification...")
@@ -566,7 +542,7 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 			return
 		}
 		docStoreMutex.Lock()
-		delete(documentStore, params.TextDocument.URI) // Remove document from store.
+		delete(documentStore, params.TextDocument.URI)
 		docStoreMutex.Unlock()
 		log.Printf("Closed and removed document: %s", params.TextDocument.URI)
 
@@ -577,19 +553,18 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 			log.Printf("Error decoding didChange params: %v", err)
 			return
 		}
-		// Currently only supports full document sync.
+		// Assuming full sync.
 		if len(params.ContentChanges) != 1 {
 			log.Printf("Warning: Expected exactly one content change for full sync, got %d for %s. Using first change.", len(params.ContentChanges), params.TextDocument.URI)
 			if len(params.ContentChanges) == 0 {
-				return // Ignore if no changes provided.
+				return
 			}
 		}
 		newText := params.ContentChanges[0].Text
 		docStoreMutex.Lock()
-		documentStore[params.TextDocument.URI] = []byte(newText) // Replace content.
+		documentStore[params.TextDocument.URI] = []byte(newText)
 		docStoreMutex.Unlock()
-		log.Printf("Updated document via didChange (full sync): %s (Version: %d, New Length: %d)",
-			params.TextDocument.URI, params.TextDocument.Version, len(newText))
+		log.Printf("Updated document via didChange (full sync): %s (Version: %d, New Length: %d)", params.TextDocument.URI, params.TextDocument.Version, len(newText))
 
 	case "workspace/didChangeConfiguration":
 		log.Println("Handling 'workspace/didChangeConfiguration' notification...")
@@ -600,9 +575,8 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 		}
 		log.Printf("Received configuration change notification. Raw settings: %s", string(params.Settings))
 
-		// Attempt to parse settings into the FileConfig structure.
-		// Assumes settings are directly in the expected format. Needs refinement
-		// if settings are nested (e.g., under a "deepcomplete" key).
+		// Attempt to parse settings into FileConfig structure.
+		// Assumes settings directly match FileConfig. Needs refinement for nested settings.
 		var fileCfg deepcomplete.FileConfig
 		if err := json.Unmarshal(params.Settings, &fileCfg); err != nil {
 			log.Printf("Warning: Could not unmarshal settings into FileConfig structure: %v. Config not updated.", err)
@@ -610,12 +584,8 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 		}
 
 		if completer != nil {
-			// Create a new config based on defaults and merge the partial FileConfig.
-			// This approach is simple but doesn't preserve previous non-default settings
-			// that weren't included in the notification. A better approach would be
-			// to get the *current* config from the completer and merge into that.
-			mergedConfig := deepcomplete.DefaultConfig // Base for merging.
-			// Apply partial settings from fileCfg...
+			// Merge new settings with defaults (simple approach).
+			mergedConfig := deepcomplete.DefaultConfig
 			if fileCfg.OllamaURL != nil {
 				mergedConfig.OllamaURL = *fileCfg.OllamaURL
 			}
@@ -644,7 +614,7 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 				mergedConfig.MaxSnippetLen = *fileCfg.MaxSnippetLen
 			}
 
-			// Update the completer's config atomically.
+			// Update the completer's config.
 			if err := completer.UpdateConfig(mergedConfig); err != nil {
 				log.Printf("Error applying updated configuration: %v", err)
 			} else {
@@ -656,6 +626,5 @@ func handleNotification(ctx context.Context, notif NotificationMessage) {
 
 	default:
 		// Ignore other notifications.
-		// log.Printf("Received unhandled notification method: %s", notif.Method)
 	}
 }
