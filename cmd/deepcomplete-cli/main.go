@@ -19,25 +19,47 @@ func main() {
 	logLevel := slog.LevelInfo                                            // Default level for CLI, could be flag-controlled
 	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false} // Source location less useful for CLI
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &handlerOpts))
-	slog.SetDefault(logger)
+	slog.SetDefault(logger) // Set as default for convenience
 
 	// --- Flag Definitions ---
-	filePath := flag.String("file", "", "Path to the Go file")
-	line := flag.Int("line", 0, "Line number (1-based)")
-	col := flag.Int("col", 0, "Column number (1-based)")
-	stdin := flag.Bool("stdin", false, "Read code snippet from stdin instead of file")
+	filePath := flag.String("file", "", "Path to the Go file (required unless -stdin is used)")
+	line := flag.Int("line", 0, "Line number (1-based, required unless -stdin is used)")
+	col := flag.Int("col", 0, "Column number (1-based, required unless -stdin is used)")
+	stdin := flag.Bool("stdin", false, "Read code snippet from stdin instead of file context")
 	// Add flags for other config options if needed, e.g.:
 	// model := flag.String("model", "", "Ollama model to use (overrides config)")
 	// ollamaURL := flag.String("url", "", "Ollama URL (overrides config)")
+	// TODO: Add flag to control log level? e.g., -debug
 
 	flag.Parse()
 
-	// --- Input Validation ---
-	if !*stdin && (*filePath == "" || *line <= 0 || *col <= 0) {
-		fmt.Fprintf(os.Stderr, "Usage: %s -file <path> -line <num> -col <num> [flags]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "   or: %s -stdin [flags] < <snippet>\n", os.Args[0])
-		flag.PrintDefaults()
-		os.Exit(1)
+	// --- Input Validation (Defensive Programming) ---
+	if *stdin {
+		if *filePath != "" || *line != 0 || *col != 0 {
+			slog.Error("Cannot use -file, -line, or -col flags when -stdin is specified.")
+			os.Exit(1)
+		}
+	} else {
+		if *filePath == "" {
+			slog.Error("Missing required flag: -file")
+			flag.Usage() // Print usage information
+			os.Exit(1)
+		}
+		if *line <= 0 {
+			slog.Error("Invalid value for -line: must be positive", "value", *line)
+			flag.Usage()
+			os.Exit(1)
+		}
+		if *col <= 0 {
+			slog.Error("Invalid value for -col: must be positive", "value", *col)
+			flag.Usage()
+			os.Exit(1)
+		}
+		// Check if file exists (optional, but good for CLI)
+		if _, err := os.Stat(*filePath); err != nil {
+			slog.Error("Cannot access file provided via -file flag", "path", *filePath, "error", err)
+			os.Exit(1)
+		}
 	}
 
 	// --- Initialize Completer ---
@@ -46,6 +68,8 @@ func main() {
 	if err != nil {
 		// Use slog for fatal errors
 		slog.Error("Failed to initialize DeepCompleter service", "error", err)
+		// If config error, maybe just warn and proceed with defaults if possible?
+		// For now, exit on any init error.
 		os.Exit(1)
 	}
 	defer func() {
@@ -54,10 +78,11 @@ func main() {
 			slog.Error("Error closing completer", "error", err)
 		}
 	}()
-	slog.Info("DeepCompleter service initialized.")
+	slog.Info("DeepComplete service initialized.")
 
 	// --- Execute Command ---
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second) // Add timeout
+	// Add a reasonable timeout for the CLI operation
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	if *stdin {
@@ -84,15 +109,24 @@ func main() {
 		slog.Info("Getting completion from file", "path", *filePath, "line", *line, "col", *col)
 
 		// Use streaming completion, write result directly to stdout
-		err := completer.GetCompletionStreamFromFile(ctx, *filePath, *line, *col, os.Stdout)
+		// NOTE: GetCompletionStreamFromFile now expects version, but CLI doesn't track it.
+		// Pass a dummy version (e.g., 0 or 1) or modify the core function signature
+		// if version is strictly needed even without LSP context (less likely).
+		// Let's assume version 0 is acceptable for CLI usage where versioning isn't relevant.
+		dummyVersion := 0
+		err := completer.GetCompletionStreamFromFile(ctx, *filePath, dummyVersion, *line, *col, os.Stdout)
 		if err != nil {
-			// Check if error is context cancellation or timeout
+			// Check for specific, potentially user-actionable errors
 			if errors.Is(err, context.DeadlineExceeded) {
 				slog.Error("Completion request timed out", "file", *filePath, "line", *line, "col", *col)
 			} else if errors.Is(err, context.Canceled) {
 				slog.Warn("Completion request cancelled", "file", *filePath, "line", *line, "col", *col)
+			} else if errors.Is(err, deepcomplete.ErrOllamaUnavailable) {
+				slog.Error("Completion backend (Ollama) unavailable", "error", err)
+			} else if errors.Is(err, deepcomplete.ErrAnalysisFailed) {
+				slog.Error("Code analysis failed (see logs for details)", "error", err)
 			} else {
-				// Log specific error types if needed (e.g., Ollama unavailable vs analysis error)
+				// Log other internal errors
 				slog.Error("Failed to get completion stream from file", "error", err, "file", *filePath, "line", *line, "col", *col)
 			}
 			// Add a newline to stderr for errors to separate from potential stdout output
@@ -107,22 +141,4 @@ func main() {
 	}
 
 	slog.Info("CLI command finished successfully.")
-}
-
-// Helper function to truncate strings for logging (if needed, maybe move to utils)
-func firstN(s string, n int) string {
-	if len(s) > n {
-		if n < 0 {
-			n = 0
-		}
-		i := 0
-		for j := range s {
-			if i == n {
-				return s[:j] + "..."
-			}
-			i++
-		}
-		return s
-	}
-	return s
 }

@@ -11,8 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-
-	// "go/format" // No longer needed directly in this file
 	"go/token"
 	"go/types"
 	"io"
@@ -23,14 +21,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-
-	// "sort" // No longer needed directly in this file
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/dgraph-io/ristretto" // Cycle 9: Added ristretto
 	"go.etcd.io/bbolt"
-	// "golang.org/x/tools/go/ast/astutil" // Moved to helpers
 	"golang.org/x/tools/go/packages"
 )
 
@@ -77,7 +73,7 @@ CODE TO FILL:
 	configDirName         = "deepcomplete" // Subdirectory name for config/data.
 	cacheSchemaVersion    = 2              // Used to invalidate cache if internal formats change.
 
-	// Phase 1 Fix: Define retry constants
+	// Retry constants
 	maxRetries = 3
 	retryDelay = 500 * time.Millisecond
 )
@@ -145,10 +141,15 @@ type FileConfig struct {
 }
 
 // AstContextInfo holds structured information extracted from code analysis.
+// Updated for Cycle 8/9/Hover.
 type AstContextInfo struct {
-	FilePath           string
+	FilePath           string // Absolute, validated path
+	Version            int    // Document version for memory cache keying
 	CursorPos          token.Pos
 	PackageName        string
+	TargetPackage      *packages.Package // Store loaded package for qualifier/scope
+	TargetFileSet      *token.FileSet    // Store FileSet for position info
+	TargetAstFile      *ast.File         // Store AST for comment lookup? (Or use CommentMap)
 	EnclosingFunc      *types.Func
 	EnclosingFuncNode  *ast.FuncDecl
 	ReceiverType       string
@@ -158,6 +159,7 @@ type AstContextInfo struct {
 	IdentifierAtCursor *ast.Ident
 	IdentifierType     types.Type
 	IdentifierObject   types.Object
+	IdentifierDefNode  ast.Node // Added for Hover: Store the defining AST node
 	SelectorExpr       *ast.SelectorExpr
 	SelectorExprType   types.Type
 	CallExpr           *ast.CallExpr
@@ -167,8 +169,10 @@ type AstContextInfo struct {
 	CompositeLit       *ast.CompositeLit
 	CompositeLitType   types.Type
 	VariablesInScope   map[string]types.Object
-	PromptPreamble     string
+	PromptPreamble     string // Final preamble generated (potentially cached)
 	AnalysisErrors     []error
+	// Potentially add CommentMap here if needed for hover doc lookup
+	// CommentMap         ast.CommentMap
 }
 
 // OllamaError defines a custom error for Ollama API issues.
@@ -191,10 +195,11 @@ type OllamaResponse struct {
 	Error    string `json:"error,omitempty"`
 }
 
-// CachedAnalysisData holds derived information stored in the cache (gob-encoded).
+// CachedAnalysisData holds derived information stored in the bbolt cache (gob-encoded).
 type CachedAnalysisData struct {
 	PackageName    string
 	PromptPreamble string
+	// Add other easily serializable, frequently reused data if needed
 }
 
 // CachedAnalysisEntry represents the full structure stored in bbolt.
@@ -202,7 +207,7 @@ type CachedAnalysisEntry struct {
 	SchemaVersion   int
 	GoModHash       string
 	InputFileHashes map[string]string // key: relative path (using '/')
-	AnalysisGob     []byte
+	AnalysisGob     []byte            // Gob-encoded CachedAnalysisData
 }
 
 // MemberKind defines the type of member (field or method).
@@ -226,10 +231,10 @@ type MemberInfo struct {
 // =============================================================================
 
 var (
-	ErrAnalysisFailed       = errors.New("code analysis failed")
+	ErrAnalysisFailed       = errors.New("code analysis failed") // Wraps non-fatal analysis issues
 	ErrOllamaUnavailable    = errors.New("ollama API unavailable")
 	ErrStreamProcessing     = errors.New("error processing LLM stream")
-	ErrConfig               = errors.New("configuration error")
+	ErrConfig               = errors.New("configuration error") // Wraps non-fatal config load issues
 	ErrInvalidConfig        = errors.New("invalid configuration")
 	ErrCache                = errors.New("cache operation failed")
 	ErrCacheRead            = errors.New("cache read failed")
@@ -241,6 +246,7 @@ var (
 	ErrInvalidPositionInput = errors.New("invalid input position")
 	ErrPositionOutOfRange   = errors.New("position out of range")
 	ErrInvalidUTF8          = errors.New("invalid utf-8 sequence")
+	ErrInvalidURI           = errors.New("invalid document URI") // Added for path validation
 )
 
 // =============================================================================
@@ -253,10 +259,22 @@ type LLMClient interface {
 }
 
 // Analyzer defines code context analysis.
+// Updated for Cycle 9 versioning and fixed DocumentURI usage.
 type Analyzer interface {
-	Analyze(ctx context.Context, filename string, line, col int) (*AstContextInfo, error)
+	// Analyze performs code analysis for a given file and position.
+	// filename should be an absolute, validated path.
+	// version is the document version from the client.
+	Analyze(ctx context.Context, filename string, version int, line, col int) (*AstContextInfo, error)
 	Close() error
+	// InvalidateCache invalidates the bbolt cache for a directory.
 	InvalidateCache(dir string) error
+	// InvalidateMemoryCacheForURI invalidates the ristretto cache for a URI.
+	// **FIX:** Changed DocumentURI to string to avoid cross-package dependency.
+	InvalidateMemoryCacheForURI(uri string, version int) error
+	// MemoryCacheEnabled checks if the ristretto cache is active.
+	MemoryCacheEnabled() bool
+	// GetMemoryCacheMetrics returns the ristretto cache metrics.
+	GetMemoryCacheMetrics() *ristretto.Metrics
 }
 
 // PromptFormatter defines prompt construction.
@@ -292,6 +310,8 @@ var (
 // LoadConfig loads configuration from standard locations, merges with defaults,
 // and attempts to write a default config if none exists or is invalid.
 func LoadConfig() (Config, error) {
+	// Ensure default slog logger is set for potential warnings here
+	// (Assuming it's set in main or tests)
 	cfg := DefaultConfig
 	var loadedFromFile bool
 	var loadErrors []error
@@ -303,6 +323,7 @@ func LoadConfig() (Config, error) {
 		slog.Warn("Could not determine config paths", "error", pathErr)
 	}
 
+	// Try loading from primary path
 	if primaryPath != "" {
 		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg)
 		if loadErr != nil {
@@ -314,41 +335,44 @@ func LoadConfig() (Config, error) {
 		loadedFromFile = loaded
 		if loadedFromFile && loadErr == nil {
 			slog.Info("Loaded config", "path", primaryPath)
-		} else if loadedFromFile {
-			slog.Warn("Attempted load but failed", "path", primaryPath, "error", loadErr)
 		}
 	}
 
-	primaryNotFound := len(loadErrors) > 0 && errors.Is(loadErrors[len(loadErrors)-1], os.ErrNotExist)
-	if !loadedFromFile && secondaryPath != "" && (primaryNotFound || primaryPath == "") {
+	// Try secondary path if primary wasn't found or didn't load successfully
+	primaryNotFoundOrFailed := !loadedFromFile || len(loadErrors) > 0
+	if primaryNotFoundOrFailed && secondaryPath != "" {
 		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg)
 		if loadErr != nil {
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
 				if configParseError == nil {
 					configParseError = loadErr
-				}
+				} // Keep first parse error
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", secondaryPath, loadErr))
 		}
-		loadedFromFile = loaded
-		if loadedFromFile && loadErr == nil {
+		// Only set loadedFromFile if it wasn't already true from primary
+		if !loadedFromFile {
+			loadedFromFile = loaded
+		}
+		if loaded && loadErr == nil {
 			slog.Info("Loaded config", "path", secondaryPath)
-		} else if loadedFromFile {
-			slog.Warn("Attempted load but failed", "path", secondaryPath, "error", loadErr)
 		}
 	}
 
+	// Write default config if no file was loaded successfully
 	loadSucceeded := loadedFromFile && configParseError == nil
 	if !loadSucceeded {
 		if configParseError != nil {
 			slog.Warn("Existing config file failed to parse. Attempting to write default.", "error", configParseError)
 		} else {
-			slog.Info("No config file found. Attempting to write default.")
+			slog.Info("No valid config file found. Attempting to write default.")
 		}
+		// Determine write path (prefer primary)
 		writePath := primaryPath
 		if writePath == "" {
 			writePath = secondaryPath
 		}
+
 		if writePath != "" {
 			slog.Info("Attempting to write default config", "path", writePath)
 			if err := writeDefaultConfig(writePath, DefaultConfig); err != nil {
@@ -359,9 +383,10 @@ func LoadConfig() (Config, error) {
 			slog.Warn("Cannot determine path to write default config.")
 			loadErrors = append(loadErrors, errors.New("cannot determine default config path"))
 		}
-		cfg = DefaultConfig
+		cfg = DefaultConfig // Use defaults if write fails or no path
 	}
 
+	// Ensure internal templates are set
 	if cfg.PromptTemplate == "" {
 		cfg.PromptTemplate = promptTemplate
 	}
@@ -369,17 +394,20 @@ func LoadConfig() (Config, error) {
 		cfg.FimTemplate = fimPromptTemplate
 	}
 
+	// Final validation of the resulting config
 	finalCfg := cfg
 	if err := finalCfg.Validate(); err != nil {
-		slog.Warn("Config after load/merge failed validation. Returning defaults.", "error", err)
+		slog.Warn("Config after load/merge failed validation. Returning pure defaults.", "error", err)
 		loadErrors = append(loadErrors, fmt.Errorf("post-load config validation failed: %w", err))
+		// Validate pure defaults as a safety check
 		if valErr := DefaultConfig.Validate(); valErr != nil {
-			slog.Error("Default config is invalid", "error", valErr)
+			slog.Error("FATAL: Default config is invalid", "error", valErr)
 			return DefaultConfig, fmt.Errorf("default config is invalid: %w", valErr)
 		}
 		finalCfg = DefaultConfig
 	}
 
+	// Return config and potentially wrapped non-fatal errors
 	if len(loadErrors) > 0 {
 		return finalCfg, fmt.Errorf("%w: %w", ErrConfig, errors.Join(loadErrors...))
 	}
@@ -398,17 +426,20 @@ func getConfigPaths() (primary string, secondary string, err error) {
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
 		secondary = filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
+		// If primary failed, use secondary as primary (common on some systems)
 		if primary == "" && cfgErr != nil {
 			primary = secondary
 			slog.Debug("Using fallback primary config path", "path", primary)
-			secondary = ""
+			secondary = "" // No need for secondary if it's the same as primary fallback
 		}
+		// Avoid listing same path twice
 		if primary == secondary {
 			secondary = ""
 		}
 	} else {
 		slog.Warn("Could not determine user home directory", "error", homeErr)
 	}
+	// If neither path could be determined, return an error
 	if primary == "" && secondary == "" {
 		err = fmt.Errorf("cannot determine config/home directories: config error: %v; home error: %v", cfgErr, homeErr)
 	}
@@ -421,17 +452,20 @@ func loadAndMergeConfig(path string, cfg *Config) (loaded bool, err error) {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
-		}
-		return true, fmt.Errorf("reading config file %q failed: %w", path, err)
+		} // File not found is not an error here
+		return false, fmt.Errorf("reading config file %q failed: %w", path, err)
 	}
 	if len(data) == 0 {
-		slog.Warn("Config file exists but is empty", "path", path)
-		return true, nil
+		slog.Warn("Config file exists but is empty, ignoring.", "path", path)
+		return true, nil // Treat as loaded but empty
 	}
+
 	var fileCfg FileConfig
 	if err := json.Unmarshal(data, &fileCfg); err != nil {
 		return true, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
 	}
+
+	// Merge loaded fields into cfg, overwriting defaults
 	if fileCfg.OllamaURL != nil {
 		cfg.OllamaURL = *fileCfg.OllamaURL
 	}
@@ -459,15 +493,17 @@ func loadAndMergeConfig(path string, cfg *Config) (loaded bool, err error) {
 	if fileCfg.MaxSnippetLen != nil {
 		cfg.MaxSnippetLen = *fileCfg.MaxSnippetLen
 	}
-	return true, nil
+
+	return true, nil // Loaded successfully
 }
 
 // writeDefaultConfig creates the directory and writes the default config as JSON.
 func writeDefaultConfig(path string, defaultConfig Config) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil { // Use 0750 for permissions
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
+	// Create an exportable struct containing only the fields to write
 	type ExportableConfig struct {
 		OllamaURL      string   `json:"ollama_url"`
 		Model          string   `json:"model"`
@@ -479,11 +515,16 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 		MaxPreambleLen int      `json:"max_preamble_len"`
 		MaxSnippetLen  int      `json:"max_snippet_len"`
 	}
-	expCfg := ExportableConfig{OllamaURL: defaultConfig.OllamaURL, Model: defaultConfig.Model, MaxTokens: defaultConfig.MaxTokens, Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, UseAst: defaultConfig.UseAst, UseFim: defaultConfig.UseFim, MaxPreambleLen: defaultConfig.MaxPreambleLen, MaxSnippetLen: defaultConfig.MaxSnippetLen}
+	expCfg := ExportableConfig{
+		OllamaURL: defaultConfig.OllamaURL, Model: defaultConfig.Model, MaxTokens: defaultConfig.MaxTokens,
+		Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, UseAst: defaultConfig.UseAst,
+		UseFim: defaultConfig.UseFim, MaxPreambleLen: defaultConfig.MaxPreambleLen, MaxSnippetLen: defaultConfig.MaxSnippetLen,
+	}
 	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal default config to JSON: %w", err)
 	}
+	// Use more restrictive permissions for the config file itself
 	if err := os.WriteFile(path, jsonData, 0640); err != nil {
 		return fmt.Errorf("failed to write default config file %s: %w", path, err)
 	}
@@ -501,7 +542,19 @@ type httpOllamaClient struct {
 }
 
 func newHttpOllamaClient() *httpOllamaClient {
-	return &httpOllamaClient{httpClient: &http.Client{Timeout: 90 * time.Second}}
+	// Configure HTTP client with appropriate timeouts
+	return &httpOllamaClient{
+		httpClient: &http.Client{
+			Timeout: 90 * time.Second, // Overall request timeout
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: 10 * time.Second, // Connection timeout
+				}).DialContext,
+				TLSHandshakeTimeout: 10 * time.Second, // TLS handshake timeout
+				// Add other transport settings if needed (e.g., proxy)
+			},
+		},
+	}
 }
 
 // GenerateStream sends a request to Ollama's /api/generate endpoint.
@@ -513,35 +566,63 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 		return nil, fmt.Errorf("error parsing Ollama URL '%s': %w", endpointURL, err)
 	}
 
-	payload := map[string]interface{}{"model": config.Model, "prompt": prompt, "stream": true, "options": map[string]interface{}{"temperature": config.Temperature, "num_ctx": 4096, "top_p": 0.9, "stop": config.Stop, "num_predict": config.MaxTokens}}
+	// Construct payload
+	payload := map[string]interface{}{
+		"model":  config.Model,
+		"prompt": prompt,
+		"stream": true,
+		"options": map[string]interface{}{
+			"temperature": config.Temperature,
+			"num_ctx":     4096, // Consider making configurable or deriving
+			"top_p":       0.9,  // Common default, consider making configurable
+			"stop":        config.Stop,
+			"num_predict": config.MaxTokens,
+		},
+	}
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling JSON payload: %w", err)
 	}
+
+	// Create request with context
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/x-ndjson")
+	req.Header.Set("Accept", "application/x-ndjson") // Expect newline-delimited JSON stream
 
+	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// Check for context cancellation first
+		if errors.Is(err, context.Canceled) {
+			return nil, context.Canceled // Propagate cancellation
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: ollama request timed out after %v: %w", ErrOllamaUnavailable, c.httpClient.Timeout, err)
 		}
-		var netErr *net.OpError
-		if errors.As(err, &netErr) && netErr.Op == "dial" {
+		// Check for network errors (e.g., connection refused)
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			// Network timeout (e.g., connection timeout)
+			return nil, fmt.Errorf("%w: network timeout connecting to %s: %w", ErrOllamaUnavailable, u.Host, err)
+		}
+		if opErr, ok := err.(*net.OpError); ok && opErr.Op == "dial" {
 			return nil, fmt.Errorf("%w: connection refused or network error connecting to %s: %w", ErrOllamaUnavailable, u.Host, err)
 		}
+		// Other HTTP errors
 		return nil, fmt.Errorf("%w: http request failed: %w", ErrOllamaUnavailable, err)
 	}
+
+	// Check response status code
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, readErr := io.ReadAll(resp.Body)
 		bodyString := "(failed to read error response body)"
 		if readErr == nil {
 			bodyString = string(bodyBytes)
+			// Try to parse Ollama's specific error format
 			var ollamaErrResp struct {
 				Error string `json:"error"`
 			}
@@ -549,20 +630,26 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 				bodyString = ollamaErrResp.Error
 			}
 		}
+		// Create specific OllamaError
 		err = &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
 		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 	}
+
+	// Return response body for streaming
 	return resp.Body, nil
 }
 
-// GoPackagesAnalyzer implements Analyzer using go/packages and bbolt caching.
+// GoPackagesAnalyzer implements Analyzer using go/packages and caching.
+// Updated for Cycle 9 Ristretto cache.
 type GoPackagesAnalyzer struct {
-	db *bbolt.DB
-	mu sync.Mutex // Protects access to db handle during Close.
+	db          *bbolt.DB        // Disk cache
+	memoryCache *ristretto.Cache // In-memory cache
+	mu          sync.Mutex       // Protects access to db handle during Close.
 }
 
-// NewGoPackagesAnalyzer initializes the analyzer and opens the bbolt cache DB.
+// NewGoPackagesAnalyzer initializes the analyzer and caches.
 func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
+	// --- bbolt Cache Setup ---
 	dbPath := ""
 	userCacheDir, err := os.UserCacheDir()
 	if err == nil {
@@ -573,7 +660,7 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 			slog.Warn("Could not create bbolt cache directory", "path", dbDir, "error", err)
 		}
 	} else {
-		slog.Warn("Could not determine user cache directory. Caching disabled.", "error", err)
+		slog.Warn("Could not determine user cache directory. Bbolt caching disabled.", "error", err)
 	}
 
 	var db *bbolt.DB
@@ -581,7 +668,7 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 		opts := &bbolt.Options{Timeout: 1 * time.Second}
 		db, err = bbolt.Open(dbPath, 0600, opts)
 		if err != nil {
-			slog.Warn("Failed to open bbolt cache file. Caching will be disabled.", "path", dbPath, "error", err)
+			slog.Warn("Failed to open bbolt cache file. Bbolt caching will be disabled.", "path", dbPath, "error", err)
 			db = nil
 		} else {
 			err = db.Update(func(tx *bbolt.Tx) error {
@@ -592,7 +679,7 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 				return nil
 			})
 			if err != nil {
-				slog.Warn("Failed to ensure bbolt bucket exists. Caching disabled.", "error", err)
+				slog.Warn("Failed to ensure bbolt bucket exists. Bbolt caching disabled.", "error", err)
 				db.Close()
 				db = nil
 			} else {
@@ -600,162 +687,218 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 			}
 		}
 	}
-	return &GoPackagesAnalyzer{db: db}
+
+	// --- Ristretto Cache Setup (Cycle 9) ---
+	memCache, cacheErr := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 1e7,     // 10M keys to track frequency. Tune based on usage.
+		MaxCost:     1 << 30, // 1GB max cache size. Tune based on memory.
+		BufferItems: 64,      // Default is fine.
+		Metrics:     true,    // Enable metrics collection.
+	})
+	if cacheErr != nil {
+		slog.Warn("Failed to create ristretto memory cache. In-memory caching disabled.", "error", cacheErr)
+		memCache = nil // Ensure it's nil if setup fails
+	} else {
+		slog.Info("Initialized ristretto in-memory cache", "max_cost", "1GB")
+	}
+
+	return &GoPackagesAnalyzer{db: db, memoryCache: memCache}
 }
 
-// Close closes the bbolt database connection if open.
+// Close closes cache connections.
 func (a *GoPackagesAnalyzer) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	var closeErrors []error
 	if a.db != nil {
 		slog.Info("Closing bbolt cache database.")
-		err := a.db.Close()
+		if err := a.db.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("bbolt close failed: %w", err))
+		}
 		a.db = nil
-		return err
+	}
+	if a.memoryCache != nil {
+		slog.Info("Closing ristretto memory cache.")
+		a.memoryCache.Close() // Waits for buffers etc.
+		a.memoryCache = nil
+	}
+	if len(closeErrors) > 0 {
+		return errors.Join(closeErrors...)
 	}
 	return nil
 }
 
-// Analyze performs code analysis, utilizing the cache if possible.
-// Refactored in Cycle 8 to orchestrate calls to internal helpers.
-func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line, col int) (info *AstContextInfo, analysisErr error) {
-	logger := slog.Default().With("file", filename, "line", line, "col", col)
+// Analyze performs code analysis, orchestrating calls to helpers.
+// Updated for Cycle 8/9/Hover/Defensive.
+func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, version int, line, col int) (info *AstContextInfo, analysisErr error) {
+	// Input filename should already be validated absolute path by caller
+	logger := slog.Default().With("absFile", absFilename, "version", version, "line", line, "col", col)
 
-	info = &AstContextInfo{FilePath: filename, VariablesInScope: make(map[string]types.Object), AnalysisErrors: make([]error, 0), CallArgIndex: -1}
-	defer func() { // Recover from panics during analysis.
+	// Initialize result struct
+	info = &AstContextInfo{
+		FilePath:         absFilename,
+		Version:          version,
+		VariablesInScope: make(map[string]types.Object),
+		AnalysisErrors:   make([]error, 0),
+		CallArgIndex:     -1, // Initialize to -1
+	}
+
+	// Panic recovery for the entire analysis process
+	defer func() {
 		if r := recover(); r != nil {
 			panicErr := fmt.Errorf("internal panic during analysis: %v", r)
-			logger.Error("Panic recovered during AnalyzeCodeContext", "error", r, "stack", string(debug.Stack()))
-			addAnalysisError(info, panicErr, logger) // Pass logger
+			logger.Error("Panic recovered during Analyze", "error", r, "stack", string(debug.Stack()))
+			addAnalysisError(info, panicErr, logger)
+			// Ensure analysisErr reflects the panic if no other error was set
 			if analysisErr == nil {
 				analysisErr = panicErr
 			} else {
 				analysisErr = errors.Join(analysisErr, panicErr)
 			}
 		}
+		// Aggregate non-fatal errors into the final returned error
+		if len(info.AnalysisErrors) > 0 {
+			finalErr := errors.Join(info.AnalysisErrors...)
+			// Wrap non-fatal errors in ErrAnalysisFailed
+			if analysisErr == nil {
+				analysisErr = fmt.Errorf("%w: %w", ErrAnalysisFailed, finalErr)
+			} else {
+				analysisErr = fmt.Errorf("%w: %w", analysisErr, finalErr)
+			} // Join with existing fatal error if any
+		}
 	}()
 
-	absFilename, err := filepath.Abs(filename)
-	if err != nil {
-		return info, fmt.Errorf("failed to get absolute path for '%s': %w", filename, err)
-	}
-	info.FilePath = absFilename
-	logger = logger.With("absFile", absFilename)
 	logger.Info("Starting context analysis")
 	dir := filepath.Dir(absFilename)
 
-	// --- Cache Check ---
-	goModHash := calculateGoModHash(dir)
+	// --- Bbolt Cache Check (Disk Cache for final preamble) ---
+	goModHash := calculateGoModHash(dir) // Uses slog internally now
 	cacheKey := []byte(dir + "::" + goModHash)
-	var loadDuration, stepsDuration, preambleDuration time.Duration
 	cacheHit := false
 	var cachedEntry *CachedAnalysisEntry
+	var loadDuration, stepsDuration, preambleDuration time.Duration // Timings
 
 	if a.db != nil {
+		// ... (bbolt cache read logic as before, using logger, calling deleteCacheEntryByKey on error) ...
 		readStart := time.Now()
 		dbErr := a.db.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(cacheBucketName)
 			if b == nil {
-				return fmt.Errorf("%w: cache bucket %s not found during View", ErrCacheRead, string(cacheBucketName))
+				logger.Debug("Bbolt cache bucket not found.")
+				return nil
 			}
 			valBytes := b.Get(cacheKey)
 			if valBytes == nil {
-				return nil // Cache miss
+				logger.Debug("Bbolt cache miss.", "key", string(cacheKey))
+				return nil
 			}
+			logger.Debug("Bbolt cache hit (raw bytes found). Decoding...", "key", string(cacheKey))
 			var decoded CachedAnalysisEntry
 			decoder := gob.NewDecoder(bytes.NewReader(valBytes))
 			if err := decoder.Decode(&decoded); err != nil {
-				logger.Warn("Failed to gob-decode cached entry header. Treating as miss.", "key", string(cacheKey), "error", err)
-				deleteCacheEntryByKey(a.db, cacheKey, logger) // Pass logger
 				return fmt.Errorf("%w: %w", ErrCacheDecode, err)
-			}
+			} // Return error to trigger delete below
 			if decoded.SchemaVersion != cacheSchemaVersion {
-				logger.Warn("Cache data has old schema version. Ignoring.", "key", string(cacheKey), "got_version", decoded.SchemaVersion, "want_version", cacheSchemaVersion)
-				deleteCacheEntryByKey(a.db, cacheKey, logger) // Pass logger
-				return nil                                    // Treat as miss
-			}
+				logger.Warn("Cache data has old schema version. Ignoring.", "key", string(cacheKey))
+				return nil
+			} // Treat as miss
 			cachedEntry = &decoded
 			return nil
 		})
 		if dbErr != nil {
-			logger.Warn("Error reading or decoding from bbolt cache", "error", dbErr)
+			logger.Warn("Error reading or decoding from bbolt cache. Cache check failed.", "error", dbErr)
 			addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheRead, dbErr), logger)
+			if errors.Is(dbErr, ErrCacheDecode) {
+				go deleteCacheEntryByKey(a.db, cacheKey, logger.With("reason", "decode_failure"))
+			}
+			cachedEntry = nil
+		} else if cachedEntry != nil && cachedEntry.SchemaVersion != cacheSchemaVersion {
+			go deleteCacheEntryByKey(a.db, cacheKey, logger.With("reason", "schema_mismatch"))
+			cachedEntry = nil
 		}
-		logger.Debug("Cache read attempt finished", "duration", time.Since(readStart))
-	} else {
-		logger.Debug("Cache disabled (db handle is nil).")
-	}
+		logger.Debug("Bbolt cache read attempt finished", "duration", time.Since(readStart))
 
-	// Validate cache hit based on file hashes.
-	if cachedEntry != nil {
-		validationStart := time.Now()
-		logger.Debug("Potential cache hit. Validating file hashes...", "key", string(cacheKey))
-		currentHashes, hashErr := calculateInputHashes(dir, nil) // Pass nil pkg here.
-		if hashErr == nil && cachedEntry.GoModHash == goModHash && compareFileHashes(currentHashes, cachedEntry.InputFileHashes) {
-			logger.Debug("Cache VALID. Attempting to decode analysis data...", "key", string(cacheKey))
-			decodeStart := time.Now()
-			var analysisData CachedAnalysisData
-			decoder := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob))
-			if decodeErr := decoder.Decode(&analysisData); decodeErr == nil {
-				info.PackageName = analysisData.PackageName
-				info.PromptPreamble = analysisData.PromptPreamble
-				cacheHit = true
-				loadDuration = time.Since(decodeStart)
-				logger.Debug("Analysis data successfully decoded from cache.", "duration", loadDuration)
-				logger.Debug("Using cached preamble. Skipping packages.Load and analysis steps.", "preamble_length", len(info.PromptPreamble))
+		// Validate cache hit based on file hashes.
+		if cachedEntry != nil {
+			validationStart := time.Now()
+			logger.Debug("Potential bbolt cache hit. Validating file hashes...", "key", string(cacheKey))
+			currentHashes, hashErr := calculateInputHashes(dir, nil) // Pass nil pkg here.
+			if hashErr == nil && cachedEntry.GoModHash == goModHash && compareFileHashes(currentHashes, cachedEntry.InputFileHashes) {
+				logger.Debug("Bbolt cache VALID. Attempting to decode analysis data...", "key", string(cacheKey))
+				decodeStart := time.Now()
+				var analysisData CachedAnalysisData
+				decoder := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob))
+				if decodeErr := decoder.Decode(&analysisData); decodeErr == nil {
+					info.PackageName = analysisData.PackageName
+					info.PromptPreamble = analysisData.PromptPreamble
+					cacheHit = true
+					loadDuration = time.Since(decodeStart)
+					logger.Debug("Analysis data successfully decoded from bbolt cache.", "duration", loadDuration)
+					logger.Debug("Using cached preamble. Skipping packages.Load and analysis steps.", "preamble_length", len(info.PromptPreamble))
+				} else {
+					logger.Warn("Failed to gob-decode cached analysis data. Treating as miss.", "error", decodeErr)
+					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr), logger)
+					go deleteCacheEntryByKey(a.db, cacheKey, logger.With("reason", "analysis_decode_failure"))
+					cacheHit = false
+				}
 			} else {
-				logger.Warn("Failed to gob-decode cached analysis data. Treating as miss.", "error", decodeErr)
-				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr), logger)
-				deleteCacheEntryByKey(a.db, cacheKey, logger)
+				logger.Debug("Bbolt cache INVALID (hash mismatch or error). Treating as miss.", "key", string(cacheKey), "hash_error", hashErr)
+				go deleteCacheEntryByKey(a.db, cacheKey, logger.With("reason", "hash_mismatch"))
+				if hashErr != nil {
+					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr), logger)
+				}
+				cacheHit = false
 			}
-		} else {
-			logger.Debug("Cache INVALID. Treating as miss.", "key", string(cacheKey), "hash_error", hashErr)
-			deleteCacheEntryByKey(a.db, cacheKey, logger)
-			if hashErr != nil {
-				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr), logger)
-			}
+			logger.Debug("Bbolt cache validation/decode finished", "duration", time.Since(validationStart))
 		}
-		logger.Debug("Cache validation/decode finished", "duration", time.Since(validationStart))
+	} else {
+		logger.Debug("Bbolt cache disabled (db handle is nil).")
 	}
 
 	// --- Perform Full Analysis if Cache Miss ---
 	if !cacheHit {
-		if a.db == nil {
-			logger.Debug("Cache disabled, loading via packages.Load...")
-		} else {
-			logger.Debug("Cache miss or invalid. Loading via packages.Load...", "key", string(cacheKey))
-		}
+		logger.Debug("Bbolt cache miss or invalid. Performing full analysis...", "key", string(cacheKey))
 
+		// --- Step 1: Load Package Info ---
 		loadStart := time.Now()
-		fset := token.NewFileSet()
-		targetPkg, targetFileAST, targetFile, loadErrors := loadPackageInfo(ctx, absFilename, fset) // Uses slog internally now
+		fset := token.NewFileSet() // Create new FileSet for this analysis run
+		info.TargetFileSet = fset  // Store FileSet in info for later use (e.g., position formatting)
+		// **FIX:** Call the function now defined in helpers
+		targetPkg, targetFileAST, targetFile, loadErrors := loadPackageAndFile(ctx, absFilename, fset, logger)
 		loadDuration = time.Since(loadStart)
 		logger.Debug("packages.Load completed", "duration", loadDuration)
 		for _, loadErr := range loadErrors {
-			addAnalysisError(info, loadErr, logger) // Pass logger
+			addAnalysisError(info, loadErr, logger)
 		}
+		info.TargetPackage = targetPkg     // Store package info
+		info.TargetAstFile = targetFileAST // Store AST
 
-		if targetFile != nil && fset != nil {
-			stepsStart := time.Now()
-			// Cycle 8: Call refactored internal function (defined in analysis_helpers.go)
-			analyzeStepErr := performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, info, logger) // Pass logger
-			stepsDuration = time.Since(stepsStart)
-			logger.Debug("performAnalysisSteps completed", "duration", stepsDuration)
+		// --- Step 2: Perform Detailed Analysis Steps ---
+		stepsStart := time.Now()
+		if targetFile != nil { // Proceed only if the target token.File was found
+			// Call refactored helper (Cycle 8), passing analyzer for memory cache (Cycle 9)
+			analyzeStepErr := performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, a, info, logger)
 			if analyzeStepErr != nil {
-				addAnalysisError(info, analyzeStepErr, logger) // Pass logger
+				addAnalysisError(info, analyzeStepErr, logger)
 			}
 		} else {
-			if targetFile == nil {
-				addAnalysisError(info, errors.New("cannot perform analysis steps: missing target file after load"), logger) // Pass logger
+			// Log error if targetFile is nil but loading didn't report critical error earlier
+			if len(loadErrors) == 0 {
+				addAnalysisError(info, errors.New("cannot perform analysis steps: target token.File is nil"), logger)
 			}
-			if fset == nil && targetFile != nil {
-				addAnalysisError(info, errors.New("cannot perform analysis steps: missing FileSet after load"), logger) // Pass logger
-			}
+			// Attempt to gather basic package scope even without file context
+			gatherScopeContext(nil, targetPkg, fset, info, logger)
 		}
+		stepsDuration = time.Since(stepsStart)
+		logger.Debug("Analysis steps completed", "duration", stepsDuration)
 
+		// --- Step 3: Build Preamble ---
+		preambleStart := time.Now()
 		var qualifier types.Qualifier
 		if targetPkg != nil && targetPkg.Types != nil {
-			info.PackageName = targetPkg.Types.Name()
+			if info.PackageName == "" {
+				info.PackageName = targetPkg.Types.Name()
+			}
 			qualifier = types.RelativeTo(targetPkg.Types)
 		} else {
 			qualifier = func(other *types.Package) string {
@@ -766,34 +909,34 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 			}
 			logger.Debug("Building preamble with limited/no type info.")
 		}
-		preambleStart := time.Now()
-		// Cycle 8: Call refactored internal function (defined in analysis_helpers.go)
-		info.PromptPreamble = buildPreamble(info, qualifier, logger) // Pass logger
+		// Call refactored helper (Cycle 8), passing analyzer for potential future caching (Cycle 9)
+		info.PromptPreamble = constructPromptPreamble(a, info, qualifier, logger)
 		preambleDuration = time.Since(preambleStart)
-		logger.Debug("buildPreamble completed", "duration", preambleDuration)
+		logger.Debug("Preamble construction completed", "duration", preambleDuration)
 
-		// Save to cache if enabled, successful, and preamble generated.
-		if a.db != nil && info.PromptPreamble != "" && len(loadErrors) == 0 {
+		// --- Step 4: Save to Bbolt Cache ---
+		// Save only if analysis didn't have critical load errors and preamble was generated
+		shouldSave := a.db != nil && info.PromptPreamble != "" && len(loadErrors) == 0
+		if shouldSave {
+			// ... (bbolt cache save logic as before, using logger) ...
 			logger.Debug("Attempting to save analysis results to bbolt cache.", "key", string(cacheKey))
 			saveStart := time.Now()
-			inputHashes, hashErr := calculateInputHashes(dir, targetPkg) // Uses slog internally now
+			inputHashes, hashErr := calculateInputHashes(dir, targetPkg)
 			if hashErr == nil {
 				analysisDataToCache := CachedAnalysisData{PackageName: info.PackageName, PromptPreamble: info.PromptPreamble}
 				var gobBuf bytes.Buffer
-				encoder := gob.NewEncoder(&gobBuf)
-				if encodeErr := encoder.Encode(&analysisDataToCache); encodeErr == nil {
+				if encodeErr := gob.NewEncoder(&gobBuf).Encode(&analysisDataToCache); encodeErr == nil {
 					analysisGob := gobBuf.Bytes()
 					entryToSave := CachedAnalysisEntry{SchemaVersion: cacheSchemaVersion, GoModHash: goModHash, InputFileHashes: inputHashes, AnalysisGob: analysisGob}
 					var entryBuf bytes.Buffer
-					entryEncoder := gob.NewEncoder(&entryBuf)
-					if entryEncodeErr := entryEncoder.Encode(&entryToSave); entryEncodeErr == nil {
+					if entryEncodeErr := gob.NewEncoder(&entryBuf).Encode(&entryToSave); entryEncodeErr == nil {
 						encodedBytes := entryBuf.Bytes()
 						saveErr := a.db.Update(func(tx *bbolt.Tx) error {
 							b := tx.Bucket(cacheBucketName)
 							if b == nil {
-								return fmt.Errorf("%w: cache bucket %s disappeared during save", ErrCacheWrite, string(cacheBucketName))
+								return fmt.Errorf("%w: cache bucket %s disappeared", ErrCacheWrite, string(cacheBucketName))
 							}
-							logger.Debug("Writing bytes to cache", "key", string(cacheKey), "bytes", len(encodedBytes))
+							logger.Debug("Writing bytes to bbolt cache", "key", string(cacheKey), "bytes", len(encodedBytes))
 							return b.Put(cacheKey, encodedBytes)
 						})
 						if saveErr == nil {
@@ -802,167 +945,99 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, filename string, line,
 							logger.Warn("Failed to write to bbolt cache", "key", string(cacheKey), "error", saveErr)
 							addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheWrite, saveErr), logger)
 						}
-					} else {
-						logger.Warn("Failed to gob-encode cache entry", "key", string(cacheKey), "error", entryEncodeErr)
+					} else { /* handle entry encode error */
 						addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheEncode, entryEncodeErr), logger)
 					}
-				} else {
-					logger.Warn("Failed to gob-encode analysis data for caching", "error", encodeErr)
+				} else { /* handle data encode error */
 					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheEncode, encodeErr), logger)
 				}
-			} else {
-				logger.Warn("Failed to calculate input hashes for caching", "error", hashErr)
+			} else { /* handle hash error */
 				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr), logger)
 			}
 		} else if a.db != nil {
-			logger.Debug("Skipping cache save", "key", string(cacheKey), "load_errors", len(loadErrors), "preamble_empty", info.PromptPreamble == "")
+			logger.Debug("Skipping bbolt cache save", "key", string(cacheKey), "load_errors", len(loadErrors), "preamble_empty", info.PromptPreamble == "")
 		}
 	}
 
-	logAnalysisErrors(info.AnalysisErrors, logger) // Pass logger
-	analysisErr = errors.Join(info.AnalysisErrors...)
+	// Log final timing summary
 	if cacheHit {
-		logger.Info("Context analysis finished", "decode_duration", loadDuration, "cache_hit", cacheHit)
+		logger.Info("Context analysis finished (bbolt cache hit)", "decode_duration", loadDuration)
 	} else {
-		logger.Info("Context analysis finished", "load_duration", loadDuration, "steps_duration", stepsDuration, "preamble_duration", preambleDuration, "cache_hit", cacheHit)
+		logger.Info("Context analysis finished (full analysis)", "load_duration", loadDuration, "steps_duration", stepsDuration, "preamble_duration", preambleDuration)
 	}
 	logger.Debug("Final Context Preamble generated", "length", len(info.PromptPreamble))
 
-	// Return non-fatal analysis errors wrapped.
-	if analysisErr != nil {
-		return info, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisErr)
-	}
-	return info, nil
+	// Return info and potentially wrapped non-fatal errors (handled by defer)
+	return info, analysisErr
 }
 
-// InvalidateCache removes the cached entry for a given directory.
+// InvalidateCache removes the bbolt cached entry for a given directory.
 func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	logger := slog.Default().With("dir", dir)
 	a.mu.Lock()
-	db := a.db
+	db := a.db // Access db safely
 	a.mu.Unlock()
 	if db == nil {
-		logger.Debug("Cache invalidation skipped: DB is nil.")
+		logger.Debug("Bbolt cache invalidation skipped: DB is nil.")
 		return nil
 	}
-	goModHash := calculateGoModHash(dir) // Uses slog internally now
+	goModHash := calculateGoModHash(dir)
 	cacheKey := []byte(dir + "::" + goModHash)
-	return deleteCacheEntryByKey(db, cacheKey, logger) // Pass logger
+	logger.Info("Invalidating bbolt cache entry", "key", string(cacheKey))
+	// Pass logger to helper
+	return deleteCacheEntryByKey(db, cacheKey, logger)
 }
 
-// loadPackageInfo encapsulates the logic for loading package information.
-// Assumes slog is initialized.
-func loadPackageInfo(ctx context.Context, absFilename string, fset *token.FileSet) (*packages.Package, *ast.File, *token.File, []error) {
-	var loadErrors []error
-	dir := filepath.Dir(absFilename)
-	logger := slog.Default().With("dir", dir, "file", absFilename)
+// InvalidateMemoryCacheForURI clears relevant entries from the ristretto cache.
+// Cycle 9: Added method.
+// **FIX:** Changed DocumentURI to string.
+func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int) error {
+	logger := slog.Default().With("uri", uri, "version", version)
+	a.mu.Lock()
+	memCache := a.memoryCache // Access cache safely
+	a.mu.Unlock()
 
-	loadCfg := &packages.Config{
-		Context: ctx,
-		Dir:     dir,
-		Fset:    fset,
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
-			packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
-			packages.NeedSyntax | packages.NeedTypesInfo,
-		Tests: false,
-		Logf:  func(format string, args ...interface{}) { logger.Debug(fmt.Sprintf(format, args...)) }, // Pipe packages logs to slog
+	if memCache == nil {
+		logger.Debug("Memory cache invalidation skipped: Cache is nil.")
+		return nil
 	}
 
-	pkgs, err := packages.Load(loadCfg, fmt.Sprintf("file=%s", absFilename))
-	if err != nil {
-		loadErrors = append(loadErrors, fmt.Errorf("packages.Load failed: %w", err))
-		logger.Error("packages.Load failed", "error", err)
-		return nil, nil, nil, loadErrors
-	}
+	logger.Info("Invalidating memory cache (placeholder logic)")
+	// --- Placeholder Invalidation Logic ---
+	// This is highly dependent on the key structure chosen in Cycle 9, Step 3.
+	// Option 1: Clear the entire cache (simple, blunt)
+	// memCache.Clear()
+	// logger.Warn("Cleared entire memory cache due to document change (inefficient).")
 
-	if len(pkgs) == 0 {
-		loadErrors = append(loadErrors, errors.New("packages.Load returned no packages"))
-		logger.Warn("packages.Load returned no packages.")
-		return nil, nil, nil, loadErrors
-	}
+	// Option 2: Delete keys based on prefix (requires specific key design)
+	// Example: If keys are "scope:<uri>:<version>:...", "preamble:<uri>:<version>:..."
+	// We would need a way to find/delete keys matching "scope:<uri>:<version>".
+	// Ristretto doesn't directly support prefix deletion. This might involve:
+	//   a) Keeping a separate index (e.g., map[string][]cacheKey).
+	//   b) Iterating through *all* keys (if possible via metrics/internal access - not standard API).
+	//   c) Using a different cache library with prefix support.
 
-	var targetPkg *packages.Package
-	var targetFileAST *ast.File
-	var targetFile *token.File
+	// For now, log that invalidation is needed but not fully implemented.
+	logger.Warn("Memory cache invalidation logic is currently a placeholder and may not remove all stale entries.")
+	// --- End Placeholder ---
 
-	for _, p := range pkgs {
-		for _, loadErr := range p.Errors {
-			loadErrors = append(loadErrors, &loadErr)
-			logger.Warn("Package loading error", "package", p.PkgPath, "error", loadErr)
-		}
-	}
-
-	for _, p := range pkgs {
-		if p == nil {
-			continue
-		}
-		for _, astFile := range p.Syntax {
-			if astFile == nil {
-				continue
-			}
-			filePos := fset.Position(astFile.Pos())
-			if filePos.IsValid() && filePos.Filename == absFilename {
-				targetPkg = p
-				targetFileAST = astFile
-				targetFile = fset.File(astFile.Pos())
-				logger.Debug("Found target file in package", "package", p.PkgPath)
-				goto foundTarget
-			}
-		}
-	}
-
-foundTarget:
-	if targetPkg == nil {
-		loadErrors = append(loadErrors, fmt.Errorf("target file %s not found in loaded packages", absFilename))
-		logger.Warn("Target file not found in any loaded packages.")
-		if len(pkgs) > 0 {
-			targetPkg = pkgs[0]
-			logger.Warn("Falling back to first loaded package, but target file AST/Token info will be missing.", "package", targetPkg.PkgPath)
-		}
-	}
-
-	if targetPkg != nil {
-		if targetPkg.TypesInfo == nil {
-			loadErrors = append(loadErrors, fmt.Errorf("type info (TypesInfo) is nil for package %s", targetPkg.PkgPath))
-		}
-		if targetPkg.Types == nil {
-			loadErrors = append(loadErrors, fmt.Errorf("types (Types) is nil for package %s", targetPkg.PkgPath))
-		}
-	}
-
-	return targetPkg, targetFileAST, targetFile, loadErrors
+	return nil
 }
 
-// performAnalysisSteps encapsulates the core analysis logic after loading/parsing.
-// This function now orchestrates calls to helpers defined in analysis_helpers.go
-func performAnalysisSteps(
-	targetFile *token.File,
-	targetFileAST *ast.File,
-	targetPkg *packages.Package,
-	fset *token.FileSet,
-	line, col int,
-	info *AstContextInfo,
-	logger *slog.Logger,
-) error {
-	if targetFile == nil || fset == nil {
-		return errors.New("performAnalysisSteps requires non-nil targetFile and fset")
-	}
-	cursorPos, posErr := calculateCursorPos(targetFile, line, col) // Use helper from utils.go
-	if posErr != nil {
-		return fmt.Errorf("%w: %w", ErrPositionConversion, posErr)
-	}
-	info.CursorPos = cursorPos
-	logger.Debug("Calculated cursor position", "pos", info.CursorPos, "pos_string", fset.PositionFor(info.CursorPos, true).String())
+// MemoryCacheEnabled checks if the ristretto cache is active. (Cycle 9)
+func (a *GoPackagesAnalyzer) MemoryCacheEnabled() bool {
+	a.mu.Lock() // Although reading a pointer might be atomic, lock for consistency
+	defer a.mu.Unlock()
+	return a.memoryCache != nil
+}
 
-	if targetFileAST != nil {
-		// Calls to helpers now assumed to be defined in analysis_helpers.go
-		path := findEnclosingPath(targetFileAST, info.CursorPos, info, logger)
-		findContextNodes(path, info.CursorPos, targetPkg, fset, info, logger)
-		gatherScopeContext(path, targetPkg, fset, info, logger)
-		findRelevantComments(targetFileAST, path, info.CursorPos, fset, info, logger)
-	} else {
-		addAnalysisError(info, errors.New("cannot perform detailed AST analysis: targetFileAST is nil"), logger)
-		gatherScopeContext(nil, targetPkg, fset, info, logger)
+// GetMemoryCacheMetrics returns the ristretto cache metrics. (Cycle 9)
+// Returns nil if cache is disabled.
+func (a *GoPackagesAnalyzer) GetMemoryCacheMetrics() *ristretto.Metrics {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.memoryCache != nil {
+		return a.memoryCache.Metrics
 	}
 	return nil
 }
@@ -973,28 +1048,31 @@ type templateFormatter struct{}
 func newTemplateFormatter() *templateFormatter { return &templateFormatter{} }
 
 // FormatPrompt combines context and snippet into the final LLM prompt, applying truncation.
-// Assumes slog is initialized.
 func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx SnippetContext, config Config) string {
 	var finalPrompt string
-	template := config.PromptTemplate
+	template := config.PromptTemplate // Use standard template by default
 	maxPreambleLen := config.MaxPreambleLen
 	maxSnippetLen := config.MaxSnippetLen
-	maxFIMPartLen := maxSnippetLen / 2
+	maxFIMPartLen := maxSnippetLen / 2 // Divide budget for FIM prefix/suffix
 
+	// Truncate context preamble if necessary
 	if len(contextPreamble) > maxPreambleLen {
 		slog.Warn("Truncating context preamble", "original_length", len(contextPreamble), "max_length", maxPreambleLen)
 		marker := "... (context truncated)\n"
 		startByte := len(contextPreamble) - maxPreambleLen + len(marker)
 		if startByte < 0 {
 			startByte = 0
-		}
+		} // Avoid negative index
 		contextPreamble = marker + contextPreamble[startByte:]
 	}
 
+	// Handle FIM (Fill-In-the-Middle) vs standard completion
 	if config.UseFim {
-		template = config.FimTemplate
+		template = config.FimTemplate // Use FIM template
 		prefix := snippetCtx.Prefix
 		suffix := snippetCtx.Suffix
+
+		// Truncate FIM prefix if necessary (from the beginning)
 		if len(prefix) > maxFIMPartLen {
 			slog.Warn("Truncating FIM prefix", "original_length", len(prefix), "max_length", maxFIMPartLen)
 			marker := "...(prefix truncated)"
@@ -1004,6 +1082,7 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 			}
 			prefix = marker + prefix[startByte:]
 		}
+		// Truncate FIM suffix if necessary (from the end)
 		if len(suffix) > maxFIMPartLen {
 			slog.Warn("Truncating FIM suffix", "original_length", len(suffix), "max_length", maxFIMPartLen)
 			marker := "(suffix truncated)..."
@@ -1015,9 +1094,10 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 		}
 		finalPrompt = fmt.Sprintf(template, contextPreamble, prefix, suffix)
 	} else {
+		// Standard completion: use only the prefix as the snippet
 		snippet := snippetCtx.Prefix
 		if len(snippet) > maxSnippetLen {
-			slog.Warn("Truncating code snippet", "original_length", len(snippet), "max_length", maxSnippetLen)
+			slog.Warn("Truncating code snippet (prefix)", "original_length", len(snippet), "max_length", maxSnippetLen)
 			marker := "...(code truncated)\n"
 			startByte := len(snippet) - maxSnippetLen + len(marker)
 			if startByte < 0 {
@@ -1037,32 +1117,43 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 // DeepCompleter orchestrates analysis, formatting, and LLM interaction.
 type DeepCompleter struct {
 	client    LLMClient
-	analyzer  Analyzer // Keep unexported
+	analyzer  Analyzer // Use the interface type
 	formatter PromptFormatter
 	config    Config
 	configMu  sync.RWMutex // Protects concurrent read/write access to config.
 }
 
 // NewDeepCompleter creates a new DeepCompleter service with default config.
-// Assumes slog is initialized.
 func NewDeepCompleter() (*DeepCompleter, error) {
 	cfg, configErr := LoadConfig()
+	// Log warning but continue if only ErrConfig occurred
 	if configErr != nil && !errors.Is(configErr, ErrConfig) {
-		return nil, configErr
+		return nil, configErr // Fatal error during config load
 	}
 	if configErr != nil {
 		slog.Warn("Warning during initial config load", "error", configErr)
 	}
+
+	// Validate the loaded/default config before creating components
 	if err := cfg.Validate(); err != nil {
 		slog.Warn("Initial config is invalid after load/merge. Using pure defaults.", "error", err)
-		cfg = DefaultConfig
+		cfg = DefaultConfig // Reset to pure defaults
 		if valErr := cfg.Validate(); valErr != nil {
 			slog.Error("Default config validation failed", "error", valErr)
 			return nil, fmt.Errorf("default config validation failed: %w", valErr)
 		}
 	}
-	analyzer := NewGoPackagesAnalyzer()
-	dc := &DeepCompleter{client: newHttpOllamaClient(), analyzer: analyzer, formatter: newTemplateFormatter(), config: cfg}
+
+	// Initialize components
+	analyzer := NewGoPackagesAnalyzer() // Initializes bbolt and ristretto
+	dc := &DeepCompleter{
+		client:    newHttpOllamaClient(),
+		analyzer:  analyzer, // Store concrete type satisfying interface
+		formatter: newTemplateFormatter(),
+		config:    cfg,
+	}
+
+	// Return the completer, potentially along with the non-fatal config load warning
 	if configErr != nil && errors.Is(configErr, ErrConfig) {
 		return dc, configErr
 	}
@@ -1070,46 +1161,65 @@ func NewDeepCompleter() (*DeepCompleter, error) {
 }
 
 // NewDeepCompleterWithConfig creates a new DeepCompleter service with provided config.
-// Assumes slog is initialized.
 func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
+	// Ensure templates are set if empty
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
 	}
 	if config.FimTemplate == "" {
 		config.FimTemplate = fimPromptTemplate
 	}
+	// Validate the provided config
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
+	// Initialize components
 	analyzer := NewGoPackagesAnalyzer()
-	return &DeepCompleter{client: newHttpOllamaClient(), analyzer: analyzer, formatter: newTemplateFormatter(), config: config}, nil
+	return &DeepCompleter{
+		client:    newHttpOllamaClient(),
+		analyzer:  analyzer,
+		formatter: newTemplateFormatter(),
+		config:    config,
+	}, nil
 }
 
 // Close cleans up resources, primarily the analyzer's cache DB.
-// Assumes slog is initialized.
 func (dc *DeepCompleter) Close() error {
 	if dc.analyzer != nil {
-		return dc.analyzer.Close()
+		return dc.analyzer.Close() // Close handles both bbolt and ristretto
 	}
 	return nil
 }
 
 // UpdateConfig atomically updates the completer's configuration after validation.
-// Assumes slog is initialized.
 func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
+	// Ensure templates are set if empty
 	if newConfig.PromptTemplate == "" {
 		newConfig.PromptTemplate = promptTemplate
 	}
 	if newConfig.FimTemplate == "" {
 		newConfig.FimTemplate = fimPromptTemplate
 	}
+	// Validate before applying
 	if err := newConfig.Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
+	// Apply atomically
 	dc.configMu.Lock()
 	defer dc.configMu.Unlock()
 	dc.config = newConfig
-	slog.Info("DeepCompleter configuration updated", "new_config", fmt.Sprintf("%+v", newConfig))
+	// Use structured logging for config values
+	slog.Info("DeepCompleter configuration updated",
+		slog.String("ollama_url", newConfig.OllamaURL),
+		slog.String("model", newConfig.Model),
+		slog.Int("max_tokens", newConfig.MaxTokens),
+		slog.Any("stop", newConfig.Stop),
+		slog.Float64("temperature", newConfig.Temperature),
+		slog.Bool("use_ast", newConfig.UseAst),
+		slog.Bool("use_fim", newConfig.UseFim),
+		slog.Int("max_preamble_len", newConfig.MaxPreambleLen),
+		slog.Int("max_snippet_len", newConfig.MaxSnippetLen),
+	)
 	return nil
 }
 
@@ -1117,6 +1227,7 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 func (dc *DeepCompleter) GetCurrentConfig() Config {
 	dc.configMu.RLock()
 	defer dc.configMu.RUnlock()
+	// Return a copy to prevent external modification
 	cfgCopy := dc.config
 	if cfgCopy.Stop != nil {
 		stopsCopy := make([]string, len(cfgCopy.Stop))
@@ -1126,7 +1237,7 @@ func (dc *DeepCompleter) GetCurrentConfig() Config {
 	return cfgCopy
 }
 
-// InvalidateAnalyzerCache provides access to the analyzer's invalidation logic.
+// InvalidateAnalyzerCache provides access to the analyzer's bbolt invalidation logic.
 func (dc *DeepCompleter) InvalidateAnalyzerCache(dir string) error {
 	if dc.analyzer == nil {
 		return errors.New("analyzer not initialized")
@@ -1134,70 +1245,120 @@ func (dc *DeepCompleter) InvalidateAnalyzerCache(dir string) error {
 	return dc.analyzer.InvalidateCache(dir)
 }
 
+// InvalidateMemoryCacheForURI provides access to the analyzer's memory cache invalidation.
+// **FIX:** Changed DocumentURI to string.
+func (dc *DeepCompleter) InvalidateMemoryCacheForURI(uri string, version int) error {
+	if dc.analyzer == nil {
+		return errors.New("analyzer not initialized")
+	}
+	return dc.analyzer.InvalidateMemoryCacheForURI(uri, version)
+}
+
+// GetAnalyzer returns the analyzer instance (needed for Cycle 9 metrics/invalidation).
+// Consider if this is the best way to expose cache access.
+func (dc *DeepCompleter) GetAnalyzer() Analyzer {
+	return dc.analyzer
+}
+
 // GetCompletion provides basic completion for a direct code snippet (no AST analysis).
-// Assumes slog is initialized.
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
 	logger := slog.Default().With("operation", "GetCompletion")
 	logger.Info("Handling basic completion request")
 
-	dc.configMu.RLock()
-	currentConfig := dc.config
-	dc.configMu.RUnlock()
+	currentConfig := dc.GetCurrentConfig() // Get config safely
 
 	contextPreamble := "// Provide Go code completion below."
 	snippetCtx := SnippetContext{Prefix: codeSnippet}
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig)
 	logger.Debug("Generated basic prompt", "length", len(prompt))
 
-	reader, err := dc.client.GenerateStream(ctx, prompt, currentConfig)
-	if err != nil {
-		logger.Error("LLM client GenerateStream failed", "error", err)
-		return "", err
-	}
-
+	// Call the LLM client via retry logic
 	var buffer bytes.Buffer
-	streamCtx, cancelStream := context.WithTimeout(ctx, 50*time.Second)
-	defer cancelStream()
-
-	if streamErr := streamCompletion(streamCtx, reader, &buffer); streamErr != nil { // streamCompletion uses slog
-		logger.Error("Error processing LLM stream", "error", streamErr)
-		if errors.Is(streamErr, context.DeadlineExceeded) || errors.Is(streamErr, context.Canceled) {
-			return "", fmt.Errorf("%w: streaming context error: %w", ErrOllamaUnavailable, streamErr)
+	apiCallFunc := func() error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // Check context before attempt
+		default:
 		}
-		return "", fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
+		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
+		defer cancelApi()
+
+		logger.Debug("Calling Ollama GenerateStream for basic completion")
+		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig)
+		if apiErr != nil {
+			return apiErr
+		} // Return error to potentially retry
+
+		// Process stream
+		streamCtx, cancelStream := context.WithTimeout(apiCtx, 50*time.Second)
+		defer cancelStream()
+		buffer.Reset()                                            // Clear buffer for this attempt
+		streamErr := streamCompletion(streamCtx, reader, &buffer) // Uses slog
+		if streamErr != nil {
+			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
+		} // Wrap stream errors
+		return nil // Success for this attempt
 	}
+
+	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, logger) // retry uses slog
+	if err != nil {
+		// Check context cancellation one last time
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+		// Categorize final error
+		if errors.Is(err, ErrOllamaUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			logger.Error("Ollama unavailable for basic completion after retries", "error", err)
+			return "", fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
+		}
+		if errors.Is(err, ErrStreamProcessing) {
+			logger.Error("Stream processing error for basic completion after retries", "error", err)
+			return "", err // Return the wrapped ErrStreamProcessing
+		}
+		logger.Error("Failed to get basic completion after retries", "error", err)
+		return "", fmt.Errorf("failed to get basic completion after %d retries: %w", maxRetries, err)
+	}
+
+	logger.Info("Basic completion successful")
 	return strings.TrimSpace(buffer.String()), nil
 }
 
 // GetCompletionStreamFromFile provides context-aware completion using analysis, streaming the result.
-// Assumes slog is initialized.
-func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filename string, row, col int, w io.Writer) error {
-	logger := slog.Default().With("operation", "GetCompletionStreamFromFile", "file", filename, "line", row, "col", col)
+// Updated for Cycle 9 versioning and expects validated filename.
+func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFilename string, version int, line, col int, w io.Writer) error {
+	// Assume absFilename is already validated by the caller (handler)
+	logger := slog.Default().With("operation", "GetCompletionStreamFromFile", "path", absFilename, "version", version, "line", line, "col", col)
 
-	dc.configMu.RLock()
-	currentConfig := dc.config
-	dc.configMu.RUnlock()
+	currentConfig := dc.GetCurrentConfig() // Get config safely
 	var contextPreamble string = "// Basic file context only."
 	var analysisInfo *AstContextInfo
-	var analysisErr error
+	var analysisErr error // To store non-fatal analysis errors
 
+	// Perform analysis if enabled
 	if currentConfig.UseAst {
 		logger.Info("Analyzing context (or checking cache)")
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 30*time.Second)
-		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, filename, row, col) // Analyze uses slog
+		// Pass version to Analyze
+		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, absFilename, version, line, col)
 		cancelAnalysis()
 
-		if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) && !errors.Is(analysisErr, ErrCache) {
+		// Handle analysis errors (fatal vs non-fatal)
+		if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) {
 			logger.Error("Fatal error during analysis/cache check", "error", analysisErr)
-			return fmt.Errorf("analysis failed fatally: %w", analysisErr)
+			return fmt.Errorf("analysis failed fatally: %w", analysisErr) // Return fatal errors immediately
 		}
+		// Keep non-fatal errors (wrapped in ErrAnalysisFailed) to potentially notify user later
 		if analysisErr != nil {
 			logger.Warn("Non-fatal error during analysis/cache check", "error", analysisErr)
 		}
+
+		// Use preamble if available
 		if analysisInfo != nil && analysisInfo.PromptPreamble != "" {
 			contextPreamble = analysisInfo.PromptPreamble
 		} else if analysisErr != nil {
-			contextPreamble += fmt.Sprintf("\n// Warning: Context analysis completed with errors and no preamble: %v\n", analysisErr)
+			contextPreamble += fmt.Sprintf("\n// Warning: Context analysis completed with errors: %v\n", analysisErr)
 		} else {
 			contextPreamble += "\n// Warning: Context analysis returned no specific context preamble.\n"
 		}
@@ -1205,98 +1366,68 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, filena
 		logger.Info("AST analysis disabled by config.")
 	}
 
-	snippetCtx, err := extractSnippetContext(filename, row, col) // extractSnippetContext uses slog
-	if err != nil {
-		logger.Error("Failed to extract code snippet context", "error", err)
-		return fmt.Errorf("failed to extract code snippet context: %w", err)
+	// Extract code snippet around cursor
+	// Pass validated absFilename
+	snippetCtx, snippetErr := extractSnippetContext(absFilename, line, col) // Uses slog
+	if snippetErr != nil {
+		logger.Error("Failed to extract code snippet context", "error", snippetErr)
+		return fmt.Errorf("failed to extract code snippet context: %w", snippetErr)
 	}
 
-	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig) // FormatPrompt uses slog
+	// Format the final prompt
+	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig) // Uses slog
 	logger.Debug("Generated prompt", "length", len(prompt))
 
+	// --- API Call with Retry ---
 	apiCallFunc := func() error {
 		select {
 		case <-ctx.Done():
-			logger.Warn("Context cancelled before API call attempt", "error", ctx.Err())
 			return ctx.Err()
 		default:
 		}
-
 		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
 		defer cancelApi()
+
 		logger.Debug("Calling Ollama GenerateStream")
-		apiStartTime := time.Now()
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig)
-		apiDuration := time.Since(apiStartTime)
-		logger.Debug("Ollama GenerateStream returned", "duration", apiDuration, "error", apiErr)
-
 		if apiErr != nil {
-			var oe *OllamaError
-			isRetryable := errors.As(apiErr, &oe) && (oe.Status == http.StatusServiceUnavailable || oe.Status == http.StatusTooManyRequests)
-			isRetryable = isRetryable || errors.Is(apiErr, context.DeadlineExceeded) || errors.Is(apiErr, ErrOllamaUnavailable)
+			return apiErr
+		} // Let retry handler classify
 
-			select {
-			case <-ctx.Done():
-				logger.Warn("Parent context cancelled after API call failed", "api_error", apiErr, "context_error", ctx.Err())
-				return ctx.Err()
-			default:
-				if isRetryable {
-					logger.Warn("Retryable API error", "error", apiErr)
-					return apiErr
-				}
-				logger.Error("Non-retryable API error", "error", apiErr)
-				return apiErr
-			}
-		}
+		// Process stream, write directly to provided writer w
 		streamErr := streamCompletion(apiCtx, reader, w) // streamCompletion uses slog
 		if streamErr != nil {
-			select {
-			case <-ctx.Done():
-				logger.Warn("Parent context cancelled after stream error", "stream_error", streamErr, "context_error", ctx.Err())
-				return ctx.Err()
-			default:
-				if errors.Is(streamErr, context.DeadlineExceeded) || errors.Is(streamErr, context.Canceled) {
-					select {
-					case <-ctx.Done():
-						logger.Warn("Parent context cancelled after stream context error", "stream_error", streamErr, "context_error", ctx.Err())
-						return ctx.Err()
-					default:
-						logger.Warn("Stream context error occurred", "error", streamErr)
-						return streamErr
-					}
-				}
-				logger.Error("Stream processing error", "error", streamErr)
-				return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
-			}
-		}
-		logger.Debug("Completion stream finished successfully for this attempt.")
+			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
+		} // Wrap stream errors
 		return nil
 	}
 
-	err = retry(ctx, apiCallFunc, maxRetries, retryDelay, logger) // retry uses slog
+	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, logger) // retry uses slog
 	if err != nil {
 		select {
 		case <-ctx.Done():
-			logger.Warn("Context cancelled after retry attempts failed", "final_error", err, "context_error", ctx.Err())
-			return ctx.Err()
+			return ctx.Err() // Prefer context error if cancelled
 		default:
 		}
-		var oe *OllamaError
-		if errors.As(err, &oe) || errors.Is(err, ErrOllamaUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			logger.Error("Ollama unavailable after retries", "error", err)
+		// Categorize final error
+		if errors.Is(err, ErrOllamaUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			logger.Error("Ollama unavailable for stream after retries", "error", err)
+			// Return specific error for handler to potentially notify user
 			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 		}
 		if errors.Is(err, ErrStreamProcessing) {
-			logger.Error("Stream processing error after retries", "error", err)
-			return err
+			logger.Error("Stream processing error for stream after retries", "error", err)
+			return err // Return wrapped ErrStreamProcessing
 		}
-		logger.Error("Failed to get completion stream after retries", "error", err, "retries", maxRetries)
+		logger.Error("Failed to get completion stream after retries", "error", err)
 		return fmt.Errorf("failed to get completion stream after %d retries: %w", maxRetries, err)
 	}
 
+	// Log analysis warnings if stream succeeded
 	if analysisErr != nil {
-		logger.Warn("Completion succeeded, but context analysis/cache check encountered non-fatal errors", "analysis_error", analysisErr)
+		logger.Warn("Completion stream successful, but context analysis encountered non-fatal errors", "analysis_error", analysisErr)
+		// Don't return analysisErr here, as completion succeeded. Handler might notify user based on analysisErr.
 	}
 	logger.Info("Completion stream successful")
-	return nil
+	return nil // Success
 }
