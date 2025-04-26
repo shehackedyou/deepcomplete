@@ -69,6 +69,7 @@ CODE TO FILL:
 	defaultMaxTokens      = 256            // Default maximum tokens for LLM response.
 	DefaultStop           = "\n"           // Default stop sequence for LLM. Exported for CLI use.
 	defaultTemperature    = 0.1            // Default sampling temperature for LLM.
+	defaultLogLevel       = "info"         // **ADDED: Cycle 1** Default log level.
 	defaultConfigFileName = "config.json"  // Default config file name.
 	configDirName         = "deepcomplete" // Subdirectory name for config/data.
 	cacheSchemaVersion    = 2              // Used to invalidate cache if internal formats change.
@@ -91,6 +92,7 @@ type Config struct {
 	MaxTokens      int      `json:"max_tokens"`
 	Stop           []string `json:"stop"`
 	Temperature    float64  `json:"temperature"`
+	LogLevel       string   `json:"log_level"`        // **ADDED: Cycle 1** Log level (debug, info, warn, error).
 	UseAst         bool     `json:"use_ast"`          // Enable AST/Type analysis.
 	UseFim         bool     `json:"use_fim"`          // Use Fill-in-the-Middle prompting.
 	MaxPreambleLen int      `json:"max_preamble_len"` // Max bytes for AST context preamble.
@@ -124,6 +126,17 @@ func (c *Config) Validate() error {
 		slog.Warn("max_snippet_len is not positive, using default", "configured_value", c.MaxSnippetLen, "default", DefaultConfig.MaxSnippetLen)
 		c.MaxSnippetLen = DefaultConfig.MaxSnippetLen
 	}
+	// **ADDED: Cycle 1** Validate LogLevel
+	if c.LogLevel == "" {
+		slog.Warn("log_level is empty, using default", "default", defaultLogLevel)
+		c.LogLevel = defaultLogLevel
+	} else {
+		_, err := ParseLogLevel(c.LogLevel) // Use helper to validate
+		if err != nil {
+			slog.Warn("Invalid log_level found, using default", "configured_value", c.LogLevel, "default", defaultLogLevel, "error", err)
+			c.LogLevel = defaultLogLevel
+		}
+	}
 	return nil
 }
 
@@ -134,6 +147,7 @@ type FileConfig struct {
 	MaxTokens      *int      `json:"max_tokens"`
 	Stop           *[]string `json:"stop"`
 	Temperature    *float64  `json:"temperature"`
+	LogLevel       *string   `json:"log_level"` // **ADDED: Cycle 1** Pointer to detect if set
 	UseAst         *bool     `json:"use_ast"`
 	UseFim         *bool     `json:"use_fim"`
 	MaxPreambleLen *int      `json:"max_preamble_len"`
@@ -296,6 +310,7 @@ var (
 		MaxTokens:      defaultMaxTokens,
 		Stop:           []string{DefaultStop, "}", "//", "/*"},
 		Temperature:    defaultTemperature,
+		LogLevel:       defaultLogLevel, // **ADDED: Cycle 1**
 		UseAst:         true,
 		UseFim:         false,
 		MaxPreambleLen: 2048,
@@ -481,6 +496,10 @@ func loadAndMergeConfig(path string, cfg *Config) (loaded bool, err error) {
 	if fileCfg.Temperature != nil {
 		cfg.Temperature = *fileCfg.Temperature
 	}
+	// **ADDED: Cycle 1** Merge LogLevel
+	if fileCfg.LogLevel != nil {
+		cfg.LogLevel = *fileCfg.LogLevel
+	}
 	if fileCfg.UseAst != nil {
 		cfg.UseAst = *fileCfg.UseAst
 	}
@@ -510,6 +529,7 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 		MaxTokens      int      `json:"max_tokens"`
 		Stop           []string `json:"stop"`
 		Temperature    float64  `json:"temperature"`
+		LogLevel       string   `json:"log_level"` // **ADDED: Cycle 1**
 		UseAst         bool     `json:"use_ast"`
 		UseFim         bool     `json:"use_fim"`
 		MaxPreambleLen int      `json:"max_preamble_len"`
@@ -517,8 +537,9 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 	}
 	expCfg := ExportableConfig{
 		OllamaURL: defaultConfig.OllamaURL, Model: defaultConfig.Model, MaxTokens: defaultConfig.MaxTokens,
-		Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, UseAst: defaultConfig.UseAst,
-		UseFim: defaultConfig.UseFim, MaxPreambleLen: defaultConfig.MaxPreambleLen, MaxSnippetLen: defaultConfig.MaxSnippetLen,
+		Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, LogLevel: defaultConfig.LogLevel, // **ADDED: Cycle 1**
+		UseAst: defaultConfig.UseAst, UseFim: defaultConfig.UseFim,
+		MaxPreambleLen: defaultConfig.MaxPreambleLen, MaxSnippetLen: defaultConfig.MaxSnippetLen,
 	}
 	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
 	if err != nil {
@@ -530,6 +551,23 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 	}
 	slog.Info("Wrote default configuration", "path", path)
 	return nil
+}
+
+// ParseLogLevel converts a string level ("debug", "info", "warn", "error") to slog.Level.
+// **ADDED: Cycle 1** Helper function.
+func ParseLogLevel(levelStr string) (slog.Level, error) {
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error", "err":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("invalid log level string: %q (expected debug, info, warn, or error)", levelStr)
+	}
 }
 
 // =============================================================================
@@ -887,7 +925,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				addAnalysisError(info, errors.New("cannot perform analysis steps: target token.File is nil"), logger)
 			}
 			// Attempt to gather basic package scope even without file context
-			gatherScopeContext(nil, targetPkg, fset, info, logger)
+			gatherScopeContext(nil, targetPkg, fset, info, logger) // Pass nil path
 		}
 		stepsDuration = time.Since(stepsStart)
 		logger.Debug("Analysis steps completed", "duration", stepsDuration)
@@ -1215,6 +1253,7 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 		slog.Int("max_tokens", newConfig.MaxTokens),
 		slog.Any("stop", newConfig.Stop),
 		slog.Float64("temperature", newConfig.Temperature),
+		slog.String("log_level", newConfig.LogLevel), // **ADDED: Cycle 1** Log new level
 		slog.Bool("use_ast", newConfig.UseAst),
 		slog.Bool("use_fim", newConfig.UseFim),
 		slog.Int("max_preamble_len", newConfig.MaxPreambleLen),
