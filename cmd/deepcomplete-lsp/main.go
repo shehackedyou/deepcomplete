@@ -405,17 +405,35 @@ type CompletionItem struct {
 }
 
 // CompletionItemKind defines the kind of completion item.
+// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionItemKind
 type CompletionItemKind int // Standard LSP kinds
 
 const (
-	CompletionItemKindText     CompletionItemKind = 1
-	CompletionItemKindMethod   CompletionItemKind = 2
-	CompletionItemKindFunction CompletionItemKind = 3
-	CompletionItemKindVariable CompletionItemKind = 6
-	CompletionItemKindField    CompletionItemKind = 5 // Added Field
-	CompletionItemKindStruct   CompletionItemKind = 7 // Added Struct
-	CompletionItemKindKeyword  CompletionItemKind = 14
-	CompletionItemKindModule   CompletionItemKind = 9 // Added Module/Package
+	CompletionItemKindText          CompletionItemKind = 1
+	CompletionItemKindMethod        CompletionItemKind = 2
+	CompletionItemKindFunction      CompletionItemKind = 3
+	CompletionItemKindConstructor   CompletionItemKind = 4
+	CompletionItemKindField         CompletionItemKind = 5
+	CompletionItemKindVariable      CompletionItemKind = 6
+	CompletionItemKindClass         CompletionItemKind = 7
+	CompletionItemKindInterface     CompletionItemKind = 8
+	CompletionItemKindModule        CompletionItemKind = 9
+	CompletionItemKindProperty      CompletionItemKind = 10
+	CompletionItemKindUnit          CompletionItemKind = 11
+	CompletionItemKindValue         CompletionItemKind = 12
+	CompletionItemKindEnum          CompletionItemKind = 13
+	CompletionItemKindKeyword       CompletionItemKind = 14
+	CompletionItemKindSnippet       CompletionItemKind = 15
+	CompletionItemKindColor         CompletionItemKind = 16
+	CompletionItemKindFile          CompletionItemKind = 17
+	CompletionItemKindReference     CompletionItemKind = 18
+	CompletionItemKindFolder        CompletionItemKind = 19
+	CompletionItemKindEnumMember    CompletionItemKind = 20
+	CompletionItemKindConstant      CompletionItemKind = 21
+	CompletionItemKindStruct        CompletionItemKind = 22
+	CompletionItemKindEvent         CompletionItemKind = 23
+	CompletionItemKindOperator      CompletionItemKind = 24
+	CompletionItemKindTypeParameter CompletionItemKind = 25
 )
 
 // InsertTextFormat defines the format of the insert text.
@@ -1203,14 +1221,6 @@ func completionHandler(ctx context.Context, event Event, logger *slog.Logger) (r
 	} // Conceptual LRU update
 	docStoreMutex.RUnlock() // Release read lock before potential write lock in LRU update
 
-	// If LRU update needed write lock:
-	// docStoreMutex.Lock()
-	// if docInfoPtr, ok := documentStore[params.TextDocument.URI]; ok {
-	//     docInfoPtr.LastAccess = time.Now()
-	//     documentStore[params.TextDocument.URI] = docInfoPtr // Update map if value type
-	// }
-	// docStoreMutex.Unlock()
-
 	if !ok {
 		logger.Error("Document not found for completion")
 		return nil, nil // Return nil result, not an error, for missing doc
@@ -1228,8 +1238,6 @@ func completionHandler(ctx context.Context, event Event, logger *slog.Logger) (r
 	docStoreMutex.RLock()
 	currentVersion := docInfo.Version // Use version from initially fetched docInfo
 	docStoreMutex.RUnlock()
-	// Check against potentially newer version fetched just before call? Less critical now with cancellation.
-	// logger.Debug("Version check passed implicitly via context.")
 
 	// 5. Call Core Completer
 	logger.Debug("Calling GetCompletionStreamFromFile", "line", line, "col", col, "version", currentVersion)
@@ -1281,7 +1289,7 @@ func completionHandler(ctx context.Context, event Event, logger *slog.Logger) (r
 		}
 
 		if keepCompletion {
-			// Format item (existing logic...)
+			// Format item
 			label := strings.TrimSpace(completionText)
 			if firstNewline := strings.Index(label, "\n"); firstNewline != -1 {
 				label = label[:firstNewline]
@@ -1289,11 +1297,32 @@ func completionHandler(ctx context.Context, event Event, logger *slog.Logger) (r
 			if len(label) > 50 {
 				label = label[:50] + "..."
 			}
+
+			// ** Cycle 5: Determine Completion Kind **
+			// This is a placeholder. Ideally, we'd correlate the completionText
+			// with a types.Object found during analysis to get the real kind.
+			// Since the LLM generates free text, this correlation is difficult.
+			// We could potentially parse the *start* of completionText to guess,
+			// but for now, we default to Text.
 			kind := CompletionItemKindText // Default
-			// ... (kind detection logic) ...
-			item := CompletionItem{Label: label, Kind: kind, Detail: "DeepComplete Suggestion"}
+			// Example (Conceptual - requires more logic):
+			// if analysisInfo != nil && analysisInfo.IdentifierObject != nil {
+			//     // If completion seems related to the identifier at cursor?
+			//     kind = mapTypeToCompletionKind(analysisInfo.IdentifierObject)
+			// } else if strings.HasPrefix(completionText, "func ") {
+			//     kind = CompletionItemKindFunction
+			// } // etc.
+			logger.Debug("Completion kind mapping not fully implemented, using default.", "default_kind", kind)
+
+			item := CompletionItem{
+				Label:  label,
+				Kind:   kind, // Use determined kind
+				Detail: "DeepComplete Suggestion",
+			}
 			if clientSupportsSnippets {
 				item.InsertTextFormat = SnippetFormat
+				// Ensure snippet placeholders are escaped correctly if needed
+				// Simple case: append $0 for final cursor position
 				item.InsertText = completionText + "$0"
 			} else {
 				item.InsertTextFormat = PlainTextFormat
@@ -2296,4 +2325,47 @@ func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
 		byteOffset += size
 	}
 	return utf16Offset, nil
+}
+
+// ** ADDED: Cycle 5 **
+// mapTypeToCompletionKind maps a Go types.Object to an LSP CompletionItemKind.
+func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
+	if obj == nil {
+		return CompletionItemKindText // Default if no object info
+	}
+
+	switch o := obj.(type) {
+	case *types.Func:
+		sig, ok := o.Type().(*types.Signature)
+		if ok && sig.Recv() != nil {
+			return CompletionItemKindMethod
+		}
+		return CompletionItemKindFunction
+	case *types.Var:
+		if o.IsField() {
+			return CompletionItemKindField
+		}
+		return CompletionItemKindVariable
+	case *types.Const:
+		return CompletionItemKindConstant
+	case *types.TypeName:
+		switch o.Type().Underlying().(type) {
+		case *types.Struct:
+			return CompletionItemKindStruct
+		case *types.Interface:
+			return CompletionItemKindInterface
+		// Add cases for *types.Basic (like int, string), *types.Map, *types.Slice, etc. if needed
+		default:
+			return CompletionItemKindClass // General fallback for types
+		}
+	case *types.PkgName:
+		return CompletionItemKindModule
+	case *types.Builtin:
+		// Could potentially map specific builtins (e.g., append, make) to Function?
+		return CompletionItemKindFunction // Treat builtins like functions
+	case *types.Nil:
+		return CompletionItemKindValue
+	default:
+		return CompletionItemKindText // Default fallback
+	}
 }
