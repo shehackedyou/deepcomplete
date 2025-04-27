@@ -8,8 +8,8 @@ import (
 	"errors"
 	"expvar" // Cycle 3: Added expvar
 	"fmt"
-	"go/ast" // ** ADDED: Cycle 2 ** Needed for hover formatting
-	// ** ADDED: Cycle 2 ** Needed for hover formatting
+	"go/ast"   // ** ADDED: Cycle 2 ** Needed for hover formatting
+	"go/token" // ** ADDED: Cycle 2 ** Needed for hover formatting
 	"go/types"
 	"io"
 	stlog "log"        // Cycle 1: Rename standard log to avoid conflict with slog
@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson" // Cycle 2: Added gjson dependency
 	"github.com/tidwall/match" // Cycle 5: Added match dependency
@@ -133,7 +134,8 @@ func (e BaseEvent) GetRawParams() json.RawMessage { return e.RawParams }
 type InitializeRequestEvent struct{ BaseEvent }
 type ShutdownRequestEvent struct{ BaseEvent }
 type CompletionRequestEvent struct{ BaseEvent }
-type HoverRequestEvent struct{ BaseEvent } // Added Hover
+type HoverRequestEvent struct{ BaseEvent }      // Added Hover
+type DefinitionRequestEvent struct{ BaseEvent } // ** ADDED: Cycle 3 **
 
 // --- Notification Events ---
 type InitializedNotificationEvent struct{ BaseEvent }
@@ -265,7 +267,8 @@ type WorkspaceClientCapabilities struct {
 // TextDocumentClientCapabilities text document specific client capabilities.
 type TextDocumentClientCapabilities struct {
 	Completion *CompletionClientCapabilities `json:"completion,omitempty"`
-	Hover      *HoverClientCapabilities      `json:"hover,omitempty"` // Added Hover
+	Hover      *HoverClientCapabilities      `json:"hover,omitempty"`      // Added Hover
+	Definition *DefinitionClientCapabilities `json:"definition,omitempty"` // ** ADDED: Cycle 3 **
 	// Add other text document capabilities if needed
 }
 
@@ -284,6 +287,13 @@ type HoverClientCapabilities struct { // Added Hover
 	ContentFormat []MarkupKind `json:"contentFormat,omitempty"` // e.g., ["markdown", "plaintext"]
 }
 
+// DefinitionClientCapabilities client capabilities for definition.
+// ** ADDED: Cycle 3 **
+type DefinitionClientCapabilities struct {
+	// Currently no specific options, but structure allows future expansion
+	LinkSupport bool `json:"linkSupport,omitempty"` // Example: If client supports LocationLink
+}
+
 // InitializeResult result of the initialize request.
 type InitializeResult struct {
 	Capabilities ServerCapabilities `json:"capabilities"`
@@ -295,6 +305,7 @@ type ServerCapabilities struct {
 	TextDocumentSync   *TextDocumentSyncOptions `json:"textDocumentSync,omitempty"`
 	CompletionProvider *CompletionOptions       `json:"completionProvider,omitempty"` // Use options struct if needed
 	HoverProvider      bool                     `json:"hoverProvider,omitempty"`      // Added Hover (can be HoverOptions{} too)
+	DefinitionProvider bool                     `json:"definitionProvider,omitempty"` // ** ADDED: Cycle 3 ** (can be DefinitionOptions{})
 }
 
 // TextDocumentSyncOptions options for text document synchronization.
@@ -439,6 +450,21 @@ const (
 	MarkupKindPlainText MarkupKind = "plaintext"
 	MarkupKindMarkdown  MarkupKind = "markdown"
 )
+
+// Added Definition Structures
+// ** ADDED: Cycle 3 **
+type DefinitionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+}
+
+// DefinitionResult can be Location, []Location, or LocationLink[]
+// For simplicity, we'll start with []Location (or Location).
+// Using 'any' allows flexibility, but specific type is better if known.
+// type DefinitionResult = Location // Single location
+type DefinitionResult = []Location // Multiple locations (e.g., for interfaces)
+
+// type LocationLink struct { ... } // More complex alternative
 
 // Added window/showMessage Structures
 type MessageType int
@@ -723,6 +749,8 @@ func parseMessageToEvent(content []byte) Event {
 			return CompletionRequestEvent{BaseEvent: base}
 		case "textDocument/hover": // Added Hover
 			return HoverRequestEvent{BaseEvent: base}
+		case "textDocument/definition": // ** ADDED: Cycle 3 **
+			return DefinitionRequestEvent{BaseEvent: base}
 		default:
 			slog.Warn("Received unknown request method", "method", method, "requestID", base.RequestID)
 			// Return UnknownEvent for unhandled requests
@@ -814,6 +842,9 @@ func runDispatcher() {
 				isResourceIntensive = true // Calls Analyze + LLM
 			case HoverRequestEvent:
 				baseHandler = hoverHandler
+				isResourceIntensive = true // Calls Analyze
+			case DefinitionRequestEvent: // ** ADDED: Cycle 3 **
+				baseHandler = definitionHandler
 				isResourceIntensive = true // Calls Analyze
 			// --- Notifications ---
 			case InitializedNotificationEvent:
@@ -1123,6 +1154,7 @@ func initializeHandler(ctx context.Context, event Event, logger *slog.Logger) (r
 			TextDocumentSync:   &TextDocumentSyncOptions{OpenClose: true, Change: TextDocumentSyncKindFull},
 			CompletionProvider: &CompletionOptions{},
 			HoverProvider:      true, // Advertise hover support
+			DefinitionProvider: true, // ** ADDED: Cycle 3 ** Advertise definition support
 		},
 		ServerInfo: &ServerInfo{Name: "DeepComplete LSP", Version: appVersion},
 	}
@@ -1372,6 +1404,120 @@ func hoverHandler(ctx context.Context, event Event, logger *slog.Logger) (result
 	}
 
 	return hoverResult, nil // Return HoverResult (or nil)
+}
+
+// ** ADDED: Cycle 3 **
+// definitionHandler handles 'textDocument/definition'.
+func definitionHandler(ctx context.Context, event Event, logger *slog.Logger) (result any, errObj *ErrorObject) {
+	logger.Info("Core handler: definition")
+	var params DefinitionParams
+
+	// 1. Parse and Validate Parameters
+	if event.GetRawParams() == nil {
+		return nil, &ErrorObject{Code: InvalidParams, Message: "Missing parameters for definition"}
+	}
+	if err := json.Unmarshal(event.GetRawParams(), &params); err != nil {
+		logger.Error("Failed to unmarshal definition params", "error", err)
+		return nil, &ErrorObject{Code: InvalidParams, Message: fmt.Sprintf("Invalid params for definition: %v", err)}
+	}
+	// Validate position
+	if params.Position.Line < 0 || params.Position.Character < 0 {
+		logger.Error("Invalid definition params: negative position", "line", params.Position.Line, "char", params.Position.Character)
+		return nil, &ErrorObject{Code: InvalidParams, Message: "Invalid position: line and character must be non-negative."}
+	}
+	// Validate URI and get path
+	absPath, pathErr := deepcomplete.ValidateAndGetFilePath(string(params.TextDocument.URI), logger) // Use string cast
+	if pathErr != nil {
+		logger.Error("Invalid definition params: bad URI", "uri", params.TextDocument.URI, "error", pathErr)
+		return nil, &ErrorObject{Code: InvalidParams, Message: fmt.Sprintf("Invalid document URI: %v", pathErr)}
+	}
+	logger = logger.With("uri", string(params.TextDocument.URI), "path", absPath)
+
+	// 2. Get Document State
+	docStoreMutex.RLock()
+	docInfo, ok := documentStore[params.TextDocument.URI]
+	if ok {
+		docInfo.LastAccess = time.Now()
+	} // Conceptual LRU update
+	docStoreMutex.RUnlock()
+	if !ok {
+		logger.Error("Document not found for definition")
+		return nil, nil // Return nil result for missing doc
+	}
+
+	// 3. Convert Position
+	lspPos := deepcomplete.LSPPosition{Line: params.Position.Line, Character: params.Position.Character}
+	line, col, _, posErr := deepcomplete.LspPositionToBytePosition(docInfo.Content, lspPos)
+	if posErr != nil {
+		logger.Error("Error converting LSP position for definition", "error", posErr)
+		return nil, nil // Return nil result for bad position
+	}
+
+	// 4. Call Analyzer
+	if completer == nil || completer.GetAnalyzer() == nil {
+		logger.Error("Analyzer not available for definition request")
+		return nil, nil // Return nil result
+	}
+	analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 30*time.Second) // Use request ctx as parent
+	defer cancelAnalysis()
+	analysisInfo, analysisErr := completer.GetAnalyzer().Analyze(analysisCtx, absPath, docInfo.Version, line, col)
+
+	if analysisErr != nil && !errors.Is(analysisErr, deepcomplete.ErrAnalysisFailed) {
+		logger.Error("Fatal error during analysis/cache check for definition", "error", analysisErr)
+		return nil, &ErrorObject{Code: InternalError, Message: "Failed to analyze code for definition."} // Return internal error
+	}
+	if analysisErr != nil {
+		logger.Warn("Analysis for definition completed with errors", "error", analysisErr)
+		sendShowMessageNotification(MessageTypeWarning, fmt.Sprintf("Analysis issues during definition lookup: %v", analysisErr))
+	}
+	if analysisInfo == nil {
+		logger.Warn("Analysis for definition returned nil info")
+		return nil, nil // Return nil result
+	}
+	if analysisCtx.Err() != nil {
+		logger.Warn("Analysis context cancelled or timed out during definition", "error", analysisCtx.Err())
+		return nil, nil // Return nil result for timeout/cancellation
+	}
+
+	// 5. Find Definition Location
+	if analysisInfo.IdentifierObject == nil {
+		logger.Debug("No identifier object found at cursor for definition")
+		return nil, nil // Return nil result (no definition found)
+	}
+
+	obj := analysisInfo.IdentifierObject
+	defPos := obj.Pos()
+	if !defPos.IsValid() {
+		logger.Debug("Definition position is invalid for object", "object", obj.Name())
+		return nil, nil // Return nil result (no definition found)
+	}
+
+	// Get the token.FileSet from the analysis info
+	if analysisInfo.TargetFileSet == nil {
+		logger.Error("Cannot get definition location: TargetFileSet is nil in analysis info")
+		return nil, nil // Cannot proceed without FileSet
+	}
+	fset := analysisInfo.TargetFileSet
+
+	// Get the token.File containing the definition
+	defTokenFile := fset.File(defPos)
+	if defTokenFile == nil {
+		logger.Error("Cannot get definition location: token.File not found for definition position", "pos", defPos)
+		return nil, nil // Cannot proceed without token.File
+	}
+
+	// Convert definition token.Pos to LSP Location
+	defLocation, locErr := tokenPosToLSPLocation(defTokenFile, defPos, logger)
+	if locErr != nil {
+		logger.Error("Failed to convert definition position to LSP Location", "error", locErr)
+		return nil, nil // Return nil result
+	}
+
+	logger.Info("Found definition location", "object", obj.Name(), "location", defLocation)
+
+	// LSP DefinitionResult can be Location or []Location.
+	// For simplicity, return a single Location in a slice.
+	return []Location{*defLocation}, nil
 }
 
 // ============================================================================
@@ -2024,4 +2170,130 @@ func formatObjectForHover(obj types.Object, analysisInfo *deepcomplete.AstContex
 	}
 	logger.Debug("Formatted hover content", "object", obj.Name(), "content_length", len(finalContent))
 	return finalContent
+}
+
+// ** ADDED: Cycle 3 **
+// tokenPosToLSPLocation converts a token.Pos to an LSP Location.
+// Requires the token.File containing the position.
+func tokenPosToLSPLocation(file *token.File, pos token.Pos, logger *slog.Logger) (*Location, error) {
+	if file == nil {
+		return nil, errors.New("cannot convert position: token.File is nil")
+	}
+	if !pos.IsValid() {
+		return nil, errors.New("cannot convert position: token.Pos is invalid")
+	}
+
+	// Get the 0-based offset within the file
+	offset := file.Offset(pos)
+	if offset < 0 || offset > file.Size() {
+		return nil, fmt.Errorf("invalid offset %d calculated from pos %d in file %s (size %d)", offset, pos, file.Name(), file.Size())
+	}
+
+	// Read the entire file content to convert byte offset to LSP line/char
+	// This is inefficient but necessary without a pre-built line index or similar.
+	// TODO: Optimization: Cache file content or line index map if performance becomes an issue.
+	content, err := os.ReadFile(file.Name())
+	if err != nil {
+		logger.Error("Failed to read file content for position conversion", "file", file.Name(), "error", err)
+		return nil, fmt.Errorf("failed to read file %s for position conversion: %w", file.Name(), err)
+	}
+
+	// Convert 0-based byte offset to 0-based LSP line/char
+	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger)
+	if convErr != nil {
+		return nil, fmt.Errorf("failed converting byte offset %d to LSP position: %w", offset, convErr)
+	}
+
+	// Construct file URI
+	fileURI := filepath.ToSlash(file.Name()) // Ensure forward slashes
+	if !strings.HasPrefix(fileURI, "/") {
+		// Ensure it's an absolute path before adding file:// scheme
+		absPath, absErr := filepath.Abs(fileURI)
+		if absErr != nil {
+			logger.Warn("Could not get absolute path for URI conversion", "path", fileURI, "error", absErr)
+			// Proceed with potentially relative path? Risky.
+		} else {
+			fileURI = absPath
+		}
+	}
+	// On Windows, ensure leading slash for file URI (e.g., file:///C:/...)
+	if runtime.GOOS == "windows" && len(fileURI) > 1 && fileURI[1] == ':' {
+		fileURI = "/" + fileURI
+	}
+	lspFileURI := DocumentURI("file://" + fileURI)
+
+	// Create LSP Position and Range (range spans just the single point for now)
+	lspPosition := Position{Line: lspLine, Character: lspChar}
+	lspRange := Range{Start: lspPosition, End: lspPosition}
+
+	return &Location{
+		URI:   lspFileURI,
+		Range: lspRange,
+	}, nil
+}
+
+// ** ADDED: Cycle 3 **
+// byteOffsetToLSPPosition converts a 0-based byte offset to 0-based LSP line/char (UTF-16).
+func byteOffsetToLSPPosition(content []byte, targetByteOffset int, logger *slog.Logger) (line, char uint32, err error) {
+	if content == nil {
+		return 0, 0, errors.New("content is nil")
+	}
+	if targetByteOffset < 0 {
+		return 0, 0, fmt.Errorf("invalid targetByteOffset: %d", targetByteOffset)
+	}
+	if targetByteOffset > len(content) {
+		// Allow offset at EOF, treat as end of last line
+		targetByteOffset = len(content)
+		logger.Debug("targetByteOffset exceeds content length, clamping to EOF", "offset", targetByteOffset, "content_len", len(content))
+		// return 0, 0, fmt.Errorf("targetByteOffset %d exceeds content length %d", targetByteOffset, len(content))
+	}
+
+	currentLine := uint32(0)
+	currentByteOffset := 0
+	currentLineStartByteOffset := 0
+
+	for currentByteOffset < targetByteOffset {
+		r, size := utf8.DecodeRune(content[currentByteOffset:])
+		if r == utf8.RuneError && size <= 1 {
+			return 0, 0, fmt.Errorf("invalid UTF-8 sequence at byte offset %d", currentByteOffset)
+		}
+		if r == '\n' {
+			currentLine++
+			currentLineStartByteOffset = currentByteOffset + size
+		}
+		currentByteOffset += size
+	}
+
+	// Now currentByteOffset >= targetByteOffset.
+	// Calculate the UTF-16 character offset from the start of the current line.
+	lineContentBytes := content[currentLineStartByteOffset:targetByteOffset]
+	utf16CharOffset, convErr := bytesToUTF16Offset(lineContentBytes, logger)
+	if convErr != nil {
+		// Log error but try to return best guess position
+		logger.Error("Error converting line bytes to UTF16 offset", "error", convErr, "line", currentLine)
+		// Fallback: approximate using byte count (incorrect for multi-byte chars)
+		utf16CharOffset = len(lineContentBytes)
+	}
+
+	return currentLine, uint32(utf16CharOffset), nil
+}
+
+// ** ADDED: Cycle 3 **
+// bytesToUTF16Offset calculates the number of UTF-16 code units for a byte slice.
+func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
+	utf16Offset := 0
+	byteOffset := 0
+	for byteOffset < len(bytes) {
+		r, size := utf8.DecodeRune(bytes[byteOffset:])
+		if r == utf8.RuneError && size <= 1 {
+			return utf16Offset, fmt.Errorf("%w at byte offset %d within slice", ErrInvalidUTF8, byteOffset)
+		}
+		if r > 0xFFFF {
+			utf16Offset += 2 // Surrogate pair
+		} else {
+			utf16Offset += 1
+		}
+		byteOffset += size
+	}
+	return utf16Offset, nil
 }
