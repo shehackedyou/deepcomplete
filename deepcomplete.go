@@ -1029,6 +1029,7 @@ func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 // InvalidateMemoryCacheForURI clears relevant entries from the ristretto cache.
 // Cycle 9: Added method.
 // **FIX:** Changed DocumentURI to string.
+// ** Cycle 4: Implement cache clearing **
 func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int) error {
 	logger := slog.Default().With("uri", uri, "version", version)
 	a.mu.Lock()
@@ -1040,23 +1041,33 @@ func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int
 		return nil
 	}
 
-	logger.Info("Invalidating memory cache (placeholder logic)")
-	// --- Placeholder Invalidation Logic ---
-	// This is highly dependent on the key structure chosen in Cycle 9, Step 3.
-	// Option 1: Clear the entire cache (simple, blunt)
-	// memCache.Clear()
-	// logger.Warn("Cleared entire memory cache due to document change (inefficient).")
+	// --- Cycle 4: Clear entire cache ---
+	// Clearing the entire cache is the simplest way to ensure correctness
+	// when a file changes, as Ristretto doesn't easily support targeted
+	// deletion by URI/version prefix without extra indexing.
+	logger.Warn("Clearing entire Ristretto memory cache due to document change.", "uri", uri)
+	memCache.Clear()
+	// memCache.Wait() // Wait for clear operation to complete? Optional.
+	// --- End Cycle 4 Change ---
 
-	// Option 2: Delete keys based on prefix (requires specific key design)
-	// Example: If keys are "scope:<uri>:<version>:...", "preamble:<uri>:<version>:..."
-	// We would need a way to find/delete keys matching "scope:<uri>:<version>".
-	// Ristretto doesn't directly support prefix deletion. This might involve:
-	//   a) Keeping a separate index (e.g., map[string][]cacheKey).
-	//   b) Iterating through *all* keys (if possible via metrics/internal access - not standard API).
-	//   c) Using a different cache library with prefix support.
-
-	// For now, log that invalidation is needed but not fully implemented.
-	logger.Warn("Memory cache invalidation logic is currently a placeholder and may not remove all stale entries.")
+	// --- Original Placeholder Logic (Commented Out) ---
+	// logger.Info("Invalidating memory cache (placeholder logic)")
+	// // --- Placeholder Invalidation Logic ---
+	// // This is highly dependent on the key structure chosen in Cycle 9, Step 3.
+	// // Option 1: Clear the entire cache (simple, blunt)
+	// // memCache.Clear()
+	// // logger.Warn("Cleared entire memory cache due to document change (inefficient).")
+	//
+	// // Option 2: Delete keys based on prefix (requires specific key design)
+	// // Example: If keys are "scope:<uri>:<version>:...", "preamble:<uri>:<version>:..."
+	// // We would need a way to find/delete keys matching "scope:<uri>:<version>".
+	// // Ristretto doesn't directly support prefix deletion. This might involve:
+	// //   a) Keeping a separate index (e.g., map[string][]cacheKey).
+	// //   b) Iterating through *all* keys (if possible via metrics/internal access - not standard API).
+	// //   c) Using a different cache library with prefix support.
+	//
+	// // For now, log that invalidation is needed but not fully implemented.
+	// logger.Warn("Memory cache invalidation logic is currently a placeholder and may not remove all stale entries.")
 	// --- End Placeholder ---
 
 	return nil
