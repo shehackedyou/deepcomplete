@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"go/types"
 	"io"
-	"log"              // Used only for initial fatal errors
+	stlog "log"        // Cycle 1: Rename standard log to avoid conflict with slog
 	"log/slog"         // Cycle 3: Added slog
 	"net/http"         // Cycle 3: Added http
 	_ "net/http/pprof" // Cycle 3: Added pprof endpoint registration
@@ -102,6 +102,7 @@ const (
 	RequestCancelled     int = -32800
 	ServerNotInitialized int = -32002 // Example: If request comes before 'initialize' finishes
 	ServerBusy           int = -32000 // Example: Using generic code for busy/timeout
+	RequestFailed        int = -32803 // LSP spec: Error code indicating that a request failed but it was syntactically correct, e.g the method name was known and the parameters were valid. The error message should contain human readable information about why the request failed.
 )
 
 // ============================================================================
@@ -463,19 +464,64 @@ func main() {
 	// Setup logging *before* initializing slog
 	logFile, err := os.OpenFile("deepcomplete-lsp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 	if err != nil {
-		log.Fatalf("Failed to open log file: %v", err) // Use standard log for initial fatal error
+		stlog.Fatalf("Failed to open log file: %v", err) // Use standard log for initial fatal error
 	}
 	defer logFile.Close()
 
-	// Initialize slog (Cycle 3)
-	logLevel := slog.LevelDebug // TODO: Make configurable via flag/env
+	// Initialize core service *first* to get config for log level
+	var initErr error
+	completer, initErr = deepcomplete.NewDeepCompleter()
+	if initErr != nil {
+		// Log initial error using a temporary basic logger
+		tempLogger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logFile), &slog.HandlerOptions{Level: slog.LevelWarn}))
+		tempLogger.Error("Failed to initialize DeepCompleter service", "error", initErr)
+		if errors.Is(initErr, deepcomplete.ErrConfig) {
+			// Try to send notification even if completer init failed due to config warnings
+			// Note: This requires the notification queue to be initialized, which happens later.
+			// Consider if this notification is critical or can be skipped on early init failure.
+			// For now, we'll proceed, but notification might not be sent.
+		} else {
+			// Treat other init errors as fatal
+			os.Exit(1)
+		}
+		// Continue if it was just a config warning, completer might use defaults
+		if completer == nil {
+			os.Exit(1) // Exit if completer is still nil
+		}
+	}
+	defer func() {
+		// Use the final configured logger for shutdown messages
+		slog.Info("Closing DeepCompleter service...")
+		if err := completer.Close(); err != nil {
+			slog.Error("Error closing completer", "error", err)
+		}
+	}()
+
+	// ** Cycle 1: Get log level from config **
+	initialConfig := completer.GetCurrentConfig()
+	logLevel, parseLevelErr := deepcomplete.ParseLogLevel(initialConfig.LogLevel)
+	if parseLevelErr != nil {
+		// Should not happen if config validation worked, but handle defensively
+		logLevel = slog.LevelInfo // Default to Info
+		slog.Warn("Error parsing configured log level, using default", "config_level", initialConfig.LogLevel, "default", "info", "error", parseLevelErr)
+	}
+
+	// Initialize slog (Cycle 3 & Cycle 1)
 	logWriter := io.MultiWriter(os.Stderr, logFile)
+	// Use the parsed logLevel from config
 	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: true}
 	handler := slog.NewTextHandler(logWriter, &handlerOpts)
 	logger := slog.New(handler)
-	slog.SetDefault(logger)
+	slog.SetDefault(logger) // Set the configured logger as default
 
-	slog.Info("DeepComplete LSP server starting...", "version", appVersion)
+	// Now log standard messages using the configured logger
+	slog.Info("DeepComplete LSP server starting...", "version", appVersion, "log_level", logLevel.String())
+	if initErr != nil && errors.Is(initErr, deepcomplete.ErrConfig) {
+		// Attempt notification now that queues might be set up later
+		// Still might race, but better chance than before
+		sendShowMessageNotification(MessageTypeWarning, fmt.Sprintf("Configuration loaded with warnings: %v", initErr))
+	}
+	slog.Info("DeepComplete service initialized.") // Log service init confirmation
 
 	// Enable profiling rates (Cycle 3)
 	runtime.SetBlockProfileRate(1)
@@ -500,31 +546,6 @@ func main() {
 			slog.Error("Debug server failed", "error", err)
 		}
 	}()
-
-	// Initialize core service
-	var initErr error
-	completer, initErr = deepcomplete.NewDeepCompleter()
-	if initErr != nil {
-		slog.Error("Failed to initialize DeepCompleter service", "error", initErr)
-		if errors.Is(initErr, deepcomplete.ErrConfig) {
-			// Try to send notification even if completer init failed due to config warnings
-			sendShowMessageNotification(MessageTypeWarning, fmt.Sprintf("Configuration loaded with warnings: %v", initErr))
-		} else {
-			// Treat other init errors as fatal for now
-			os.Exit(1)
-		}
-		// Continue if it was just a config warning, completer might use defaults
-		if completer == nil {
-			os.Exit(1) // Exit if completer is still nil
-		}
-	}
-	defer func() {
-		slog.Info("Closing DeepCompleter service...")
-		if err := completer.Close(); err != nil {
-			slog.Error("Error closing completer", "error", err)
-		}
-	}()
-	slog.Info("DeepComplete service initialized.")
 
 	// Initialize queues, shutdown channel, and semaphore
 	eventQueue = make(chan Event, defaultQueueSize)
@@ -893,7 +914,7 @@ func runDispatcher() {
 						reqLogger.Error("Error occurred processing notification within middleware", "error", errObj)
 						errorsReported.Add(1)
 					}
-				}(wrappedHandler, ev, eventLogger, isResourceIntensive) // Pass copies
+				}(wrappedHandler, event, eventLogger, isResourceIntensive) // Pass copies
 			}
 		}
 	}
@@ -1600,6 +1621,7 @@ func handleDidChangeConfigurationNotification(ctx context.Context, event DidChan
 	updateIfChanged("model", func(val gjson.Result) { newConfig.Model = val.String() })
 	updateIfChanged("max_tokens", func(val gjson.Result) { newConfig.MaxTokens = int(val.Int()) })
 	updateIfChanged("temperature", func(val gjson.Result) { newConfig.Temperature = val.Float() })
+	updateIfChanged("log_level", func(val gjson.Result) { newConfig.LogLevel = val.String() }) // **ADDED: Cycle 1** Update log level
 	updateIfChanged("use_ast", func(val gjson.Result) { newConfig.UseAst = val.Bool() })
 	updateIfChanged("use_fim", func(val gjson.Result) { newConfig.UseFim = val.Bool() })
 	updateIfChanged("max_preamble_len", func(val gjson.Result) { newConfig.MaxPreambleLen = int(val.Int()) })
@@ -1629,7 +1651,13 @@ func handleDidChangeConfigurationNotification(ctx context.Context, event DidChan
 			sendShowMessageNotification(MessageTypeError, fmt.Sprintf("Failed to apply configuration: %v", err)) // Notify user
 		} else {
 			logger.Info("Successfully applied updated configuration from client.")
-			// Optionally send info message: sendShowMessageNotification(MessageTypeInfo, "DeepComplete configuration updated.")
+			// ** Cycle 1: Optionally restart logger with new level? **
+			// This is complex as it involves changing the global logger or passing loggers around.
+			// For now, the logger level is set at startup. A restart might be needed for level change to take effect.
+			// Consider sending a notification that a restart might be needed for log level changes.
+			if settingsGroup.Get(configPrefix + "log_level").Exists() {
+				sendShowMessageNotification(MessageTypeInfo, "Log level configuration changed. Restart LSP server for change to take full effect.")
+			}
 		}
 	} else {
 		logger.Info("No relevant configuration changes detected in notification.")
@@ -1720,7 +1748,8 @@ func sendShowMessageNotification(level MessageType, message string) {
 	// Use default logger for this helper
 	logger := slog.Default()
 	if notificationQueue == nil {
-		logger.Error("Cannot send notification, queue not initialized", "level", level, "message", message)
+		// ** Cycle 1: Log error if queue not ready **
+		logger.Error("Cannot send notification, queue not initialized or closed", "level", level, "message", message)
 		return
 	}
 	params := ShowMessageParams{Type: level, Message: message}
