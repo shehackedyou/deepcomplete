@@ -154,8 +154,41 @@ type FileConfig struct {
 	MaxSnippetLen  *int      `json:"max_snippet_len"`
 }
 
+// ** ADDED: Cycle 6 ** Diagnostic Structures (Internal representation)
+// These align with LSP but are defined internally to avoid circular deps.
+type DiagnosticSeverity int
+
+const (
+	SeverityError   DiagnosticSeverity = 1
+	SeverityWarning DiagnosticSeverity = 2
+	SeverityInfo    DiagnosticSeverity = 3
+	SeverityHint    DiagnosticSeverity = 4
+)
+
+// Position represents a 0-based line/character offset (bytes).
+// Note: LSP uses UTF-16, conversion is needed when sending.
+type Position struct {
+	Line      int // 0-based
+	Character int // 0-based, byte offset within the line
+}
+
+// Range represents a range in a text document using byte offsets.
+type Range struct {
+	Start Position // Start position (inclusive)
+	End   Position // End position (exclusive or inclusive depending on usage, typically inclusive start/exclusive end)
+}
+
+// Diagnostic represents a problem found during analysis.
+type Diagnostic struct {
+	Range    Range              // The range (using byte offsets) at which the message applies.
+	Severity DiagnosticSeverity // The diagnostic's severity.
+	Code     string             // The diagnostic's code, if any (e.g., compiler error code).
+	Source   string             // Source of the diagnostic (e.g., "go", "deepcomplete").
+	Message  string             // The diagnostic's message.
+}
+
 // AstContextInfo holds structured information extracted from code analysis.
-// Updated for Cycle 8/9/Hover.
+// Updated for Cycle 8/9/Hover and Cycle 6 (Diagnostics).
 type AstContextInfo struct {
 	FilePath           string // Absolute, validated path
 	Version            int    // Document version for memory cache keying
@@ -185,6 +218,7 @@ type AstContextInfo struct {
 	VariablesInScope   map[string]types.Object
 	PromptPreamble     string // Final preamble generated (potentially cached)
 	AnalysisErrors     []error
+	Diagnostics        []Diagnostic // ** ADDED: Cycle 6 ** Store diagnostics found.
 	// Potentially add CommentMap here if needed for hover doc lookup
 	// CommentMap         ast.CommentMap
 }
@@ -213,7 +247,9 @@ type OllamaResponse struct {
 type CachedAnalysisData struct {
 	PackageName    string
 	PromptPreamble string
-	// Add other easily serializable, frequently reused data if needed
+	// ** ADDED: Cycle 6 ** Cache diagnostics as well?
+	// Diagnostics    []Diagnostic // Consider if diagnostics should be part of the cache. Might become stale quickly.
+	// For now, let's NOT cache diagnostics, recalculate them on load.
 }
 
 // CachedAnalysisEntry represents the full structure stored in bbolt.
@@ -767,7 +803,7 @@ func (a *GoPackagesAnalyzer) Close() error {
 }
 
 // Analyze performs code analysis, orchestrating calls to helpers.
-// Updated for Cycle 8/9/Hover/Defensive.
+// Updated for Cycle 8/9/Hover/Defensive and Cycle 6 (Diagnostics).
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, version int, line, col int) (info *AstContextInfo, analysisErr error) {
 	// Input filename should already be validated absolute path by caller
 	logger := slog.Default().With("absFile", absFilename, "version", version, "line", line, "col", col)
@@ -778,7 +814,8 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		Version:          version,
 		VariablesInScope: make(map[string]types.Object),
 		AnalysisErrors:   make([]error, 0),
-		CallArgIndex:     -1, // Initialize to -1
+		Diagnostics:      make([]Diagnostic, 0), // ** ADDED: Cycle 6 ** Initialize diagnostics slice
+		CallArgIndex:     -1,                    // Initialize to -1
 	}
 
 	// Panic recovery for the entire analysis process
@@ -786,7 +823,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		if r := recover(); r != nil {
 			panicErr := fmt.Errorf("internal panic during analysis: %v", r)
 			logger.Error("Panic recovered during Analyze", "error", r, "stack", string(debug.Stack()))
-			addAnalysisError(info, panicErr, logger)
+			addAnalysisError(info, panicErr, logger) // Log panic as analysis error
 			// Ensure analysisErr reflects the panic if no other error was set
 			if analysisErr == nil {
 				analysisErr = panicErr
@@ -873,6 +910,10 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 					loadDuration = time.Since(decodeStart)
 					logger.Debug("Analysis data successfully decoded from bbolt cache.", "duration", loadDuration)
 					logger.Debug("Using cached preamble. Skipping packages.Load and analysis steps.", "preamble_length", len(info.PromptPreamble))
+					// ** ADDED: Cycle 6 ** Need to re-run load and steps to get diagnostics even on cache hit.
+					// Diagnostics are not cached.
+					logger.Debug("Re-running load/analysis steps for diagnostics despite cache hit.")
+					cacheHit = false // Force re-analysis for diagnostics
 				} else {
 					logger.Warn("Failed to gob-decode cached analysis data. Treating as miss.", "error", decodeErr)
 					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr), logger)
@@ -893,9 +934,9 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		logger.Debug("Bbolt cache disabled (db handle is nil).")
 	}
 
-	// --- Perform Full Analysis if Cache Miss ---
+	// --- Perform Full Analysis if Cache Miss (or for Diagnostics) ---
 	if !cacheHit {
-		logger.Debug("Bbolt cache miss or invalid. Performing full analysis...", "key", string(cacheKey))
+		logger.Debug("Bbolt cache miss or invalid (or re-running for diagnostics). Performing full analysis...", "key", string(cacheKey))
 
 		// --- Step 1: Load Package Info ---
 		loadStart := time.Now()
@@ -907,6 +948,13 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		logger.Debug("packages.Load completed", "duration", loadDuration)
 		for _, loadErr := range loadErrors {
 			addAnalysisError(info, loadErr, logger)
+			// ** ADDED: Cycle 6 ** Convert packages.Error to Diagnostic
+			if pkgErr, ok := loadErr.(*packages.Error); ok {
+				diag := packagesErrorToDiagnostic(*pkgErr, fset, logger)
+				if diag != nil {
+					info.Diagnostics = append(info.Diagnostics, *diag)
+				}
+			}
 		}
 		info.TargetPackage = targetPkg     // Store package info
 		info.TargetAstFile = targetFileAST // Store AST
@@ -918,6 +966,8 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 			analyzeStepErr := performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, a, info, logger)
 			if analyzeStepErr != nil {
 				addAnalysisError(info, analyzeStepErr, logger)
+				// ** ADDED: Cycle 6 ** Consider adding diagnostics for analysisStepErr?
+				// For now, just log as analysis error.
 			}
 		} else {
 			// Log error if targetFile is nil but loading didn't report critical error earlier
@@ -931,36 +981,42 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		logger.Debug("Analysis steps completed", "duration", stepsDuration)
 
 		// --- Step 3: Build Preamble ---
-		preambleStart := time.Now()
-		var qualifier types.Qualifier
-		if targetPkg != nil && targetPkg.Types != nil {
-			if info.PackageName == "" {
-				info.PackageName = targetPkg.Types.Name()
-			}
-			qualifier = types.RelativeTo(targetPkg.Types)
-		} else {
-			qualifier = func(other *types.Package) string {
-				if other != nil {
-					return other.Path()
+		// Only build preamble if it wasn't loaded from cache
+		if info.PromptPreamble == "" {
+			preambleStart := time.Now()
+			var qualifier types.Qualifier
+			if targetPkg != nil && targetPkg.Types != nil {
+				if info.PackageName == "" {
+					info.PackageName = targetPkg.Types.Name()
 				}
-				return ""
+				qualifier = types.RelativeTo(targetPkg.Types)
+			} else {
+				qualifier = func(other *types.Package) string {
+					if other != nil {
+						return other.Path()
+					}
+					return ""
+				}
+				logger.Debug("Building preamble with limited/no type info.")
 			}
-			logger.Debug("Building preamble with limited/no type info.")
+			// Call refactored helper (Cycle 8), passing analyzer for potential future caching (Cycle 9)
+			info.PromptPreamble = constructPromptPreamble(a, info, qualifier, logger)
+			preambleDuration = time.Since(preambleStart)
+			logger.Debug("Preamble construction completed", "duration", preambleDuration)
+		} else {
+			logger.Debug("Skipping preamble construction (loaded from cache or already built).")
 		}
-		// Call refactored helper (Cycle 8), passing analyzer for potential future caching (Cycle 9)
-		info.PromptPreamble = constructPromptPreamble(a, info, qualifier, logger)
-		preambleDuration = time.Since(preambleStart)
-		logger.Debug("Preamble construction completed", "duration", preambleDuration)
 
 		// --- Step 4: Save to Bbolt Cache ---
-		// Save only if analysis didn't have critical load errors and preamble was generated
+		// Save preamble (but not diagnostics) if analysis didn't have critical load errors
 		shouldSave := a.db != nil && info.PromptPreamble != "" && len(loadErrors) == 0
 		if shouldSave {
-			// ... (bbolt cache save logic as before, using logger) ...
-			logger.Debug("Attempting to save analysis results to bbolt cache.", "key", string(cacheKey))
+			// ... (bbolt cache save logic as before, using logger, caching only preamble/pkgname) ...
+			logger.Debug("Attempting to save analysis results (preamble) to bbolt cache.", "key", string(cacheKey))
 			saveStart := time.Now()
 			inputHashes, hashErr := calculateInputHashes(dir, targetPkg)
 			if hashErr == nil {
+				// *** Cycle 6: Only cache preamble/pkgname, NOT diagnostics ***
 				analysisDataToCache := CachedAnalysisData{PackageName: info.PackageName, PromptPreamble: info.PromptPreamble}
 				var gobBuf bytes.Buffer
 				if encodeErr := gob.NewEncoder(&gobBuf).Encode(&analysisDataToCache); encodeErr == nil {
@@ -978,7 +1034,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 							return b.Put(cacheKey, encodedBytes)
 						})
 						if saveErr == nil {
-							logger.Debug("Saved analysis results to bbolt cache", "key", string(cacheKey), "duration", time.Since(saveStart))
+							logger.Debug("Saved analysis results (preamble) to bbolt cache", "key", string(cacheKey), "duration", time.Since(saveStart))
 						} else {
 							logger.Warn("Failed to write to bbolt cache", "key", string(cacheKey), "error", saveErr)
 							addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheWrite, saveErr), logger)
@@ -998,12 +1054,14 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	}
 
 	// Log final timing summary
-	if cacheHit {
-		logger.Info("Context analysis finished (bbolt cache hit)", "decode_duration", loadDuration)
+	// ** Cycle 6: Adjusted log message based on cacheHit logic change **
+	if info.PromptPreamble != "" && len(info.Diagnostics) == 0 && analysisErr == nil {
+		logger.Info("Context analysis finished (cache hit for preamble, re-analyzed for diagnostics)", "decode_duration", loadDuration)
 	} else {
 		logger.Info("Context analysis finished (full analysis)", "load_duration", loadDuration, "steps_duration", stepsDuration, "preamble_duration", preambleDuration)
 	}
 	logger.Debug("Final Context Preamble generated", "length", len(info.PromptPreamble))
+	logger.Debug("Final Diagnostics collected", "count", len(info.Diagnostics)) // ** ADDED: Cycle 6 **
 
 	// Return info and potentially wrapped non-fatal errors (handled by defer)
 	return info, analysisErr
@@ -1049,26 +1107,6 @@ func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int
 	memCache.Clear()
 	// memCache.Wait() // Wait for clear operation to complete? Optional.
 	// --- End Cycle 4 Change ---
-
-	// --- Original Placeholder Logic (Commented Out) ---
-	// logger.Info("Invalidating memory cache (placeholder logic)")
-	// // --- Placeholder Invalidation Logic ---
-	// // This is highly dependent on the key structure chosen in Cycle 9, Step 3.
-	// // Option 1: Clear the entire cache (simple, blunt)
-	// // memCache.Clear()
-	// // logger.Warn("Cleared entire memory cache due to document change (inefficient).")
-	//
-	// // Option 2: Delete keys based on prefix (requires specific key design)
-	// // Example: If keys are "scope:<uri>:<version>:...", "preamble:<uri>:<version>:..."
-	// // We would need a way to find/delete keys matching "scope:<uri>:<version>".
-	// // Ristretto doesn't directly support prefix deletion. This might involve:
-	// //   a) Keeping a separate index (e.g., map[string][]cacheKey).
-	// //   b) Iterating through *all* keys (if possible via metrics/internal access - not standard API).
-	// //   c) Using a different cache library with prefix support.
-	//
-	// // For now, log that invalidation is needed but not fully implemented.
-	// logger.Warn("Memory cache invalidation logic is currently a placeholder and may not remove all stale entries.")
-	// --- End Placeholder ---
 
 	return nil
 }

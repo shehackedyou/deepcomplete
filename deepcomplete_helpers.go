@@ -15,6 +15,7 @@ import (
 	"log/slog" // Use slog
 	"path/filepath"
 	"sort"
+	"strconv" // ** ADDED: Cycle 6 ** For parsing position string
 	"strings"
 	"time" // Cycle 9: Needed for TTL
 
@@ -38,7 +39,7 @@ func loadPackageAndFile(ctx context.Context, absFilename string, fset *token.Fil
 		Fset:    fset,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
-			packages.NeedSyntax | packages.NeedTypesInfo,
+			packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedErrors, // ** ADDED: Cycle 6 ** NeedErrors
 		// Load imports recursively? Might be too slow/memory intensive initially.
 		// Mode: packages.LoadAllSyntax, // Alternative: Load syntax for all dependencies
 		Tests: false,                                                                                   // Don't load test files initially
@@ -64,12 +65,13 @@ func loadPackageAndFile(ctx context.Context, absFilename string, fset *token.Fil
 	var targetFileAST *ast.File
 	var targetFile *token.File
 
-	// Collect all package-level errors first
+	// Collect all package-level errors first (Cycle 6: Moved error collection here)
 	for _, p := range pkgs {
 		for i := range p.Errors {
 			// Make a copy of the error to avoid loop variable capture issues if used in goroutines later
 			loadErr := p.Errors[i]
-			loadErrors = append(loadErrors, &loadErr) // Store as pointer to original error type
+			// Store as pointer to original error type to preserve details
+			loadErrors = append(loadErrors, &loadErr)
 			logger.Warn("Package loading error encountered", "package", p.PkgPath, "error", loadErr)
 		}
 	}
@@ -206,6 +208,50 @@ func performAnalysisSteps(
 		if commentErr != nil {
 			addAnalysisError(info, fmt.Errorf("failed to extract comments: %w", commentErr), logger)
 		}
+
+		// ** ADDED: Cycle 6 ** Add other analysis-based diagnostics here if needed
+		// Example: Check for unresolved identifiers found during context node identification
+		if info.IdentifierAtCursor != nil && info.IdentifierObject == nil && info.IdentifierType == nil {
+			// Check if it's a known builtin before reporting as unresolved
+			isBuiltin := false
+			if obj, _ := types.Universe.Lookup(info.IdentifierAtCursor.Name).(*types.Builtin); obj != nil {
+				isBuiltin = true
+			}
+			if !isBuiltin {
+				diag := createDiagnosticForNode(
+					fset,
+					info.IdentifierAtCursor,
+					SeverityError, // Or Warning? Depends on context. Error seems appropriate.
+					"unresolved",
+					"deepcomplete-analyzer",
+					fmt.Sprintf("unresolved identifier: %s", info.IdentifierAtCursor.Name),
+					logger,
+				)
+				if diag != nil {
+					info.Diagnostics = append(info.Diagnostics, *diag)
+				}
+			}
+		}
+		// Example: Check for unknown selector
+		if info.SelectorExpr != nil && info.SelectorExprType != nil && info.SelectorExpr.Sel != nil {
+			selName := info.SelectorExpr.Sel.Name
+			obj, _, _ := types.LookupFieldOrMethod(info.SelectorExprType, true, nil, selName)
+			if obj == nil {
+				diag := createDiagnosticForNode(
+					fset,
+					info.SelectorExpr.Sel, // Diagnose the selector identifier itself
+					SeverityError,
+					"unknown-member",
+					"deepcomplete-analyzer",
+					fmt.Sprintf("unknown member '%s' for type '%s'", selName, info.SelectorExprType.String()),
+					logger,
+				)
+				if diag != nil {
+					info.Diagnostics = append(info.Diagnostics, *diag)
+				}
+			}
+		}
+		// Add more checks as needed (e.g., type mismatches in assignments/calls if type info is reliable)
 
 	} else {
 		// AST is missing, likely due to load errors.
@@ -1171,14 +1217,7 @@ func findContextNodes(
 					addAnalysisError(info, fmt.Errorf("missing type info entry for selector base expr (%T) starting at %s", selExpr.X, posStr(selExpr.X.Pos())), logger)
 				}
 			}
-			// Check if selected member is known
-			if info.SelectorExprType != nil && selExpr.Sel != nil {
-				selName := selExpr.Sel.Name
-				obj, _, _ := types.LookupFieldOrMethod(info.SelectorExprType, true, nil, selName)
-				if obj == nil {
-					addAnalysisError(info, fmt.Errorf("selecting unknown member '%s' from type '%s'", selName, info.SelectorExprType.String()), logger)
-				}
-			}
+			// Check if selected member is known (moved to performAnalysisSteps for diagnostics)
 			return // Found context, exit
 		}
 	}
@@ -1301,7 +1340,8 @@ func findContextNodes(
 				}
 				// --- End Hover Refinement ---
 
-			} else { // Object not found in defs or uses
+			} else { // Object not found in defs or uses (check moved to performAnalysisSteps for diagnostics)
+				// Check type map as fallback
 				if typesMap != nil {
 					if tv, ok := typesMap[ident]; ok && tv.Type != nil {
 						info.IdentifierType = tv.Type
@@ -1703,4 +1743,132 @@ func withMemoryCache[T any](
 	// analyzer.memoryCache.Wait() // Optional: Wait for value to be processed by buffer
 
 	return computedResult, false, nil // Return computed value
+}
+
+// ============================================================================
+// Diagnostic Helpers (Cycle 6)
+// ============================================================================
+
+// packagesErrorToDiagnostic converts a packages.Error into our internal Diagnostic format.
+func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logger *slog.Logger) *Diagnostic {
+	if fset == nil {
+		logger.Warn("Cannot convert packages.Error to Diagnostic: FileSet is nil")
+		return nil
+	}
+
+	// Example Pos string: "file.go:line:col: message" or "file.go:line:col"
+	// Need to parse this carefully.
+	posStr := pkgErr.Pos
+	msg := pkgErr.Msg
+	kind := pkgErr.Kind // Error or Warning
+
+	// Default position if parsing fails
+	startPos := Position{Line: 0, Character: 0}
+	endPos := Position{Line: 0, Character: 1} // Default to 1 character length
+
+	parts := strings.SplitN(posStr, ":", 4)
+	if len(parts) >= 3 {
+		filename := parts[0]
+		lineNum, lineErr := strconv.Atoi(parts[1])
+		colNum, colErr := strconv.Atoi(parts[2])
+
+		if lineErr == nil && colErr == nil {
+			// Convert 1-based line/col from error string to 0-based byte position
+			startPos.Line = lineNum - 1
+			startPos.Character = colNum - 1 // Assuming col is byte-based here
+
+			// Try to determine a reasonable end position
+			// If a message exists after the position, use its length? Risky.
+			// Default to a single character range for now.
+			endPos = startPos
+			endPos.Character = startPos.Character + 1
+
+			// Refine message if it was part of the position string
+			if len(parts) == 4 {
+				msg = strings.TrimSpace(parts[3])
+			}
+		} else {
+			logger.Warn("Failed to parse line/column from packages.Error position string", "pos_string", posStr)
+			// Use default range (start of file)
+		}
+
+		// Check if filename matches one in the fileset
+		foundFile := false
+		fset.Iterate(func(f *token.File) bool {
+			if f != nil && f.Name() == filename {
+				foundFile = true
+				return false // Stop iteration
+			}
+			return true // Continue iteration
+		})
+		if !foundFile {
+			logger.Warn("Filename from packages.Error not found in FileSet", "error_filename", filename)
+			// Keep default range (start of file) or try to map? Difficult without file content.
+		}
+	} else if posStr != "" {
+		logger.Warn("Could not parse filename:line:col from packages.Error position string", "pos_string", posStr)
+		// Use default range (start of file)
+	}
+
+	severity := SeverityError
+	if kind == packages.TypeError { // Treat type errors as errors
+		severity = SeverityError
+	} // Add mapping for other kinds if needed
+
+	return &Diagnostic{
+		Range:    Range{Start: startPos, End: endPos},
+		Severity: severity,
+		Source:   "go", // Source is the Go compiler/type checker
+		Message:  msg,
+		// Code: Extract code if available/relevant
+	}
+}
+
+// createDiagnosticForNode creates a diagnostic targeting a specific AST node.
+func createDiagnosticForNode(fset *token.FileSet, node ast.Node, severity DiagnosticSeverity, code, source, message string, logger *slog.Logger) *Diagnostic {
+	if fset == nil || node == nil {
+		logger.Warn("Cannot create diagnostic for node: FileSet or Node is nil")
+		return nil
+	}
+
+	startTokenPos := node.Pos()
+	endTokenPos := node.End()
+
+	if !startTokenPos.IsValid() || !endTokenPos.IsValid() {
+		logger.Warn("Cannot create diagnostic: Node position is invalid", "node_type", fmt.Sprintf("%T", node))
+		return nil
+	}
+
+	startFilePos := fset.Position(startTokenPos)
+	endFilePos := fset.Position(endTokenPos)
+
+	if !startFilePos.IsValid() || !endFilePos.IsValid() {
+		logger.Warn("Cannot create diagnostic: FileSet position conversion failed", "node_type", fmt.Sprintf("%T", node))
+		return nil
+	}
+
+	// Convert token.Position (1-based line/col) to our internal 0-based line/char (byte offset)
+	startDiagPos := Position{
+		Line:      startFilePos.Line - 1,
+		Character: startFilePos.Column - 1,
+	}
+	endDiagPos := Position{
+		Line:      endFilePos.Line - 1,
+		Character: endFilePos.Column - 1,
+	}
+
+	// Ensure end position is not before start position
+	if endDiagPos.Line < startDiagPos.Line || (endDiagPos.Line == startDiagPos.Line && endDiagPos.Character < startDiagPos.Character) {
+		endDiagPos = startDiagPos // Make it a zero-length range at the start if end is invalid
+		endDiagPos.Character++    // Make it length 1
+		logger.Warn("Calculated end position before start position for diagnostic range, adjusting.", "node_type", fmt.Sprintf("%T", node))
+	}
+
+	return &Diagnostic{
+		Range:    Range{Start: startDiagPos, End: endDiagPos},
+		Severity: severity,
+		Code:     code,
+		Source:   source,
+		Message:  message,
+	}
 }

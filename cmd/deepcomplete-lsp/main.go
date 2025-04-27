@@ -499,6 +499,35 @@ type ShowMessageParams struct {
 	Message string      `json:"message"`
 }
 
+// ** ADDED: Cycle 6 ** Diagnostic Structures
+// DiagnosticSeverity defines the severity level of a diagnostic.
+type DiagnosticSeverity int
+
+const (
+	SeverityError   DiagnosticSeverity = 1
+	SeverityWarning DiagnosticSeverity = 2
+	SeverityInfo    DiagnosticSeverity = 3
+	SeverityHint    DiagnosticSeverity = 4
+)
+
+// Diagnostic represents a diagnostic, such as a compiler error or warning.
+type Diagnostic struct {
+	Range    Range              `json:"range"`            // The range at which the message applies.
+	Severity DiagnosticSeverity `json:"severity"`         // The diagnostic's severity.
+	Code     any                `json:"code,omitempty"`   // The diagnostic's code, which might be a number or string.
+	Source   string             `json:"source,omitempty"` // A human-readable string describing the source of this diagnostic, e.g. 'go' or 'deepcomplete'.
+	Message  string             `json:"message"`          // The diagnostic's message.
+	// RelatedInformation []DiagnosticRelatedInformation `json:"relatedInformation,omitempty"` // Optional related locations.
+	// Tags []DiagnosticTag `json:"tags,omitempty"` // Optional tags like Unnecessary or Deprecated.
+}
+
+// PublishDiagnosticsParams parameters for textDocument/publishDiagnostics notification.
+type PublishDiagnosticsParams struct {
+	URI         DocumentURI  `json:"uri"`
+	Version     *int         `json:"version,omitempty"` // Optional: The version number of the document the diagnostics are published for.
+	Diagnostics []Diagnostic `json:"diagnostics"`       // An array of diagnostic items.
+}
+
 // ============================================================================
 // Main Server Logic & Event Loop
 // ============================================================================
