@@ -8,6 +8,8 @@ import (
 	"errors"
 	"expvar" // Cycle 3: Added expvar
 	"fmt"
+	"go/ast" // ** ADDED: Cycle 2 ** Needed for hover formatting
+	// ** ADDED: Cycle 2 ** Needed for hover formatting
 	"go/types"
 	"io"
 	stlog "log"        // Cycle 1: Rename standard log to avoid conflict with slog
@@ -1351,7 +1353,7 @@ func hoverHandler(ctx context.Context, event Event, logger *slog.Logger) (result
 		obj := analysisInfo.IdentifierObject
 		logger.Debug("Found object for hover", "name", obj.Name(), "type", obj.Type().String())
 
-		// Call conceptual helper (implementation needed in deepcomplete_helpers.go)
+		// ** Cycle 2: Call the implemented local formatObjectForHover **
 		hoverContent := formatObjectForHover(obj, analysisInfo, logger)
 
 		if hoverContent != "" {
@@ -1360,6 +1362,7 @@ func hoverHandler(ctx context.Context, event Event, logger *slog.Logger) (result
 					Kind:  MarkupKindMarkdown, // Assume Markdown
 					Value: hoverContent,
 				},
+				// TODO: Optionally set Range based on analysisInfo.IdentifierAtCursor.Pos/End?
 			}
 		} else {
 			logger.Debug("Formatter returned empty content for object", "name", obj.Name())
@@ -1894,15 +1897,131 @@ func firstN(s string, n int) string {
 	return s
 }
 
-// Conceptual helper (implementation needed in deepcomplete_helpers.go)
+// ** Cycle 2: Updated hover formatting function **
+// formatObjectForHover creates a Markdown string for hover info.
+// This is now the actual implementation, copied from deepcomplete_helpers.go
 func formatObjectForHover(obj types.Object, analysisInfo *deepcomplete.AstContextInfo, logger *slog.Logger) string {
-	// Placeholder - Requires implementation in helpers file using analysisInfo
-	logger.Warn("formatObjectForHover called but using placeholder implementation")
-	if obj != nil {
-		// Basic formatting without doc comments or proper qualifier
-		qualifier := func(other *types.Package) string { return "" } // Dummy qualifier
-		definition := types.ObjectString(obj, qualifier)
-		return fmt.Sprintf("```go\n%s\n```\n\n(Documentation lookup not implemented)", definition)
+	if obj == nil {
+		logger.Debug("formatObjectForHover called with nil object")
+		return ""
 	}
-	return ""
+
+	var hoverText strings.Builder
+
+	// --- 1. Format Definition ---
+	var qualifier types.Qualifier
+	// Use TargetPackage from analysisInfo if available
+	if analysisInfo != nil && analysisInfo.TargetPackage != nil && analysisInfo.TargetPackage.Types != nil {
+		qualifier = types.RelativeTo(analysisInfo.TargetPackage.Types)
+	} else {
+		qualifier = func(other *types.Package) string {
+			if other != nil {
+				return other.Name()
+			}
+			return ""
+		} // Fallback
+	}
+	definition := types.ObjectString(obj, qualifier)
+	if definition != "" {
+		hoverText.WriteString("```go\n")
+		hoverText.WriteString(definition)
+		hoverText.WriteString("\n```") // End code block
+	} else {
+		logger.Warn("Could not format object definition string", "object", obj.Name())
+	}
+
+	// --- 2. Find and Format Documentation ---
+	docComment := ""
+	var commentGroup *ast.CommentGroup
+
+	// Attempt to get comment from the definition node found earlier in analysisInfo
+	if analysisInfo != nil && analysisInfo.IdentifierDefNode != nil {
+		switch n := analysisInfo.IdentifierDefNode.(type) {
+		case *ast.FuncDecl:
+			commentGroup = n.Doc
+		case *ast.GenDecl: // Handles var, const, type blocks
+			// For GenDecl, find the specific Spec that matches the object's position
+			for _, spec := range n.Specs {
+				switch s := spec.(type) {
+				case *ast.ValueSpec: // var, const
+					for _, name := range s.Names {
+						if name.Pos() == obj.Pos() {
+							commentGroup = s.Doc
+							if commentGroup == nil { // Fallback to GenDecl doc if spec doc is nil
+								commentGroup = n.Doc
+							}
+							goto foundDoc // Exit spec loop
+						}
+					}
+				case *ast.TypeSpec: // type
+					if s.Name != nil && s.Name.Pos() == obj.Pos() {
+						commentGroup = s.Doc
+						if commentGroup == nil { // Fallback
+							commentGroup = n.Doc
+						}
+						goto foundDoc // Exit spec loop
+					}
+				}
+			}
+			// If no specific spec matched, use the GenDecl doc as a last resort
+			if commentGroup == nil {
+				commentGroup = n.Doc
+			}
+		case *ast.TypeSpec: // Handles individual type specs outside GenDecl (less common)
+			commentGroup = n.Doc
+		case *ast.Field: // Handles struct fields, interface methods, func params/results
+			commentGroup = n.Doc
+		case *ast.ValueSpec: // Handles individual var/const specs outside GenDecl
+			commentGroup = n.Doc
+		case *ast.AssignStmt: // Handle short variable declarations (var := value)
+			for _, lhsExpr := range n.Lhs {
+				if ident, ok := lhsExpr.(*ast.Ident); ok && ident.Pos() == obj.Pos() {
+					logger.Debug("Hover object is a short variable declaration; doc comment lookup not implemented for this case.", "object", obj.Name())
+					break
+				}
+			}
+		default:
+			logger.Debug("Hover documentation lookup: Unhandled definition node type", "type", fmt.Sprintf("%T", n))
+		}
+	foundDoc: // Label to jump to after finding doc in GenDecl specs
+	} else {
+		logger.Debug("Defining node (IdentifierDefNode) not found in AstContextInfo", "object", obj.Name())
+	}
+
+	// Format the comment group if found
+	if commentGroup != nil && len(commentGroup.List) > 0 {
+		var doc strings.Builder
+		for _, c := range commentGroup.List {
+			if c != nil {
+				// Basic cleaning: remove comment markers, trim space
+				text := strings.TrimSpace(strings.TrimPrefix(c.Text, "//"))
+				text = strings.TrimSpace(strings.TrimPrefix(text, "/*"))
+				text = strings.TrimSpace(strings.TrimSuffix(text, "*/"))
+				if doc.Len() > 0 {
+					doc.WriteString("\n") // Add newline between comment lines
+				}
+				doc.WriteString(text)
+			}
+		}
+		docComment = doc.String()
+		logger.Debug("Found and formatted doc comment for object", "object", obj.Name())
+	} else if analysisInfo != nil && analysisInfo.IdentifierDefNode != nil {
+		logger.Debug("No doc comment found on definition node", "object", obj.Name(), "node_type", fmt.Sprintf("%T", analysisInfo.IdentifierDefNode))
+	}
+
+	// Combine definition and documentation
+	if docComment != "" {
+		if hoverText.Len() > 0 {
+			hoverText.WriteString("\n\n---\n\n") // Separator only if definition exists
+		}
+		hoverText.WriteString(docComment)
+	}
+
+	finalContent := hoverText.String()
+	// Avoid returning just an empty code block if definition is empty and no docs found
+	if strings.TrimSpace(finalContent) == "```go\n```" {
+		return ""
+	}
+	logger.Debug("Formatted hover content", "object", obj.Name(), "content_length", len(finalContent))
+	return finalContent
 }

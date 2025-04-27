@@ -4,7 +4,7 @@
 package deepcomplete
 
 import (
-	"bytes" // Added context
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -234,15 +234,7 @@ func findEnclosingPathAndNodes(
 	logger *slog.Logger,
 ) ([]ast.Node, error) {
 	// --- Memory Cache Check (Conceptual) ---
-	// cacheKey := generateCacheKey("pathNodes", info) // Needs refined key
-	// cachedResult, cacheHit, err := withMemoryCache[[]ast.Node](analyzer, cacheKey, 10, 5*time.Minute, func() ([]ast.Node, error) {
-	//     path := findEnclosingPath(targetFileAST, cursorPos, info, logger)
-	//     findContextNodes(path, cursorPos, pkg, fset, analyzer, info, logger) // Populates info struct
-	//     return path, errors.Join(info.AnalysisErrors...) // Return path and any errors encountered
-	// }, logger)
-	// if err != nil { return nil, err } // Return computation error
-	// if cacheHit { return cachedResult, nil } // Return cached path
-	// return cachedResult, nil // Return computed path (info struct populated by computeFn)
+	// ... (cache logic omitted for brevity) ...
 	// --- End Cache Check ---
 
 	// --- Direct Implementation (without cache wrapping for now) ---
@@ -264,12 +256,7 @@ func extractScopeInformation(
 	logger *slog.Logger,
 ) error {
 	// --- Memory Cache Check (Conceptual) ---
-	// cacheKey := generateCacheKey("scope", info) // Needs refined key
-	// _, _, err := withMemoryCache[struct{}](analyzer, cacheKey, 10, 5*time.Minute, func() (struct{}, error) {
-	//     gatherScopeContext(path, targetPkg, info.TargetFileSet, info, logger) // Populates info struct
-	//     return struct{}{}, errors.Join(info.AnalysisErrors...) // Return dummy struct and any errors
-	// }, logger)
-	// return err // Return error from computation or nil
+	// ... (cache logic omitted for brevity) ...
 	// --- End Cache Check ---
 
 	// --- Direct Implementation ---
@@ -289,12 +276,7 @@ func extractRelevantComments(
 	logger *slog.Logger,
 ) error {
 	// --- Memory Cache Check (Conceptual) ---
-	// cacheKey := generateCacheKey("comments", info) // Needs refined key
-	// _, _, err := withMemoryCache[struct{}](analyzer, cacheKey, 5, 5*time.Minute, func() (struct{}, error) {
-	//     findRelevantComments(targetFileAST, path, cursorPos, fset, info, logger) // Populates info struct
-	//     return struct{}{}, errors.Join(info.AnalysisErrors...) // Return dummy struct and any errors
-	// }, logger)
-	// return err // Return error from computation or nil
+	// ... (cache logic omitted for brevity) ...
 	// --- End Cache Check ---
 
 	// --- Direct Implementation ---
@@ -315,13 +297,7 @@ func constructPromptPreamble(
 	logger *slog.Logger,
 ) string {
 	// --- Memory Cache Check (Conceptual) ---
-	// cacheKey := generateCacheKey("preamble", info) // Needs refined key
-	// preambleStr, cacheHit, err := withMemoryCache[string](analyzer, cacheKey, 20, 5*time.Minute, func() (string, error) {
-	//     return buildPreamble(analyzer, info, qualifier, logger), errors.Join(info.AnalysisErrors...) // Return computed preamble and any errors
-	// }, logger)
-	// if err != nil { logger.Warn("Error computing preamble for cache", "error", err) }
-	// if cacheHit { return preambleStr }
-	// return preambleStr // Return computed preamble
+	// ... (cache logic omitted for brevity) ...
 	// --- End Cache Check ---
 
 	// --- Direct Implementation ---
@@ -1243,18 +1219,83 @@ func findContextNodes(
 					addAnalysisError(info, fmt.Errorf("object '%s' at %s found but type is nil", obj.Name(), posStr(obj.Pos())), logger)
 				}
 
-				// --- Hover Refinement: Find Defining Node ---
+				// --- ** Cycle 2: Hover Refinement: Find Defining Node ** ---
 				defPos := obj.Pos()
 				if defPos.IsValid() {
-					// Need access to the AST where the definition occurs.
-					// This might be info.TargetAstFile or an AST from another file in the package.
-					// Conceptual: Assume findNodeAtPos exists and can access the correct AST.
-					// definingNode := findNodeAtPos(info.TargetFileSet, info.TargetPackage, defPos, logger) // Needs implementation
-					// info.IdentifierDefNode = definingNode
-					// if definingNode == nil {
-					//     addAnalysisError(info, fmt.Errorf("could not find defining AST node for object '%s' at pos %s", obj.Name(), posStr(defPos)), logger)
-					// }
-					logger.Warn("Finding defining AST node for hover documentation is not fully implemented.") // Placeholder warning
+					// Find the AST file containing the definition
+					defFile := fset.File(defPos)
+					if defFile == nil {
+						addAnalysisError(info, fmt.Errorf("could not find token.File for definition of '%s' at pos %s", obj.Name(), posStr(defPos)), logger)
+					} else {
+						var defAST *ast.File
+						// Check if definition is in the currently analyzed file
+						if defFile.Name() == info.FilePath {
+							defAST = info.TargetAstFile
+						} else {
+							// Definition is in another file in the package. Find its AST.
+							if pkg != nil {
+								for _, syntaxFile := range pkg.Syntax {
+									if fset.File(syntaxFile.Pos()) == defFile {
+										defAST = syntaxFile
+										break
+									}
+								}
+							}
+						}
+
+						if defAST != nil {
+							// Find the specific AST node at the definition position
+							defPath, _ := astutil.PathEnclosingInterval(defAST, defPos, defPos)
+							if len(defPath) > 0 {
+								// Find the most specific node that corresponds to the definition
+								// (e.g., FuncDecl, ValueSpec, TypeSpec, Field)
+								for _, node := range defPath {
+									// Check if the node's position matches the object's position
+									// and if it's a suitable declaration/spec node.
+									isDeclNode := false
+									switch n := node.(type) {
+									case *ast.FuncDecl:
+										if n.Name != nil && n.Name.Pos() == defPos {
+											isDeclNode = true
+										}
+									case *ast.ValueSpec: // var, const
+										for _, name := range n.Names {
+											if name != nil && name.Pos() == defPos {
+												isDeclNode = true
+												break
+											}
+										}
+									case *ast.TypeSpec: // type
+										if n.Name != nil && n.Name.Pos() == defPos {
+											isDeclNode = true
+										}
+									case *ast.Field: // struct field, interface method, func param/result
+										for _, name := range n.Names {
+											if name != nil && name.Pos() == defPos {
+												isDeclNode = true
+												break
+											}
+										}
+									}
+									if isDeclNode {
+										info.IdentifierDefNode = node
+										logger.Debug("Found defining AST node for hover", "object", obj.Name(), "node_type", fmt.Sprintf("%T", node), "pos", posStr(node.Pos()))
+										break // Found the most specific declaration node
+									}
+								}
+								if info.IdentifierDefNode == nil {
+									// Could not find a specific decl node, maybe use innermost node at defPos?
+									info.IdentifierDefNode = defPath[0]
+									logger.Warn("Could not pinpoint specific defining declaration node, using innermost node at definition position", "object", obj.Name(), "innermost_type", fmt.Sprintf("%T", defPath[0]))
+									addAnalysisError(info, fmt.Errorf("could not find specific defining node for '%s' at pos %s", obj.Name(), posStr(defPos)), logger)
+								}
+							} else {
+								addAnalysisError(info, fmt.Errorf("could not find AST path for definition of '%s' at pos %s", obj.Name(), posStr(defPos)), logger)
+							}
+						} else {
+							addAnalysisError(info, fmt.Errorf("could not find AST for definition file '%s' of object '%s'", defFile.Name(), obj.Name()), logger)
+						}
+					}
 				} else {
 					logger.Debug("Object has invalid definition position, cannot find defining node.", "object", obj.Name())
 				}
@@ -1461,11 +1502,10 @@ func listStructFields(st *types.Struct, qualifier types.Qualifier) []MemberInfo 
 }
 
 // ============================================================================
-// Hover Formatting Helper (Conceptual - Needs Refinement)
+// Hover Formatting Helper (Cycle 2 Implementation)
 // ============================================================================
 
 // formatObjectForHover creates a Markdown string for hover info.
-// Needs refinement for documentation lookup.
 func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.Logger) string {
 	if obj == nil {
 		logger.Debug("formatObjectForHover called with nil object")
@@ -1487,57 +1527,105 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 		} // Fallback
 	}
 	definition := types.ObjectString(obj, qualifier)
-	hoverText.WriteString("```go\n")
-	hoverText.WriteString(definition)
-	hoverText.WriteString("\n```") // End code block
+	if definition != "" {
+		hoverText.WriteString("```go\n")
+		hoverText.WriteString(definition)
+		hoverText.WriteString("\n```") // End code block
+	} else {
+		logger.Warn("Could not format object definition string", "object", obj.Name())
+	}
 
 	// --- 2. Find and Format Documentation ---
 	docComment := ""
-	// Use the stored defining node from AstContextInfo
+	var commentGroup *ast.CommentGroup
+
+	// Attempt to get comment from the definition node found earlier
 	if info.IdentifierDefNode != nil {
-		var commentGroup *ast.CommentGroup
 		switch n := info.IdentifierDefNode.(type) {
 		case *ast.FuncDecl:
 			commentGroup = n.Doc
-		case *ast.GenDecl:
+		case *ast.GenDecl: // Handles var, const, type blocks
+			// For GenDecl, find the specific Spec that matches the object's position
+			// This is more accurate than just using n.Doc, which applies to the whole block.
+			for _, spec := range n.Specs {
+				switch s := spec.(type) {
+				case *ast.ValueSpec: // var, const
+					for _, name := range s.Names {
+						if name.Pos() == obj.Pos() {
+							commentGroup = s.Doc
+							if commentGroup == nil { // Fallback to GenDecl doc if spec doc is nil
+								commentGroup = n.Doc
+							}
+							goto foundDoc // Exit spec loop
+						}
+					}
+				case *ast.TypeSpec: // type
+					if s.Name != nil && s.Name.Pos() == obj.Pos() {
+						commentGroup = s.Doc
+						if commentGroup == nil { // Fallback
+							commentGroup = n.Doc
+						}
+						goto foundDoc // Exit spec loop
+					}
+				}
+			}
+			// If no specific spec matched, use the GenDecl doc as a last resort
+			if commentGroup == nil {
+				commentGroup = n.Doc
+			}
+		case *ast.TypeSpec: // Handles individual type specs outside GenDecl (less common)
 			commentGroup = n.Doc
-		case *ast.TypeSpec:
+		case *ast.Field: // Handles struct fields, interface methods, func params/results
 			commentGroup = n.Doc
-		case *ast.Field:
+		case *ast.ValueSpec: // Handles individual var/const specs outside GenDecl
 			commentGroup = n.Doc
-		case *ast.ValueSpec:
-			commentGroup = n.Doc
-		case *ast.Ident: // Less ideal, need parent logic
-			logger.Warn("Hover documentation lookup: IdentifierDefNode is *ast.Ident, finding parent doc not implemented.")
+		case *ast.AssignStmt: // Handle short variable declarations (var := value)
+			// Check if the object's position matches one of the Lhs identifiers
+			for _, lhsExpr := range n.Lhs {
+				if ident, ok := lhsExpr.(*ast.Ident); ok && ident.Pos() == obj.Pos() {
+					// Short var decls don't have their own .Doc field.
+					// We might look for comments *preceding* the AssignStmt in the CommentMap,
+					// but that requires passing the CommentMap or re-creating it here.
+					// For now, we won't find docs for short var decls this way.
+					logger.Debug("Hover object is a short variable declaration; doc comment lookup not implemented for this case.", "object", obj.Name())
+					break
+				}
+			}
 		default:
 			logger.Debug("Hover documentation lookup: Unhandled definition node type", "type", fmt.Sprintf("%T", n))
 		}
-
-		if commentGroup != nil && len(commentGroup.List) > 0 {
-			var doc strings.Builder
-			for _, c := range commentGroup.List {
-				if c != nil {
-					text := strings.TrimSpace(strings.TrimPrefix(c.Text, "//"))
-					text = strings.TrimSpace(strings.TrimPrefix(text, "/*"))
-					text = strings.TrimSpace(strings.TrimSuffix(text, "*/"))
-					if doc.Len() > 0 {
-						doc.WriteString("\n")
-					}
-					doc.WriteString(text)
-				}
-			}
-			docComment = doc.String()
-			logger.Debug("Found doc comment for object", "object", obj.Name())
-		} else {
-			logger.Debug("No doc comment found on definition node", "object", obj.Name(), "node_type", fmt.Sprintf("%T", info.IdentifierDefNode))
-		}
+	foundDoc: // Label to jump to after finding doc in GenDecl specs
 	} else {
 		logger.Debug("Defining node (IdentifierDefNode) not found in AstContextInfo", "object", obj.Name())
-		// Could potentially try cmap lookup here as a fallback if info.CommentMap was stored?
+		// TODO: Fallback? Could try finding comments near obj.Pos() using CommentMap if available?
 	}
 
+	// Format the comment group if found
+	if commentGroup != nil && len(commentGroup.List) > 0 {
+		var doc strings.Builder
+		for _, c := range commentGroup.List {
+			if c != nil {
+				// Basic cleaning: remove comment markers, trim space
+				text := strings.TrimSpace(strings.TrimPrefix(c.Text, "//"))
+				text = strings.TrimSpace(strings.TrimPrefix(text, "/*"))
+				text = strings.TrimSpace(strings.TrimSuffix(text, "*/"))
+				if doc.Len() > 0 {
+					doc.WriteString("\n") // Add newline between comment lines
+				}
+				doc.WriteString(text)
+			}
+		}
+		docComment = doc.String()
+		logger.Debug("Found and formatted doc comment for object", "object", obj.Name())
+	} else if info.IdentifierDefNode != nil {
+		logger.Debug("No doc comment found on definition node", "object", obj.Name(), "node_type", fmt.Sprintf("%T", info.IdentifierDefNode))
+	}
+
+	// Combine definition and documentation
 	if docComment != "" {
-		hoverText.WriteString("\n\n---\n\n") // Separator
+		if hoverText.Len() > 0 {
+			hoverText.WriteString("\n\n---\n\n") // Separator only if definition exists
+		}
 		hoverText.WriteString(docComment)
 	}
 
@@ -1616,30 +1704,3 @@ func withMemoryCache[T any](
 
 	return computedResult, false, nil // Return computed value
 }
-
-// Example usage of withMemoryCache (conceptual)
-// func extractScopeInformation(...) error {
-//     cacheKey := generateCacheKey("scope", info)
-//     _, cacheHit, err := withMemoryCache[map[string]types.Object](
-//         analyzer,
-//         cacheKey,
-//         10, // Example cost
-//         5*time.Minute,
-//         func() (map[string]types.Object, error) {
-//             // --- Original logic to compute scope ---
-//             tempScopeMap := make(map[string]types.Object)
-//             gatherScopeContextLogic(path, targetPkg, fset, tempScopeMap, logger) // Assume original logic moved
-//             // ... handle potential errors during computation ...
-//             info.VariablesInScope = tempScopeMap // Update info struct *inside* computeFn if successful
-//             return tempScopeMap, nil // Return computed map
-//             // --- End original logic ---
-//         },
-//         logger,
-//     )
-//     // If it was a cache hit, the info struct wasn't populated by computeFn,
-//     // so we might need to retrieve and assign the cached value here if needed outside this function.
-//     // However, if the goal is just to populate info.VariablesInScope, the cache check might
-//     // need to directly assign to info.VariablesInScope on hit.
-//     // This highlights complexity in fitting cache logic cleanly.
-//     return err // Return error from computation or nil
-// }
