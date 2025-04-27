@@ -39,7 +39,7 @@ func loadPackageAndFile(ctx context.Context, absFilename string, fset *token.Fil
 		Fset:    fset,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
-			packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedErrors, // ** ADDED: Cycle 6 ** NeedErrors
+			packages.NeedSyntax | packages.NeedTypesInfo, // ** REMOVED: Cycle 6 Fix ** packages.NeedErrors,
 		// Load imports recursively? Might be too slow/memory intensive initially.
 		// Mode: packages.LoadAllSyntax, // Alternative: Load syntax for all dependencies
 		Tests: false,                                                                                   // Don't load test files initially
@@ -66,6 +66,7 @@ func loadPackageAndFile(ctx context.Context, absFilename string, fset *token.Fil
 	var targetFile *token.File
 
 	// Collect all package-level errors first (Cycle 6: Moved error collection here)
+	// Even without NeedErrors flag, the Errors field should be populated if errors occur.
 	for _, p := range pkgs {
 		for i := range p.Errors {
 			// Make a copy of the error to avoid loop variable capture issues if used in goroutines later
