@@ -23,7 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
+	"unicode/utf8" // ** ADDED: Cycle 3 ** Needed for byteOffsetToLSPPosition
 
 	"github.com/tidwall/gjson" // Cycle 2: Added gjson dependency
 	"github.com/tidwall/match" // Cycle 5: Added match dependency
@@ -1406,7 +1406,7 @@ func hoverHandler(ctx context.Context, event Event, logger *slog.Logger) (result
 	return hoverResult, nil // Return HoverResult (or nil)
 }
 
-// ** ADDED: Cycle 3 **
+// ** Cycle 3: Implemented definitionHandler **
 // definitionHandler handles 'textDocument/definition'.
 func definitionHandler(ctx context.Context, event Event, logger *slog.Logger) (result any, errObj *ErrorObject) {
 	logger.Info("Core handler: definition")
@@ -2286,7 +2286,7 @@ func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
 	for byteOffset < len(bytes) {
 		r, size := utf8.DecodeRune(bytes[byteOffset:])
 		if r == utf8.RuneError && size <= 1 {
-			return utf16Offset, fmt.Errorf("%w at byte offset %d within slice", ErrInvalidUTF8, byteOffset)
+			return utf16Offset, fmt.Errorf("%w at byte offset %d within slice", deepcomplete.ErrInvalidUTF8, byteOffset) // Use exported error
 		}
 		if r > 0xFFFF {
 			utf16Offset += 2 // Surrogate pair
