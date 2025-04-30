@@ -54,16 +54,13 @@ func PrettyPrint(color, text string) {
 // LSP Position Conversion Helpers (Updated with slog)
 // ============================================================================
 
-// LSPPosition represents a 0-based line/character offset (UTF-16).
-// Duplicated from lsp main for use in core library without circular dependency
-type LSPPosition struct {
-	Line      uint32 `json:"line"`      // 0-based
-	Character uint32 `json:"character"` // 0-based, UTF-16 offset
-}
+// NOTE: LSPPosition struct definition removed from here.
+// The definition in lsp_protocol.go is now used package-wide.
 
 // LspPositionToBytePosition converts 0-based LSP line/character (UTF-16) to
 // 1-based Go line/column (bytes) and 0-based byte offset.
 // Uses slog for logging warnings.
+// Uses the LSPPosition type defined in lsp_protocol.go (implicitly within the package).
 func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, byteOffset int, err error) {
 	// Use default logger, assumes initialized by caller (main/test)
 	logger := slog.Default()
@@ -250,8 +247,6 @@ func ValidateAndGetFilePath(uri string, logger *slog.Logger) (string, error) {
 		logger.Warn("File URI includes unexpected host component", "uri", uri, "host", parsedURL.Host)
 		return "", fmt.Errorf("%w: file URI should not contain host component for local files", ErrInvalidURI)
 	}
-	// Trim potential leading double slash if Host was empty (e.g., file:///path)
-	// filePath = strings.TrimPrefix(filePath, "//") // This might be incorrect if path starts with //server/share
 
 	// --- Security Check: Ensure absolute and clean path ---
 	// filepath.Abs also cleans the path (e.g., removes ../, resolves symlinks conceptually)
@@ -261,17 +256,28 @@ func ValidateAndGetFilePath(uri string, logger *slog.Logger) (string, error) {
 		return "", fmt.Errorf("failed to resolve absolute path for '%s': %w", filePath, err)
 	}
 
-	// Optional Defensive Check: Ensure the file exists?
-	// This might be too restrictive, as LSP often deals with unsaved files.
-	// _, statErr := os.Stat(absPath)
-	// if statErr != nil {
-	//     logger.Warn("File path may not exist or is inaccessible", "path", absPath, "stat_error", statErr)
-	//     // Decide whether to return error or allow proceeding
-	//     // return "", fmt.Errorf("file path inaccessible '%s': %w", absPath, statErr)
-	// }
-
 	logger.Debug("Validated and converted URI to path", "uri", uri, "path", absPath)
 	return absPath, nil
+}
+
+// PathToURI converts an absolute file path to a file:// URI.
+// Added as inverse of ValidateAndGetFilePath.
+func PathToURI(absPath string) (string, error) {
+	if !filepath.IsAbs(absPath) {
+		return "", fmt.Errorf("path must be absolute: %s", absPath)
+	}
+	// Ensure consistent forward slashes for URI
+	absPath = filepath.ToSlash(absPath)
+	// On Windows, add a leading slash if it's missing (e.g., C:/ -> /C:/)
+	if runtime.GOOS == "windows" && len(absPath) > 1 && absPath[1] == ':' {
+		absPath = "/" + absPath
+	}
+	// Construct the URL
+	uri := url.URL{
+		Scheme: "file",
+		Path:   absPath,
+	}
+	return uri.String(), nil
 }
 
 // ============================================================================
@@ -321,27 +327,21 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 				filesToHash[absPath] = struct{}{}
 			} else {
 				logger.Warn("Could not get absolute path for hashing", "file", fpath, "error", absErr)
-				// Fallback to relative path? Or skip? Let's skip for now.
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			// Log errors other than file not found
 			logger.Warn("Failed to stat file for hashing", "file", fpath, "error", err)
-			// Continue without returning error, as missing go.sum might be okay
 		}
 	}
 
 	// Use compiled files from package info if available and seems valid.
 	filesFromPkg := false
 	if pkg != nil && len(pkg.CompiledGoFiles) > 0 {
-		// Basic sanity check: does the first file seem to belong to the target dir?
-		// Ensure paths are absolute before checking prefix
 		firstFileAbs, _ := filepath.Abs(pkg.CompiledGoFiles[0])
 		dirAbs, _ := filepath.Abs(dir)
 		if len(pkg.CompiledGoFiles[0]) > 0 && filepath.IsAbs(firstFileAbs) && strings.HasPrefix(firstFileAbs, dirAbs) {
 			filesFromPkg = true
 			logger.Debug("Hashing based on CompiledGoFiles", "count", len(pkg.CompiledGoFiles), "package", pkg.ID)
 			for _, fpath := range pkg.CompiledGoFiles {
-				// CompiledGoFiles should already be absolute paths.
 				filesToHash[fpath] = struct{}{}
 			}
 		} else {
@@ -358,9 +358,8 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 			return nil, fmt.Errorf("failed to scan directory %s for hashing: %w", dir, err)
 		}
 		for _, entry := range entries {
-			// Include only .go files, ignore test files, ignore subdirectories.
 			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") && !strings.HasSuffix(entry.Name(), "_test.go") {
-				absPath := filepath.Join(dir, entry.Name()) // Construct absolute path
+				absPath := filepath.Join(dir, entry.Name())
 				filesToHash[absPath] = struct{}{}
 			}
 		}
@@ -368,7 +367,6 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 
 	// Calculate hash for each unique absolute file path.
 	for absPath := range filesToHash {
-		// Use relative path for the map key for portability/consistency.
 		relPath, err := filepath.Rel(dir, absPath)
 		if err != nil {
 			logger.Warn("Could not get relative path for hashing, using base name", "absPath", absPath, "error", err)
@@ -380,9 +378,8 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				logger.Warn("File disappeared during hashing, skipping.", "path", absPath)
-				continue // Skip files that disappear
+				continue
 			}
-			// Return error for other hash failures
 			return nil, fmt.Errorf("%w: failed to hash input file %s: %w", ErrCacheHash, absPath, err)
 		}
 		hashes[relPath] = hash
@@ -395,12 +392,12 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 func hashFileContent(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return "", err // Propagate error (e.g., file not found)
+		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", err // Propagate hashing error
+		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -412,7 +409,6 @@ func compareFileHashes(current, cached map[string]string) bool {
 
 	if len(current) != len(cached) {
 		logger.Debug("Cache invalid: File count mismatch", "current_count", len(current), "cached_count", len(cached))
-		// Log specific differences at Debug level
 		if logger.Enabled(context.Background(), slog.LevelDebug) {
 			for relPath := range current {
 				if _, ok := cached[relPath]; !ok {
@@ -427,11 +423,9 @@ func compareFileHashes(current, cached map[string]string) bool {
 		}
 		return false
 	}
-	// Compare hashes for each file present in both maps
 	for relPath, currentHash := range current {
 		cachedHash, ok := cached[relPath]
 		if !ok {
-			// This case should not happen if counts match, but check defensively
 			logger.Debug("Cache invalid: File missing in cache despite matching counts", "file", relPath)
 			return false
 		}
@@ -451,26 +445,24 @@ func deleteCacheEntryByKey(db *bbolt.DB, cacheKey []byte, logger *slog.Logger) e
 	}
 	if logger == nil {
 		logger = slog.Default()
-	} // Use default logger if none provided
-	logger = logger.With("cache_key", string(cacheKey)) // Add context
+	}
+	logger = logger.With("cache_key", string(cacheKey))
 
 	err := db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(cacheBucketName)
 		if b == nil {
 			logger.Warn("Cache bucket not found during delete attempt.")
-			return nil // Bucket gone? Nothing to do.
+			return nil
 		}
-		// Check if key exists before deleting (optional, Delete is safe)
 		if b.Get(cacheKey) == nil {
 			logger.Debug("Cache key not found during delete attempt, nothing to delete.")
-			return nil // Key doesn't exist.
+			return nil
 		}
 		logger.Debug("Deleting cache entry")
 		return b.Delete(cacheKey)
 	})
 	if err != nil {
 		logger.Warn("Failed to delete cache entry", "error", err)
-		// Wrap error for clarity
 		return fmt.Errorf("%w: failed to delete entry %s: %w", ErrCacheWrite, string(cacheKey), err)
 	}
 	return nil
@@ -486,7 +478,7 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 	var lastErr error
 	if logger == nil {
 		logger = slog.Default()
-	} // Use default if nil
+	}
 
 	currentDelay := initialDelay
 	for i := 0; i < maxRetries; i++ {
@@ -496,30 +488,27 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 			attemptLogger.Warn("Context cancelled before attempt", "error", ctx.Err())
 			return ctx.Err()
 		default:
-		} // Check context.
+		}
 
 		lastErr = operation()
 		if lastErr == nil {
 			return nil
-		} // Success.
+		}
 
-		// Don't retry context errors.
 		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
 			attemptLogger.Warn("Attempt failed due to context error. Not retrying.", "error", lastErr)
 			return lastErr
 		}
 
-		// Check for other retryable errors
 		var ollamaErr *OllamaError
 		isRetryable := errors.As(lastErr, &ollamaErr) && (ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests)
-		isRetryable = isRetryable || errors.Is(lastErr, ErrOllamaUnavailable) // Include general unavailability
+		isRetryable = isRetryable || errors.Is(lastErr, ErrOllamaUnavailable)
 
 		if !isRetryable {
 			attemptLogger.Warn("Attempt failed with non-retryable error.", "error", lastErr)
-			return lastErr // Return non-retryable error immediately
+			return lastErr
 		}
 
-		// If it's the last attempt, don't wait, just break loop to return lastErr.
 		if i == maxRetries-1 {
 			break
 		}
@@ -527,18 +516,16 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 		waitDuration := currentDelay
 		attemptLogger.Warn("Attempt failed with retryable error. Retrying...", "error", lastErr, "delay", waitDuration)
 
-		// Wait for the delay duration or until context is cancelled
 		select {
 		case <-ctx.Done():
 			attemptLogger.Warn("Context cancelled during retry wait", "error", ctx.Err())
 			return ctx.Err()
 		case <-time.After(waitDuration):
-			// Optionally increase delay for next attempt: currentDelay *= 2
-		} // Wait or cancel.
+			// Optionally increase delay: currentDelay *= 2
+		}
 	}
-	// Loop finished (max retries reached)
 	logger.Error("Operation failed after all retries.", "retries", maxRetries, "final_error", lastErr)
-	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr) // Return last error after retries exhausted.
+	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
 }
 
 // ============================================================================
@@ -576,31 +563,30 @@ func (s *Spinner) Start(initialMessage string) {
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		defer func() { // Cleanup goroutine state
+		defer func() {
 			s.mu.Lock()
 			isRunning := s.running
 			s.running = false
 			s.mu.Unlock()
 			if isRunning {
 				fmt.Fprintf(os.Stderr, "\r\033[K")
-			} // Clear line only if it was running
-			close(s.doneChan) // Signal completion
+			}
+			close(s.doneChan)
 		}()
 		for {
 			select {
 			case <-s.stopChan:
-				return // Stop signal received
+				return
 			case <-ticker.C:
 				s.mu.Lock()
 				if !s.running {
 					s.mu.Unlock()
 					return
-				} // Check running flag again
+				}
 				char := s.chars[s.index]
 				msg := s.message
 				s.index = (s.index + 1) % len(s.chars)
 				s.mu.Unlock()
-				// Print to stderr
 				fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s %s", ColorCyan, char, ColorReset, msg)
 			}
 		}
@@ -624,22 +610,21 @@ func (s *Spinner) Stop() {
 		return
 	}
 	select {
-	case <-s.stopChan: // Already stopped
+	case <-s.stopChan:
 	default:
-		close(s.stopChan) // Signal stop
+		close(s.stopChan)
 	}
 	doneChan := s.doneChan
 	s.mu.Unlock()
 
-	// Wait for goroutine cleanup with timeout
 	if doneChan != nil {
 		select {
-		case <-doneChan: // Goroutine finished cleanup
+		case <-doneChan:
 		case <-time.After(500 * time.Millisecond):
-			slog.Warn("Timeout waiting for spinner goroutine cleanup") // Use slog
+			slog.Warn("Timeout waiting for spinner goroutine cleanup")
 		}
 	}
-	fmt.Fprintf(os.Stderr, "\r\033[K") // Final clear line
+	fmt.Fprintf(os.Stderr, "\r\033[K")
 }
 
 // ============================================================================
@@ -666,24 +651,20 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 	content := string(contentBytes)
 
 	fset := token.NewFileSet()
-	// Base must be 1 for LineStart to work correctly with 1-based line numbers.
 	file := fset.AddFile(filename, 1, len(contentBytes))
 	if file == nil {
 		return ctx, fmt.Errorf("failed to add file '%s' to fileset", filename)
 	}
 
-	// Calculate 0-based byte offset using helper.
 	cursorPos, posErr := calculateCursorPos(file, row, col) // Uses slog internally
 	if posErr != nil {
 		return ctx, fmt.Errorf("cannot determine valid cursor position: %w", posErr)
 	}
 	if !cursorPos.IsValid() {
-		// Should be caught by calculateCursorPos, but double check
 		return ctx, fmt.Errorf("%w: invalid cursor position calculated (Pos: %d)", ErrPositionConversion, cursorPos)
 	}
 
 	offset := file.Offset(cursorPos)
-	// Clamp offset defensively (should be handled by calculateCursorPos clamping)
 	if offset < 0 {
 		offset = 0
 	}
@@ -694,28 +675,23 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 	ctx.Prefix = content[:offset]
 	ctx.Suffix = content[offset:]
 
-	// Extract the full line content.
-	lineStartPos := file.LineStart(row) // Use 1-based row here
+	lineStartPos := file.LineStart(row)
 	if !lineStartPos.IsValid() {
 		logger.Warn("Could not get start position for line")
-		return ctx, nil // Return context without FullLine, not an error
+		return ctx, nil
 	}
 	startOffset := file.Offset(lineStartPos)
 
-	// Find end of line (start of next line or EOF)
-	lineEndOffset := file.Size() // Default to EOF
+	lineEndOffset := file.Size()
 	fileLineCount := file.LineCount()
 	if row < fileLineCount {
-		// Get start of *next* line to find end of current line
 		if nextLineStartPos := file.LineStart(row + 1); nextLineStartPos.IsValid() {
 			lineEndOffset = file.Offset(nextLineStartPos)
 		}
 	}
 
-	// Extract line content, handling potential offset issues
 	if startOffset >= 0 && lineEndOffset >= startOffset && lineEndOffset <= len(content) {
 		lineContent := content[startOffset:lineEndOffset]
-		// Trim trailing newline characters (\n or \r\n)
 		lineContent = strings.TrimRight(lineContent, "\n")
 		lineContent = strings.TrimRight(lineContent, "\r")
 		ctx.FullLine = lineContent
@@ -743,52 +719,40 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 
 	fileLineCount := file.LineCount()
 	if line > fileLineCount {
-		// Allow cursor at start of line after last line.
 		if line == fileLineCount+1 && col == 1 {
-			// File.Pos takes 0-based offset. Size is the offset *after* the last character.
 			return file.Pos(file.Size()), nil
 		}
 		return token.NoPos, fmt.Errorf("%w: line number %d exceeds file line count %d", ErrPositionOutOfRange, line, fileLineCount)
 	}
 
-	// LineStart takes 1-based line number.
 	lineStartPos := file.LineStart(line)
 	if !lineStartPos.IsValid() {
 		return token.NoPos, fmt.Errorf("%w: cannot get start offset for line %d in file '%s'", ErrPositionConversion, line, file.Name())
 	}
 
-	// Offset takes 0-based offset. lineStartPos is 0-based relative to file start.
 	lineStartOffset := file.Offset(lineStartPos)
-	// Calculate target offset (0-based) from 1-based column.
 	cursorOffset := lineStartOffset + col - 1
 
-	// Determine end offset of the line (exclusive for range, inclusive for position)
-	// The position should be *at most* the offset of the newline character or EOF.
-	lineEndOffset := file.Size() // Default to end of file for last line
+	lineEndOffset := file.Size()
 	if line < fileLineCount {
-		// Get start of *next* line
 		if nextLineStartPos := file.LineStart(line + 1); nextLineStartPos.IsValid() {
 			lineEndOffset = file.Offset(nextLineStartPos)
 		}
 	}
 
-	// Clamp offset to line boundaries (inclusive start, inclusive end for position)
 	finalOffset := cursorOffset
 	if cursorOffset < lineStartOffset {
 		finalOffset = lineStartOffset
 		slog.Warn("Column resulted in offset before line start. Clamping.", "col", col, "offset", cursorOffset, "line_start", lineStartOffset)
 	}
-	// Check against the start of the *next* line or EOF.
 	if cursorOffset > lineEndOffset {
 		finalOffset = lineEndOffset
 		slog.Warn("Column resulted in offset beyond line end. Clamping.", "col", col, "offset", cursorOffset, "line_end", lineEndOffset)
 	}
 
-	// File.Pos takes 0-based offset.
 	pos := file.Pos(finalOffset)
 	if !pos.IsValid() {
 		slog.Error("Clamped offset resulted in invalid token.Pos. Using line start.", "offset", finalOffset, "line_start_pos", lineStartPos)
-		// Fallback to line start position if clamped offset is invalid
 		return lineStartPos, fmt.Errorf("%w: failed to calculate valid token.Pos for offset %d", ErrPositionConversion, finalOffset)
 	}
 	return pos, nil
@@ -807,7 +771,6 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 	logger := slog.Default() // Use default logger
 
 	for {
-		// Check context cancellation *before* reading
 		select {
 		case <-ctx.Done():
 			logger.Warn("Context cancelled during streaming", "error", ctx.Err())
@@ -817,32 +780,27 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 
 		line, err := reader.ReadBytes('\n')
 
-		// Check for read errors *after* reading
 		if err != nil {
 			if err == io.EOF {
-				// Process final partial line if any content exists
 				if len(line) > 0 {
-					if procErr := processLine(line, w, logger); procErr != nil { // Pass logger
-						return procErr // Return error from processing partial line
+					if procErr := processLine(line, w, logger); procErr != nil {
+						return procErr
 					}
 				}
 				logger.Debug("Stream processing finished (EOF)", "lines_processed", lineCount)
-				return nil // Clean EOF
+				return nil
 			}
-			// Check context again after read error
 			select {
 			case <-ctx.Done():
-				return ctx.Err() // Prefer context error
+				return ctx.Err()
 			default:
-				// Return the original read error
 				return fmt.Errorf("error reading from Ollama stream: %w", err)
 			}
 		}
 
-		// Process the successfully read line
 		lineCount++
-		if procErr := processLine(line, w, logger); procErr != nil { // Pass logger
-			return procErr // Return error from processing
+		if procErr := processLine(line, w, logger); procErr != nil {
+			return procErr
 		}
 	}
 }
@@ -853,25 +811,37 @@ func processLine(line []byte, w io.Writer, logger *slog.Logger) error {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
 		return nil
-	} // Ignore empty lines.
+	}
 
 	var resp OllamaResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
-		// Log non-JSON lines but don't treat as fatal error for the whole stream
 		logger.Debug("Ignoring non-JSON line from Ollama stream", "line", string(line))
 		return nil
 	}
 
-	// Check for errors reported within the JSON structure
 	if resp.Error != "" {
 		logger.Error("Ollama stream reported an error", "error", resp.Error)
 		return fmt.Errorf("ollama stream error: %s", resp.Error)
 	}
 
-	// Write the actual response content chunk
 	if _, err := fmt.Fprint(w, resp.Response); err != nil {
 		logger.Error("Error writing stream chunk to output", "error", err)
 		return fmt.Errorf("error writing to output: %w", err)
 	}
 	return nil
+}
+
+// Helper function to truncate strings for logging (moved from lsp_server.go)
+func firstN(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i] + "..."
+		}
+		count++
+	}
+	return s
 }
