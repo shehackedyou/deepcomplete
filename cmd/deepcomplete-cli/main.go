@@ -6,11 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog" // Cycle 3: Added slog
+	"log/slog" // Use structured logging
 	"os"
 	"time"
 
-	// NOTE: Replace with your actual module path
+	// NOTE: Replace with your actual module path if different
 	"github.com/shehackedyou/deepcomplete"
 )
 
@@ -20,24 +20,29 @@ func main() {
 	line := flag.Int("line", 0, "Line number (1-based, required unless -stdin is used)")
 	col := flag.Int("col", 0, "Column number (1-based, required unless -stdin is used)")
 	stdin := flag.Bool("stdin", false, "Read code snippet from stdin instead of file context")
-	// ** Cycle 1: Add log level flag **
+	// Cycle 1: Add log level flag for overriding config/default
 	logLevelFlag := flag.String("log-level", "", "Log level (debug, info, warn, error) - overrides config")
-	// Add flags for other config options if needed, e.g.:
-	// model := flag.String("model", "", "Ollama model to use (overrides config)")
-	// ollamaURL := flag.String("url", "", "Ollama URL (overrides config)")
+	// Add flags for other config options if needed (e.g., -model, -url)
 
 	flag.Parse()
 
 	// --- Initialize Completer (Loads Config) ---
-	// Load config implicitly via NewDeepCompleter (it calls LoadConfig)
-	// We need the config *before* setting up the final logger
-	completer, err := deepcomplete.NewDeepCompleter()
-	if err != nil {
-		// Use a temporary basic logger for fatal init errors
+	// Load config implicitly via NewDeepCompleter.
+	// NewDeepCompleter now returns a non-fatal ErrConfig if loading had issues.
+	completer, initErr := deepcomplete.NewDeepCompleter()
+	if initErr != nil && !errors.Is(initErr, deepcomplete.ErrConfig) {
+		// Use a temporary basic logger for fatal init errors before final logger setup
 		tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-		tempLogger.Error("Failed to initialize DeepCompleter service", "error", err)
+		tempLogger.Error("Fatal error initializing DeepCompleter service", "error", initErr)
+		os.Exit(1) // Exit on fatal errors
+	}
+	if completer == nil {
+		// This should ideally not happen if NewDeepCompleter handles errors correctly
+		tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		tempLogger.Error("DeepCompleter initialization returned nil unexpectedly")
 		os.Exit(1)
 	}
+	// Log non-fatal config errors later, after the final logger is set up.
 	defer func() {
 		// Use the final configured logger for shutdown messages
 		slog.Info("Closing DeepCompleter service...")
@@ -46,43 +51,50 @@ func main() {
 		}
 	}()
 
-	// --- Setup Logger based on Flag/Config (Cycle 1) ---
+	// --- Setup Logger based on Flag/Config (Cycle 1 Refinement) ---
 	initialConfig := completer.GetCurrentConfig()
 	chosenLogLevelStr := initialConfig.LogLevel // Start with config level
 
 	// Override with flag if provided
 	if *logLevelFlag != "" {
 		chosenLogLevelStr = *logLevelFlag
+		slog.Debug("Log level overridden by command-line flag", "flag_level", chosenLogLevelStr)
 	}
 
 	// Parse the chosen level string
 	logLevel, parseLevelErr := deepcomplete.ParseLogLevel(chosenLogLevelStr)
 	if parseLevelErr != nil {
-		// Log warning using a temporary logger if parsing fails
+		// Use a temporary logger if parsing fails, as default logger isn't set yet
 		tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		tempLogger.Warn("Invalid log level specified, using default 'info'", "specified_level", chosenLogLevelStr, "error", parseLevelErr)
 		logLevel = slog.LevelInfo // Default to Info
 	}
 
 	// Initialize the default slog logger with the determined level
+	// Send CLI logs to stderr
 	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false} // Source location less useful for CLI
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &handlerOpts))
 	slog.SetDefault(logger) // Set as default for the rest of the execution
 
 	// Log initialization confirmation *after* setting the final logger
 	slog.Info("DeepComplete service initialized.", "effective_log_level", logLevel.String())
+	// Log the non-fatal config error now, if it occurred during init
+	if initErr != nil && errors.Is(initErr, deepcomplete.ErrConfig) {
+		slog.Warn("DeepCompleter initialized with configuration warnings", "error", initErr)
+	}
 
-	// --- Input Validation (Defensive Programming) ---
-	// Use the configured logger (slog) for validation errors now
+	// --- Input Validation ---
+	// Use the configured slog logger for validation errors now
 	if *stdin {
 		if *filePath != "" || *line != 0 || *col != 0 {
 			slog.Error("Cannot use -file, -line, or -col flags when -stdin is specified.")
+			flag.Usage()
 			os.Exit(1)
 		}
 	} else {
 		if *filePath == "" {
 			slog.Error("Missing required flag: -file")
-			flag.Usage() // Print usage information
+			flag.Usage()
 			os.Exit(1)
 		}
 		if *line <= 0 {
@@ -95,20 +107,26 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		// Check if file exists (optional, but good for CLI)
-		if _, err := os.Stat(*filePath); err != nil {
-			slog.Error("Cannot access file provided via -file flag", "path", *filePath, "error", err)
+		// Validate file path using helper function
+		absPath, pathErr := deepcomplete.ValidateAndGetFilePath(*filePath, slog.Default())
+		if pathErr != nil {
+			slog.Error("Invalid file path provided via -file flag", "path", *filePath, "error", pathErr)
 			os.Exit(1)
 		}
+		// Check if file exists (optional, but good for CLI)
+		if _, statErr := os.Stat(absPath); statErr != nil {
+			slog.Error("Cannot access file provided via -file flag", "path", absPath, "error", statErr)
+			os.Exit(1)
+		}
+		// Update filePath to the validated absolute path
+		*filePath = absPath
 	}
 
 	// --- Execute Command ---
-	// Add a reasonable timeout for the CLI operation
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	if *stdin {
-		// Read code from stdin
 		slog.Info("Reading code snippet from stdin...")
 		snippetBytes, readErr := io.ReadAll(os.Stdin)
 		if readErr != nil {
@@ -127,14 +145,10 @@ func main() {
 		fmt.Print(completion) // Print result directly to stdout
 
 	} else {
-		// Get completion from file context
 		slog.Info("Getting completion from file", "path", *filePath, "line", *line, "col", *col)
 
 		// Use streaming completion, write result directly to stdout
-		// NOTE: GetCompletionStreamFromFile now expects version, but CLI doesn't track it.
-		// Pass a dummy version (e.g., 0 or 1) or modify the core function signature
-		// if version is strictly needed even without LSP context (less likely).
-		// Let's assume version 0 is acceptable for CLI usage where versioning isn't relevant.
+		// Pass a dummy version (0) as CLI doesn't track versions.
 		dummyVersion := 0
 		completionErr := completer.GetCompletionStreamFromFile(ctx, *filePath, dummyVersion, *line, *col, os.Stdout)
 		if completionErr != nil {
@@ -148,18 +162,12 @@ func main() {
 			} else if errors.Is(completionErr, deepcomplete.ErrAnalysisFailed) {
 				slog.Error("Code analysis failed (see logs for details)", "error", completionErr)
 			} else {
-				// Log other internal errors
 				slog.Error("Failed to get completion stream from file", "error", completionErr, "file", *filePath, "line", *line, "col", *col)
 			}
-			// Add a newline to stderr for errors to separate from potential stdout output
-			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr) // Add newline to stderr for errors
 			os.Exit(1)
 		}
-		// Add a newline to stdout if completion was successful and didn't end with one
-		// (The stream might handle this, but ensures clean separation)
-		// Note: This might add an extra newline if the completion already ends with one.
-		// A more robust way would be to capture the output and check.
-		fmt.Println()
+		fmt.Println() // Add newline to stdout for clean separation
 	}
 
 	slog.Info("CLI command finished successfully.")

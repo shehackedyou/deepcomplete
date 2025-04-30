@@ -1,6 +1,5 @@
 // deepcomplete.go
 // Package deepcomplete provides core logic for local code completion using LLMs.
-// This version assumes helper functions have been moved to deepcomplete_helpers.go
 package deepcomplete
 
 import (
@@ -14,7 +13,7 @@ import (
 	"go/token"
 	"go/types"
 	"io"
-	"log/slog" // Cycle 3: Added slog
+	"log/slog" // Use structured logging
 	"net"
 	"net/http"
 	"net/url"
@@ -31,7 +30,7 @@ import (
 )
 
 // =============================================================================
-// Constants & Core Types (Remain in main package file)
+// Constants & Core Types
 // =============================================================================
 
 const (
@@ -69,7 +68,7 @@ CODE TO FILL:
 	defaultMaxTokens      = 256            // Default maximum tokens for LLM response.
 	DefaultStop           = "\n"           // Default stop sequence for LLM. Exported for CLI use.
 	defaultTemperature    = 0.1            // Default sampling temperature for LLM.
-	defaultLogLevel       = "info"         // **ADDED: Cycle 1** Default log level.
+	defaultLogLevel       = "info"         // Default log level.
 	defaultConfigFileName = "config.json"  // Default config file name.
 	configDirName         = "deepcomplete" // Subdirectory name for config/data.
 	cacheSchemaVersion    = 2              // Used to invalidate cache if internal formats change.
@@ -92,7 +91,7 @@ type Config struct {
 	MaxTokens      int      `json:"max_tokens"`
 	Stop           []string `json:"stop"`
 	Temperature    float64  `json:"temperature"`
-	LogLevel       string   `json:"log_level"`        // **ADDED: Cycle 1** Log level (debug, info, warn, error).
+	LogLevel       string   `json:"log_level"`        // Log level (debug, info, warn, error).
 	UseAst         bool     `json:"use_ast"`          // Enable AST/Type analysis.
 	UseFim         bool     `json:"use_fim"`          // Use Fill-in-the-Middle prompting.
 	MaxPreambleLen int      `json:"max_preamble_len"` // Max bytes for AST context preamble.
@@ -100,62 +99,69 @@ type Config struct {
 }
 
 // Validate checks if configuration values are valid, applying defaults for some fields.
+// Cycle 1: Added more explicit logging for default application.
 func (c *Config) Validate() error {
+	var validationErrors []error
+	logger := slog.Default() // Use default logger for validation warnings
+
 	if strings.TrimSpace(c.OllamaURL) == "" {
-		return errors.New("ollama_url cannot be empty")
-	}
-	if _, err := url.ParseRequestURI(c.OllamaURL); err != nil {
-		return fmt.Errorf("invalid ollama_url: %w", err)
+		validationErrors = append(validationErrors, errors.New("ollama_url cannot be empty"))
+	} else if _, err := url.ParseRequestURI(c.OllamaURL); err != nil {
+		validationErrors = append(validationErrors, fmt.Errorf("invalid ollama_url: %w", err))
 	}
 	if strings.TrimSpace(c.Model) == "" {
-		return errors.New("model cannot be empty")
+		validationErrors = append(validationErrors, errors.New("model cannot be empty"))
 	}
 	if c.MaxTokens <= 0 {
-		slog.Warn("max_tokens is not positive, using default", "configured_value", c.MaxTokens, "default", defaultMaxTokens)
-		c.MaxTokens = defaultMaxTokens
+		logger.Warn("Config validation: max_tokens is not positive, applying default.", "configured_value", c.MaxTokens, "default", DefaultConfig.MaxTokens)
+		c.MaxTokens = DefaultConfig.MaxTokens
 	}
 	if c.Temperature < 0 {
-		slog.Warn("temperature is negative, using default", "configured_value", c.Temperature, "default", defaultTemperature)
-		c.Temperature = defaultTemperature
+		logger.Warn("Config validation: temperature is negative, applying default.", "configured_value", c.Temperature, "default", DefaultConfig.Temperature)
+		c.Temperature = DefaultConfig.Temperature
 	}
 	if c.MaxPreambleLen <= 0 {
-		slog.Warn("max_preamble_len is not positive, using default", "configured_value", c.MaxPreambleLen, "default", DefaultConfig.MaxPreambleLen)
+		logger.Warn("Config validation: max_preamble_len is not positive, applying default.", "configured_value", c.MaxPreambleLen, "default", DefaultConfig.MaxPreambleLen)
 		c.MaxPreambleLen = DefaultConfig.MaxPreambleLen
 	}
 	if c.MaxSnippetLen <= 0 {
-		slog.Warn("max_snippet_len is not positive, using default", "configured_value", c.MaxSnippetLen, "default", DefaultConfig.MaxSnippetLen)
+		logger.Warn("Config validation: max_snippet_len is not positive, applying default.", "configured_value", c.MaxSnippetLen, "default", DefaultConfig.MaxSnippetLen)
 		c.MaxSnippetLen = DefaultConfig.MaxSnippetLen
 	}
-	// **ADDED: Cycle 1** Validate LogLevel
 	if c.LogLevel == "" {
-		slog.Warn("log_level is empty, using default", "default", defaultLogLevel)
+		logger.Warn("Config validation: log_level is empty, applying default.", "default", defaultLogLevel)
 		c.LogLevel = defaultLogLevel
 	} else {
 		_, err := ParseLogLevel(c.LogLevel) // Use helper to validate
 		if err != nil {
-			slog.Warn("Invalid log_level found, using default", "configured_value", c.LogLevel, "default", defaultLogLevel, "error", err)
+			logger.Warn("Config validation: Invalid log_level found, applying default.", "configured_value", c.LogLevel, "default", defaultLogLevel, "error", err)
 			c.LogLevel = defaultLogLevel
 		}
+	}
+	// Add checks for other fields if necessary
+
+	if len(validationErrors) > 0 {
+		return errors.Join(validationErrors...)
 	}
 	return nil
 }
 
 // FileConfig represents the structure of the JSON config file for unmarshalling.
+// Uses pointers to distinguish between unset fields and zero-value fields.
 type FileConfig struct {
 	OllamaURL      *string   `json:"ollama_url"`
 	Model          *string   `json:"model"`
 	MaxTokens      *int      `json:"max_tokens"`
 	Stop           *[]string `json:"stop"`
 	Temperature    *float64  `json:"temperature"`
-	LogLevel       *string   `json:"log_level"` // **ADDED: Cycle 1** Pointer to detect if set
+	LogLevel       *string   `json:"log_level"`
 	UseAst         *bool     `json:"use_ast"`
 	UseFim         *bool     `json:"use_fim"`
 	MaxPreambleLen *int      `json:"max_preamble_len"`
 	MaxSnippetLen  *int      `json:"max_snippet_len"`
 }
 
-// ** ADDED: Cycle 6 ** Diagnostic Structures (Internal representation)
-// These align with LSP but are defined internally to avoid circular deps.
+// Diagnostic Structures (Internal representation)
 type DiagnosticSeverity int
 
 const (
@@ -165,38 +171,33 @@ const (
 	SeverityHint    DiagnosticSeverity = 4
 )
 
-// Position represents a 0-based line/character offset (bytes).
-// Note: LSP uses UTF-16, conversion is needed when sending.
 type Position struct {
 	Line      int // 0-based
 	Character int // 0-based, byte offset within the line
 }
 
-// Range represents a range in a text document using byte offsets.
 type Range struct {
-	Start Position // Start position (inclusive)
-	End   Position // End position (exclusive or inclusive depending on usage, typically inclusive start/exclusive end)
+	Start Position
+	End   Position
 }
 
-// Diagnostic represents a problem found during analysis.
 type Diagnostic struct {
-	Range    Range              // The range (using byte offsets) at which the message applies.
-	Severity DiagnosticSeverity // The diagnostic's severity.
-	Code     string             // The diagnostic's code, if any (e.g., compiler error code).
-	Source   string             // Source of the diagnostic (e.g., "go", "deepcomplete").
-	Message  string             // The diagnostic's message.
+	Range    Range
+	Severity DiagnosticSeverity
+	Code     string
+	Source   string
+	Message  string
 }
 
 // AstContextInfo holds structured information extracted from code analysis.
-// Updated for Cycle 8/9/Hover and Cycle 6 (Diagnostics).
 type AstContextInfo struct {
-	FilePath           string // Absolute, validated path
-	Version            int    // Document version for memory cache keying
+	FilePath           string
+	Version            int
 	CursorPos          token.Pos
 	PackageName        string
-	TargetPackage      *packages.Package // Store loaded package for qualifier/scope
-	TargetFileSet      *token.FileSet    // Store FileSet for position info
-	TargetAstFile      *ast.File         // Store AST for comment lookup? (Or use CommentMap)
+	TargetPackage      *packages.Package
+	TargetFileSet      *token.FileSet
+	TargetAstFile      *ast.File
 	EnclosingFunc      *types.Func
 	EnclosingFuncNode  *ast.FuncDecl
 	ReceiverType       string
@@ -206,7 +207,7 @@ type AstContextInfo struct {
 	IdentifierAtCursor *ast.Ident
 	IdentifierType     types.Type
 	IdentifierObject   types.Object
-	IdentifierDefNode  ast.Node // Added for Hover: Store the defining AST node
+	IdentifierDefNode  ast.Node
 	SelectorExpr       *ast.SelectorExpr
 	SelectorExprType   types.Type
 	CallExpr           *ast.CallExpr
@@ -216,11 +217,9 @@ type AstContextInfo struct {
 	CompositeLit       *ast.CompositeLit
 	CompositeLitType   types.Type
 	VariablesInScope   map[string]types.Object
-	PromptPreamble     string // Final preamble generated (potentially cached)
+	PromptPreamble     string
 	AnalysisErrors     []error
-	Diagnostics        []Diagnostic // ** ADDED: Cycle 6 ** Store diagnostics found.
-	// Potentially add CommentMap here if needed for hover doc lookup
-	// CommentMap         ast.CommentMap
+	Diagnostics        []Diagnostic
 }
 
 // OllamaError defines a custom error for Ollama API issues.
@@ -247,17 +246,14 @@ type OllamaResponse struct {
 type CachedAnalysisData struct {
 	PackageName    string
 	PromptPreamble string
-	// ** ADDED: Cycle 6 ** Cache diagnostics as well?
-	// Diagnostics    []Diagnostic // Consider if diagnostics should be part of the cache. Might become stale quickly.
-	// For now, let's NOT cache diagnostics, recalculate them on load.
 }
 
 // CachedAnalysisEntry represents the full structure stored in bbolt.
 type CachedAnalysisEntry struct {
 	SchemaVersion   int
 	GoModHash       string
-	InputFileHashes map[string]string // key: relative path (using '/')
-	AnalysisGob     []byte            // Gob-encoded CachedAnalysisData
+	InputFileHashes map[string]string
+	AnalysisGob     []byte
 }
 
 // MemberKind defines the type of member (field or method).
@@ -277,7 +273,7 @@ type MemberInfo struct {
 }
 
 // =============================================================================
-// Exported Errors (Remain in main package file)
+// Exported Errors
 // =============================================================================
 
 var (
@@ -296,44 +292,32 @@ var (
 	ErrInvalidPositionInput = errors.New("invalid input position")
 	ErrPositionOutOfRange   = errors.New("position out of range")
 	ErrInvalidUTF8          = errors.New("invalid utf-8 sequence")
-	ErrInvalidURI           = errors.New("invalid document URI") // Added for path validation
+	ErrInvalidURI           = errors.New("invalid document URI")
 )
 
 // =============================================================================
-// Interfaces for Components (Remain in main package file)
+// Interfaces for Components
 // =============================================================================
 
-// LLMClient defines interaction with the LLM API.
 type LLMClient interface {
 	GenerateStream(ctx context.Context, prompt string, config Config) (io.ReadCloser, error)
 }
 
-// Analyzer defines code context analysis.
-// Updated for Cycle 9 versioning and fixed DocumentURI usage.
 type Analyzer interface {
-	// Analyze performs code analysis for a given file and position.
-	// filename should be an absolute, validated path.
-	// version is the document version from the client.
 	Analyze(ctx context.Context, filename string, version int, line, col int) (*AstContextInfo, error)
 	Close() error
-	// InvalidateCache invalidates the bbolt cache for a directory.
 	InvalidateCache(dir string) error
-	// InvalidateMemoryCacheForURI invalidates the ristretto cache for a URI.
-	// **FIX:** Changed DocumentURI to string to avoid cross-package dependency.
 	InvalidateMemoryCacheForURI(uri string, version int) error
-	// MemoryCacheEnabled checks if the ristretto cache is active.
 	MemoryCacheEnabled() bool
-	// GetMemoryCacheMetrics returns the ristretto cache metrics.
 	GetMemoryCacheMetrics() *ristretto.Metrics
 }
 
-// PromptFormatter defines prompt construction.
 type PromptFormatter interface {
 	FormatPrompt(contextPreamble string, snippetCtx SnippetContext, config Config) string
 }
 
 // =============================================================================
-// Variables & Default Config (Remain in main package file)
+// Variables & Default Config
 // =============================================================================
 
 var (
@@ -346,7 +330,7 @@ var (
 		MaxTokens:      defaultMaxTokens,
 		Stop:           []string{DefaultStop, "}", "//", "/*"},
 		Temperature:    defaultTemperature,
-		LogLevel:       defaultLogLevel, // **ADDED: Cycle 1**
+		LogLevel:       defaultLogLevel,
 		UseAst:         true,
 		UseFim:         false,
 		MaxPreambleLen: 2048,
@@ -355,68 +339,74 @@ var (
 )
 
 // =============================================================================
-// Configuration Loading (Remains with Config type)
+// Configuration Loading (Cycle 1: Refined error handling and logging)
 // =============================================================================
 
 // LoadConfig loads configuration from standard locations, merges with defaults,
 // and attempts to write a default config if none exists or is invalid.
+// Returns the loaded config and a potential non-fatal ErrConfig wrapping specific issues.
 func LoadConfig() (Config, error) {
-	// Ensure default slog logger is set for potential warnings here
-	// (Assuming it's set in main or tests)
+	logger := slog.Default() // Use default logger, assume initialized by caller
 	cfg := DefaultConfig
 	var loadedFromFile bool
 	var loadErrors []error
-	var configParseError error
+	var configParseError error // Store the first JSON parsing error encountered
 
 	primaryPath, secondaryPath, pathErr := getConfigPaths()
 	if pathErr != nil {
 		loadErrors = append(loadErrors, pathErr)
-		slog.Warn("Could not determine config paths", "error", pathErr)
+		logger.Warn("Could not determine config paths", "error", pathErr)
 	}
 
 	// Try loading from primary path
 	if primaryPath != "" {
-		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg)
+		logger.Debug("Attempting to load config", "path", primaryPath)
+		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg, logger) // Pass logger
 		if loadErr != nil {
+			// Check if it's a parsing error specifically
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				configParseError = loadErr
+				configParseError = loadErr // Record the parse error
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", primaryPath, loadErr))
-		}
-		loadedFromFile = loaded
-		if loadedFromFile && loadErr == nil {
-			slog.Info("Loaded config", "path", primaryPath)
+			logger.Warn("Failed to load or merge config", "path", primaryPath, "error", loadErr)
+		} else if loaded {
+			loadedFromFile = true
+			logger.Info("Loaded config", "path", primaryPath)
+		} else {
+			logger.Debug("Config file not found or empty", "path", primaryPath)
 		}
 	}
 
-	// Try secondary path if primary wasn't found or didn't load successfully
-	primaryNotFoundOrFailed := !loadedFromFile || len(loadErrors) > 0
+	// Try secondary path if primary wasn't found or failed to parse
+	primaryNotFoundOrFailed := !loadedFromFile || configParseError != nil
 	if primaryNotFoundOrFailed && secondaryPath != "" {
-		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg)
+		logger.Debug("Attempting to load config from secondary path", "path", secondaryPath)
+		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg, logger) // Pass logger
 		if loadErr != nil {
-			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				if configParseError == nil {
-					configParseError = loadErr
-				} // Keep first parse error
+			// Record parse error only if we haven't recorded one already
+			if configParseError == nil && strings.Contains(loadErr.Error(), "parsing config file JSON") {
+				configParseError = loadErr
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", secondaryPath, loadErr))
-		}
-		// Only set loadedFromFile if it wasn't already true from primary
-		if !loadedFromFile {
-			loadedFromFile = loaded
-		}
-		if loaded && loadErr == nil {
-			slog.Info("Loaded config", "path", secondaryPath)
+			logger.Warn("Failed to load or merge config", "path", secondaryPath, "error", loadErr)
+		} else if loaded {
+			// Only set loadedFromFile if it wasn't already true from primary
+			if !loadedFromFile {
+				loadedFromFile = true
+				logger.Info("Loaded config", "path", secondaryPath)
+			}
+		} else {
+			logger.Debug("Config file not found or empty", "path", secondaryPath)
 		}
 	}
 
-	// Write default config if no file was loaded successfully
+	// Write default config if no file was loaded successfully OR if parsing failed
 	loadSucceeded := loadedFromFile && configParseError == nil
 	if !loadSucceeded {
 		if configParseError != nil {
-			slog.Warn("Existing config file failed to parse. Attempting to write default.", "error", configParseError)
+			logger.Warn("Existing config file failed to parse. Attempting to write default.", "error", configParseError)
 		} else {
-			slog.Info("No valid config file found. Attempting to write default.")
+			logger.Info("No valid config file found. Attempting to write default.")
 		}
 		// Determine write path (prefer primary)
 		writePath := primaryPath
@@ -425,19 +415,21 @@ func LoadConfig() (Config, error) {
 		}
 
 		if writePath != "" {
-			slog.Info("Attempting to write default config", "path", writePath)
+			logger.Info("Attempting to write default config", "path", writePath)
 			if err := writeDefaultConfig(writePath, DefaultConfig); err != nil {
-				slog.Warn("Failed to write default config", "error", err)
+				logger.Warn("Failed to write default config", "path", writePath, "error", err)
 				loadErrors = append(loadErrors, fmt.Errorf("writing default config failed: %w", err))
 			}
 		} else {
-			slog.Warn("Cannot determine path to write default config.")
+			logger.Warn("Cannot determine path to write default config.")
 			loadErrors = append(loadErrors, errors.New("cannot determine default config path"))
 		}
-		cfg = DefaultConfig // Use defaults if write fails or no path
+		// Reset to defaults if load/write failed
+		cfg = DefaultConfig
+		logger.Info("Using default configuration values.")
 	}
 
-	// Ensure internal templates are set
+	// Ensure internal templates are set (they are not loaded from file)
 	if cfg.PromptTemplate == "" {
 		cfg.PromptTemplate = promptTemplate
 	}
@@ -445,14 +437,16 @@ func LoadConfig() (Config, error) {
 		cfg.FimTemplate = fimPromptTemplate
 	}
 
-	// Final validation of the resulting config
+	// Final validation of the resulting config (could be merged or default)
 	finalCfg := cfg
 	if err := finalCfg.Validate(); err != nil {
-		slog.Warn("Config after load/merge failed validation. Returning pure defaults.", "error", err)
+		// If the merged/loaded config is invalid, log it and fall back to pure defaults
+		logger.Warn("Config after load/merge failed validation. Falling back to pure defaults.", "error", err)
 		loadErrors = append(loadErrors, fmt.Errorf("post-load config validation failed: %w", err))
 		// Validate pure defaults as a safety check
 		if valErr := DefaultConfig.Validate(); valErr != nil {
-			slog.Error("FATAL: Default config is invalid", "error", valErr)
+			// This should not happen if DefaultConfig is correct
+			logger.Error("FATAL: Default config is invalid", "error", valErr)
 			return DefaultConfig, fmt.Errorf("default config is invalid: %w", valErr)
 		}
 		finalCfg = DefaultConfig
@@ -460,9 +454,10 @@ func LoadConfig() (Config, error) {
 
 	// Return config and potentially wrapped non-fatal errors
 	if len(loadErrors) > 0 {
+		// Wrap all collected errors under ErrConfig
 		return finalCfg, fmt.Errorf("%w: %w", ErrConfig, errors.Join(loadErrors...))
 	}
-	return finalCfg, nil
+	return finalCfg, nil // Success or non-fatal recoverable errors occurred
 }
 
 // getConfigPaths determines the primary (XDG) and secondary (~/.config) config paths.
@@ -477,20 +472,17 @@ func getConfigPaths() (primary string, secondary string, err error) {
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
 		secondary = filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
-		// If primary failed, use secondary as primary (common on some systems)
 		if primary == "" && cfgErr != nil {
 			primary = secondary
 			slog.Debug("Using fallback primary config path", "path", primary)
-			secondary = "" // No need for secondary if it's the same as primary fallback
+			secondary = ""
 		}
-		// Avoid listing same path twice
 		if primary == secondary {
 			secondary = ""
 		}
 	} else {
 		slog.Warn("Could not determine user home directory", "error", homeErr)
 	}
-	// If neither path could be determined, return an error
 	if primary == "" && secondary == "" {
 		err = fmt.Errorf("cannot determine config/home directories: config error: %v; home error: %v", cfgErr, homeErr)
 	}
@@ -498,64 +490,77 @@ func getConfigPaths() (primary string, secondary string, err error) {
 }
 
 // loadAndMergeConfig attempts to load config from a path and merge into cfg.
-func loadAndMergeConfig(path string, cfg *Config) (loaded bool, err error) {
+// Cycle 1: Added logger parameter.
+func loadAndMergeConfig(path string, cfg *Config, logger *slog.Logger) (loaded bool, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		} // File not found is not an error here
+			return false, nil // File not found is not an error here
+		}
 		return false, fmt.Errorf("reading config file %q failed: %w", path, err)
 	}
 	if len(data) == 0 {
-		slog.Warn("Config file exists but is empty, ignoring.", "path", path)
+		logger.Warn("Config file exists but is empty, ignoring.", "path", path)
 		return true, nil // Treat as loaded but empty
 	}
 
 	var fileCfg FileConfig
 	if err := json.Unmarshal(data, &fileCfg); err != nil {
+		// Return a specific error message for easier identification upstream
 		return true, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
 	}
 
-	// Merge loaded fields into cfg, overwriting defaults
+	// Merge loaded fields into cfg, overwriting defaults only if field was present in JSON
+	mergedFields := 0
 	if fileCfg.OllamaURL != nil {
 		cfg.OllamaURL = *fileCfg.OllamaURL
+		mergedFields++
 	}
 	if fileCfg.Model != nil {
 		cfg.Model = *fileCfg.Model
+		mergedFields++
 	}
 	if fileCfg.MaxTokens != nil {
 		cfg.MaxTokens = *fileCfg.MaxTokens
+		mergedFields++
 	}
 	if fileCfg.Stop != nil {
 		cfg.Stop = *fileCfg.Stop
+		mergedFields++
 	}
 	if fileCfg.Temperature != nil {
 		cfg.Temperature = *fileCfg.Temperature
+		mergedFields++
 	}
-	// **ADDED: Cycle 1** Merge LogLevel
 	if fileCfg.LogLevel != nil {
 		cfg.LogLevel = *fileCfg.LogLevel
+		mergedFields++
 	}
 	if fileCfg.UseAst != nil {
 		cfg.UseAst = *fileCfg.UseAst
+		mergedFields++
 	}
 	if fileCfg.UseFim != nil {
 		cfg.UseFim = *fileCfg.UseFim
+		mergedFields++
 	}
 	if fileCfg.MaxPreambleLen != nil {
 		cfg.MaxPreambleLen = *fileCfg.MaxPreambleLen
+		mergedFields++
 	}
 	if fileCfg.MaxSnippetLen != nil {
 		cfg.MaxSnippetLen = *fileCfg.MaxSnippetLen
+		mergedFields++
 	}
+	logger.Debug("Merged configuration from file", "path", path, "fields_merged", mergedFields)
 
-	return true, nil // Loaded successfully
+	return true, nil // Loaded and merged successfully
 }
 
 // writeDefaultConfig creates the directory and writes the default config as JSON.
 func writeDefaultConfig(path string, defaultConfig Config) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0750); err != nil { // Use 0750 for permissions
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
 	// Create an exportable struct containing only the fields to write
@@ -565,7 +570,7 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 		MaxTokens      int      `json:"max_tokens"`
 		Stop           []string `json:"stop"`
 		Temperature    float64  `json:"temperature"`
-		LogLevel       string   `json:"log_level"` // **ADDED: Cycle 1**
+		LogLevel       string   `json:"log_level"`
 		UseAst         bool     `json:"use_ast"`
 		UseFim         bool     `json:"use_fim"`
 		MaxPreambleLen int      `json:"max_preamble_len"`
@@ -573,7 +578,7 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 	}
 	expCfg := ExportableConfig{
 		OllamaURL: defaultConfig.OllamaURL, Model: defaultConfig.Model, MaxTokens: defaultConfig.MaxTokens,
-		Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, LogLevel: defaultConfig.LogLevel, // **ADDED: Cycle 1**
+		Stop: defaultConfig.Stop, Temperature: defaultConfig.Temperature, LogLevel: defaultConfig.LogLevel,
 		UseAst: defaultConfig.UseAst, UseFim: defaultConfig.UseFim,
 		MaxPreambleLen: defaultConfig.MaxPreambleLen, MaxSnippetLen: defaultConfig.MaxSnippetLen,
 	}
@@ -581,7 +586,6 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal default config to JSON: %w", err)
 	}
-	// Use more restrictive permissions for the config file itself
 	if err := os.WriteFile(path, jsonData, 0640); err != nil {
 		return fmt.Errorf("failed to write default config file %s: %w", path, err)
 	}
@@ -590,7 +594,6 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 }
 
 // ParseLogLevel converts a string level ("debug", "info", "warn", "error") to slog.Level.
-// **ADDED: Cycle 1** Helper function.
 func ParseLogLevel(levelStr string) (slog.Level, error) {
 	switch strings.ToLower(levelStr) {
 	case "debug":
@@ -607,7 +610,7 @@ func ParseLogLevel(levelStr string) (slog.Level, error) {
 }
 
 // =============================================================================
-// Default Component Implementations (Remain in main package file)
+// Default Component Implementations
 // =============================================================================
 
 // httpOllamaClient implements LLMClient using HTTP requests to Ollama.
@@ -616,16 +619,14 @@ type httpOllamaClient struct {
 }
 
 func newHttpOllamaClient() *httpOllamaClient {
-	// Configure HTTP client with appropriate timeouts
 	return &httpOllamaClient{
 		httpClient: &http.Client{
-			Timeout: 90 * time.Second, // Overall request timeout
+			Timeout: 90 * time.Second,
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
-					Timeout: 10 * time.Second, // Connection timeout
+					Timeout: 10 * time.Second,
 				}).DialContext,
-				TLSHandshakeTimeout: 10 * time.Second, // TLS handshake timeout
-				// Add other transport settings if needed (e.g., proxy)
+				TLSHandshakeTimeout: 10 * time.Second,
 			},
 		},
 	}
@@ -640,15 +641,14 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 		return nil, fmt.Errorf("error parsing Ollama URL '%s': %w", endpointURL, err)
 	}
 
-	// Construct payload
 	payload := map[string]interface{}{
 		"model":  config.Model,
 		"prompt": prompt,
 		"stream": true,
 		"options": map[string]interface{}{
 			"temperature": config.Temperature,
-			"num_ctx":     4096, // Consider making configurable or deriving
-			"top_p":       0.9,  // Common default, consider making configurable
+			"num_ctx":     4096,
+			"top_p":       0.9,
 			"stop":        config.Stop,
 			"num_predict": config.MaxTokens,
 		},
@@ -658,45 +658,37 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 		return nil, fmt.Errorf("error marshaling JSON payload: %w", err)
 	}
 
-	// Create request with context
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/x-ndjson") // Expect newline-delimited JSON stream
+	req.Header.Set("Accept", "application/x-ndjson")
 
-	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// Check for context cancellation first
 		if errors.Is(err, context.Canceled) {
-			return nil, context.Canceled // Propagate cancellation
+			return nil, context.Canceled
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: ollama request timed out after %v: %w", ErrOllamaUnavailable, c.httpClient.Timeout, err)
 		}
-		// Check for network errors (e.g., connection refused)
 		var netErr net.Error
 		if errors.As(err, &netErr) && netErr.Timeout() {
-			// Network timeout (e.g., connection timeout)
 			return nil, fmt.Errorf("%w: network timeout connecting to %s: %w", ErrOllamaUnavailable, u.Host, err)
 		}
 		if opErr, ok := err.(*net.OpError); ok && opErr.Op == "dial" {
 			return nil, fmt.Errorf("%w: connection refused or network error connecting to %s: %w", ErrOllamaUnavailable, u.Host, err)
 		}
-		// Other HTTP errors
 		return nil, fmt.Errorf("%w: http request failed: %w", ErrOllamaUnavailable, err)
 	}
 
-	// Check response status code
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, readErr := io.ReadAll(resp.Body)
 		bodyString := "(failed to read error response body)"
 		if readErr == nil {
 			bodyString = string(bodyBytes)
-			// Try to parse Ollama's specific error format
 			var ollamaErrResp struct {
 				Error string `json:"error"`
 			}
@@ -704,26 +696,23 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 				bodyString = ollamaErrResp.Error
 			}
 		}
-		// Create specific OllamaError
 		err = &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
 		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 	}
 
-	// Return response body for streaming
 	return resp.Body, nil
 }
 
 // GoPackagesAnalyzer implements Analyzer using go/packages and caching.
-// Updated for Cycle 9 Ristretto cache.
 type GoPackagesAnalyzer struct {
-	db          *bbolt.DB        // Disk cache
-	memoryCache *ristretto.Cache // In-memory cache
-	mu          sync.Mutex       // Protects access to db handle during Close.
+	db          *bbolt.DB
+	memoryCache *ristretto.Cache
+	mu          sync.Mutex
 }
 
 // NewGoPackagesAnalyzer initializes the analyzer and caches.
 func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
-	// --- bbolt Cache Setup ---
+	logger := slog.Default() // Use default logger
 	dbPath := ""
 	userCacheDir, err := os.UserCacheDir()
 	if err == nil {
@@ -731,10 +720,10 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 		if err := os.MkdirAll(dbDir, 0750); err == nil {
 			dbPath = filepath.Join(dbDir, "analysis_cache.db")
 		} else {
-			slog.Warn("Could not create bbolt cache directory", "path", dbDir, "error", err)
+			logger.Warn("Could not create bbolt cache directory", "path", dbDir, "error", err)
 		}
 	} else {
-		slog.Warn("Could not determine user cache directory. Bbolt caching disabled.", "error", err)
+		logger.Warn("Could not determine user cache directory. Bbolt caching disabled.", "error", err)
 	}
 
 	var db *bbolt.DB
@@ -742,7 +731,7 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 		opts := &bbolt.Options{Timeout: 1 * time.Second}
 		db, err = bbolt.Open(dbPath, 0600, opts)
 		if err != nil {
-			slog.Warn("Failed to open bbolt cache file. Bbolt caching will be disabled.", "path", dbPath, "error", err)
+			logger.Warn("Failed to open bbolt cache file. Bbolt caching will be disabled.", "path", dbPath, "error", err)
 			db = nil
 		} else {
 			err = db.Update(func(tx *bbolt.Tx) error {
@@ -753,27 +742,26 @@ func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
 				return nil
 			})
 			if err != nil {
-				slog.Warn("Failed to ensure bbolt bucket exists. Bbolt caching disabled.", "error", err)
+				logger.Warn("Failed to ensure bbolt bucket exists. Bbolt caching disabled.", "error", err)
 				db.Close()
 				db = nil
 			} else {
-				slog.Info("Using bbolt cache", "path", dbPath, "schema", cacheSchemaVersion)
+				logger.Info("Using bbolt cache", "path", dbPath, "schema", cacheSchemaVersion)
 			}
 		}
 	}
 
-	// --- Ristretto Cache Setup (Cycle 9) ---
 	memCache, cacheErr := ristretto.NewCache(&ristretto.Config{
-		NumCounters: 1e7,     // 10M keys to track frequency. Tune based on usage.
-		MaxCost:     1 << 30, // 1GB max cache size. Tune based on memory.
-		BufferItems: 64,      // Default is fine.
-		Metrics:     true,    // Enable metrics collection.
+		NumCounters: 1e7,
+		MaxCost:     1 << 30,
+		BufferItems: 64,
+		Metrics:     true,
 	})
 	if cacheErr != nil {
-		slog.Warn("Failed to create ristretto memory cache. In-memory caching disabled.", "error", cacheErr)
-		memCache = nil // Ensure it's nil if setup fails
+		logger.Warn("Failed to create ristretto memory cache. In-memory caching disabled.", "error", cacheErr)
+		memCache = nil
 	} else {
-		slog.Info("Initialized ristretto in-memory cache", "max_cost", "1GB")
+		logger.Info("Initialized ristretto in-memory cache", "max_cost", "1GB")
 	}
 
 	return &GoPackagesAnalyzer{db: db, memoryCache: memCache}
@@ -793,7 +781,7 @@ func (a *GoPackagesAnalyzer) Close() error {
 	}
 	if a.memoryCache != nil {
 		slog.Info("Closing ristretto memory cache.")
-		a.memoryCache.Close() // Waits for buffers etc.
+		a.memoryCache.Close()
 		a.memoryCache = nil
 	}
 	if len(closeErrors) > 0 {
@@ -803,58 +791,46 @@ func (a *GoPackagesAnalyzer) Close() error {
 }
 
 // Analyze performs code analysis, orchestrating calls to helpers.
-// Updated for Cycle 8/9/Hover/Defensive and Cycle 6 (Diagnostics).
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, version int, line, col int) (info *AstContextInfo, analysisErr error) {
-	// Input filename should already be validated absolute path by caller
 	logger := slog.Default().With("absFile", absFilename, "version", version, "line", line, "col", col)
-
-	// Initialize result struct
 	info = &AstContextInfo{
 		FilePath:         absFilename,
 		Version:          version,
 		VariablesInScope: make(map[string]types.Object),
 		AnalysisErrors:   make([]error, 0),
-		Diagnostics:      make([]Diagnostic, 0), // ** ADDED: Cycle 6 ** Initialize diagnostics slice
-		CallArgIndex:     -1,                    // Initialize to -1
+		Diagnostics:      make([]Diagnostic, 0),
+		CallArgIndex:     -1,
 	}
-
-	// Panic recovery for the entire analysis process
 	defer func() {
 		if r := recover(); r != nil {
 			panicErr := fmt.Errorf("internal panic during analysis: %v", r)
 			logger.Error("Panic recovered during Analyze", "error", r, "stack", string(debug.Stack()))
-			addAnalysisError(info, panicErr, logger) // Log panic as analysis error
-			// Ensure analysisErr reflects the panic if no other error was set
+			addAnalysisError(info, panicErr, logger)
 			if analysisErr == nil {
 				analysisErr = panicErr
 			} else {
 				analysisErr = errors.Join(analysisErr, panicErr)
 			}
 		}
-		// Aggregate non-fatal errors into the final returned error
 		if len(info.AnalysisErrors) > 0 {
 			finalErr := errors.Join(info.AnalysisErrors...)
-			// Wrap non-fatal errors in ErrAnalysisFailed
 			if analysisErr == nil {
 				analysisErr = fmt.Errorf("%w: %w", ErrAnalysisFailed, finalErr)
 			} else {
 				analysisErr = fmt.Errorf("%w: %w", analysisErr, finalErr)
-			} // Join with existing fatal error if any
+			}
 		}
 	}()
 
 	logger.Info("Starting context analysis")
 	dir := filepath.Dir(absFilename)
-
-	// --- Bbolt Cache Check (Disk Cache for final preamble) ---
-	goModHash := calculateGoModHash(dir) // Uses slog internally now
+	goModHash := calculateGoModHash(dir)
 	cacheKey := []byte(dir + "::" + goModHash)
 	cacheHit := false
 	var cachedEntry *CachedAnalysisEntry
-	var loadDuration, stepsDuration, preambleDuration time.Duration // Timings
+	var loadDuration, stepsDuration, preambleDuration time.Duration
 
 	if a.db != nil {
-		// ... (bbolt cache read logic as before, using logger, calling deleteCacheEntryByKey on error) ...
 		readStart := time.Now()
 		dbErr := a.db.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(cacheBucketName)
@@ -869,14 +845,13 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 			}
 			logger.Debug("Bbolt cache hit (raw bytes found). Decoding...", "key", string(cacheKey))
 			var decoded CachedAnalysisEntry
-			decoder := gob.NewDecoder(bytes.NewReader(valBytes))
-			if err := decoder.Decode(&decoded); err != nil {
+			if err := gob.NewDecoder(bytes.NewReader(valBytes)).Decode(&decoded); err != nil {
 				return fmt.Errorf("%w: %w", ErrCacheDecode, err)
-			} // Return error to trigger delete below
+			}
 			if decoded.SchemaVersion != cacheSchemaVersion {
 				logger.Warn("Cache data has old schema version. Ignoring.", "key", string(cacheKey))
 				return nil
-			} // Treat as miss
+			}
 			cachedEntry = &decoded
 			return nil
 		})
@@ -893,25 +868,20 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		}
 		logger.Debug("Bbolt cache read attempt finished", "duration", time.Since(readStart))
 
-		// Validate cache hit based on file hashes.
 		if cachedEntry != nil {
 			validationStart := time.Now()
 			logger.Debug("Potential bbolt cache hit. Validating file hashes...", "key", string(cacheKey))
-			currentHashes, hashErr := calculateInputHashes(dir, nil) // Pass nil pkg here.
+			currentHashes, hashErr := calculateInputHashes(dir, nil)
 			if hashErr == nil && cachedEntry.GoModHash == goModHash && compareFileHashes(currentHashes, cachedEntry.InputFileHashes) {
 				logger.Debug("Bbolt cache VALID. Attempting to decode analysis data...", "key", string(cacheKey))
 				decodeStart := time.Now()
 				var analysisData CachedAnalysisData
-				decoder := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob))
-				if decodeErr := decoder.Decode(&analysisData); decodeErr == nil {
+				if decodeErr := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob)).Decode(&analysisData); decodeErr == nil {
 					info.PackageName = analysisData.PackageName
 					info.PromptPreamble = analysisData.PromptPreamble
 					cacheHit = true
 					loadDuration = time.Since(decodeStart)
 					logger.Debug("Analysis data successfully decoded from bbolt cache.", "duration", loadDuration)
-					logger.Debug("Using cached preamble. Skipping packages.Load and analysis steps.", "preamble_length", len(info.PromptPreamble))
-					// ** ADDED: Cycle 6 ** Need to re-run load and steps to get diagnostics even on cache hit.
-					// Diagnostics are not cached.
 					logger.Debug("Re-running load/analysis steps for diagnostics despite cache hit.")
 					cacheHit = false // Force re-analysis for diagnostics
 				} else {
@@ -934,21 +904,16 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		logger.Debug("Bbolt cache disabled (db handle is nil).")
 	}
 
-	// --- Perform Full Analysis if Cache Miss (or for Diagnostics) ---
 	if !cacheHit {
 		logger.Debug("Bbolt cache miss or invalid (or re-running for diagnostics). Performing full analysis...", "key", string(cacheKey))
-
-		// --- Step 1: Load Package Info ---
 		loadStart := time.Now()
-		fset := token.NewFileSet() // Create new FileSet for this analysis run
-		info.TargetFileSet = fset  // Store FileSet in info for later use (e.g., position formatting)
-		// **FIX:** Call the function now defined in helpers
+		fset := token.NewFileSet()
+		info.TargetFileSet = fset
 		targetPkg, targetFileAST, targetFile, loadErrors := loadPackageAndFile(ctx, absFilename, fset, logger)
 		loadDuration = time.Since(loadStart)
 		logger.Debug("packages.Load completed", "duration", loadDuration)
 		for _, loadErr := range loadErrors {
 			addAnalysisError(info, loadErr, logger)
-			// ** ADDED: Cycle 6 ** Convert packages.Error to Diagnostic
 			if pkgErr, ok := loadErr.(*packages.Error); ok {
 				diag := packagesErrorToDiagnostic(*pkgErr, fset, logger)
 				if diag != nil {
@@ -956,32 +921,24 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				}
 			}
 		}
-		info.TargetPackage = targetPkg     // Store package info
-		info.TargetAstFile = targetFileAST // Store AST
+		info.TargetPackage = targetPkg
+		info.TargetAstFile = targetFileAST
 
-		// --- Step 2: Perform Detailed Analysis Steps ---
 		stepsStart := time.Now()
-		if targetFile != nil { // Proceed only if the target token.File was found
-			// Call refactored helper (Cycle 8), passing analyzer for memory cache (Cycle 9)
+		if targetFile != nil {
 			analyzeStepErr := performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, a, info, logger)
 			if analyzeStepErr != nil {
 				addAnalysisError(info, analyzeStepErr, logger)
-				// ** ADDED: Cycle 6 ** Consider adding diagnostics for analysisStepErr?
-				// For now, just log as analysis error.
 			}
 		} else {
-			// Log error if targetFile is nil but loading didn't report critical error earlier
 			if len(loadErrors) == 0 {
 				addAnalysisError(info, errors.New("cannot perform analysis steps: target token.File is nil"), logger)
 			}
-			// Attempt to gather basic package scope even without file context
-			gatherScopeContext(nil, targetPkg, fset, info, logger) // Pass nil path
+			gatherScopeContext(nil, targetPkg, fset, info, logger)
 		}
 		stepsDuration = time.Since(stepsStart)
 		logger.Debug("Analysis steps completed", "duration", stepsDuration)
 
-		// --- Step 3: Build Preamble ---
-		// Only build preamble if it wasn't loaded from cache
 		if info.PromptPreamble == "" {
 			preambleStart := time.Now()
 			var qualifier types.Qualifier
@@ -999,7 +956,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				}
 				logger.Debug("Building preamble with limited/no type info.")
 			}
-			// Call refactored helper (Cycle 8), passing analyzer for potential future caching (Cycle 9)
 			info.PromptPreamble = constructPromptPreamble(a, info, qualifier, logger)
 			preambleDuration = time.Since(preambleStart)
 			logger.Debug("Preamble construction completed", "duration", preambleDuration)
@@ -1007,16 +963,12 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 			logger.Debug("Skipping preamble construction (loaded from cache or already built).")
 		}
 
-		// --- Step 4: Save to Bbolt Cache ---
-		// Save preamble (but not diagnostics) if analysis didn't have critical load errors
 		shouldSave := a.db != nil && info.PromptPreamble != "" && len(loadErrors) == 0
 		if shouldSave {
-			// ... (bbolt cache save logic as before, using logger, caching only preamble/pkgname) ...
 			logger.Debug("Attempting to save analysis results (preamble) to bbolt cache.", "key", string(cacheKey))
 			saveStart := time.Now()
 			inputHashes, hashErr := calculateInputHashes(dir, targetPkg)
 			if hashErr == nil {
-				// *** Cycle 6: Only cache preamble/pkgname, NOT diagnostics ***
 				analysisDataToCache := CachedAnalysisData{PackageName: info.PackageName, PromptPreamble: info.PromptPreamble}
 				var gobBuf bytes.Buffer
 				if encodeErr := gob.NewEncoder(&gobBuf).Encode(&analysisDataToCache); encodeErr == nil {
@@ -1039,13 +991,13 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 							logger.Warn("Failed to write to bbolt cache", "key", string(cacheKey), "error", saveErr)
 							addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheWrite, saveErr), logger)
 						}
-					} else { /* handle entry encode error */
+					} else {
 						addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheEncode, entryEncodeErr), logger)
 					}
-				} else { /* handle data encode error */
+				} else {
 					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheEncode, encodeErr), logger)
 				}
-			} else { /* handle hash error */
+			} else {
 				addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheHash, hashErr), logger)
 			}
 		} else if a.db != nil {
@@ -1053,17 +1005,14 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		}
 	}
 
-	// Log final timing summary
-	// ** Cycle 6: Adjusted log message based on cacheHit logic change **
 	if info.PromptPreamble != "" && len(info.Diagnostics) == 0 && analysisErr == nil {
 		logger.Info("Context analysis finished (cache hit for preamble, re-analyzed for diagnostics)", "decode_duration", loadDuration)
 	} else {
 		logger.Info("Context analysis finished (full analysis)", "load_duration", loadDuration, "steps_duration", stepsDuration, "preamble_duration", preambleDuration)
 	}
 	logger.Debug("Final Context Preamble generated", "length", len(info.PromptPreamble))
-	logger.Debug("Final Diagnostics collected", "count", len(info.Diagnostics)) // ** ADDED: Cycle 6 **
+	logger.Debug("Final Diagnostics collected", "count", len(info.Diagnostics))
 
-	// Return info and potentially wrapped non-fatal errors (handled by defer)
 	return info, analysisErr
 }
 
@@ -1071,7 +1020,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	logger := slog.Default().With("dir", dir)
 	a.mu.Lock()
-	db := a.db // Access db safely
+	db := a.db
 	a.mu.Unlock()
 	if db == nil {
 		logger.Debug("Bbolt cache invalidation skipped: DB is nil.")
@@ -1080,46 +1029,33 @@ func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	goModHash := calculateGoModHash(dir)
 	cacheKey := []byte(dir + "::" + goModHash)
 	logger.Info("Invalidating bbolt cache entry", "key", string(cacheKey))
-	// Pass logger to helper
 	return deleteCacheEntryByKey(db, cacheKey, logger)
 }
 
 // InvalidateMemoryCacheForURI clears relevant entries from the ristretto cache.
-// Cycle 9: Added method.
-// **FIX:** Changed DocumentURI to string.
-// ** Cycle 4: Implement cache clearing **
 func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int) error {
 	logger := slog.Default().With("uri", uri, "version", version)
 	a.mu.Lock()
-	memCache := a.memoryCache // Access cache safely
+	memCache := a.memoryCache
 	a.mu.Unlock()
 
 	if memCache == nil {
 		logger.Debug("Memory cache invalidation skipped: Cache is nil.")
 		return nil
 	}
-
-	// --- Cycle 4: Clear entire cache ---
-	// Clearing the entire cache is the simplest way to ensure correctness
-	// when a file changes, as Ristretto doesn't easily support targeted
-	// deletion by URI/version prefix without extra indexing.
 	logger.Warn("Clearing entire Ristretto memory cache due to document change.", "uri", uri)
 	memCache.Clear()
-	// memCache.Wait() // Wait for clear operation to complete? Optional.
-	// --- End Cycle 4 Change ---
-
 	return nil
 }
 
-// MemoryCacheEnabled checks if the ristretto cache is active. (Cycle 9)
+// MemoryCacheEnabled checks if the ristretto cache is active.
 func (a *GoPackagesAnalyzer) MemoryCacheEnabled() bool {
-	a.mu.Lock() // Although reading a pointer might be atomic, lock for consistency
+	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.memoryCache != nil
 }
 
-// GetMemoryCacheMetrics returns the ristretto cache metrics. (Cycle 9)
-// Returns nil if cache is disabled.
+// GetMemoryCacheMetrics returns the ristretto cache metrics.
 func (a *GoPackagesAnalyzer) GetMemoryCacheMetrics() *ristretto.Metrics {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1137,31 +1073,29 @@ func newTemplateFormatter() *templateFormatter { return &templateFormatter{} }
 // FormatPrompt combines context and snippet into the final LLM prompt, applying truncation.
 func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx SnippetContext, config Config) string {
 	var finalPrompt string
-	template := config.PromptTemplate // Use standard template by default
+	template := config.PromptTemplate
 	maxPreambleLen := config.MaxPreambleLen
 	maxSnippetLen := config.MaxSnippetLen
-	maxFIMPartLen := maxSnippetLen / 2 // Divide budget for FIM prefix/suffix
+	maxFIMPartLen := maxSnippetLen / 2
+	logger := slog.Default() // Use default logger
 
-	// Truncate context preamble if necessary
 	if len(contextPreamble) > maxPreambleLen {
-		slog.Warn("Truncating context preamble", "original_length", len(contextPreamble), "max_length", maxPreambleLen)
+		logger.Warn("Truncating context preamble", "original_length", len(contextPreamble), "max_length", maxPreambleLen)
 		marker := "... (context truncated)\n"
 		startByte := len(contextPreamble) - maxPreambleLen + len(marker)
 		if startByte < 0 {
 			startByte = 0
-		} // Avoid negative index
+		}
 		contextPreamble = marker + contextPreamble[startByte:]
 	}
 
-	// Handle FIM (Fill-In-the-Middle) vs standard completion
 	if config.UseFim {
-		template = config.FimTemplate // Use FIM template
+		template = config.FimTemplate
 		prefix := snippetCtx.Prefix
 		suffix := snippetCtx.Suffix
 
-		// Truncate FIM prefix if necessary (from the beginning)
 		if len(prefix) > maxFIMPartLen {
-			slog.Warn("Truncating FIM prefix", "original_length", len(prefix), "max_length", maxFIMPartLen)
+			logger.Warn("Truncating FIM prefix", "original_length", len(prefix), "max_length", maxFIMPartLen)
 			marker := "...(prefix truncated)"
 			startByte := len(prefix) - maxFIMPartLen + len(marker)
 			if startByte < 0 {
@@ -1169,9 +1103,8 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 			}
 			prefix = marker + prefix[startByte:]
 		}
-		// Truncate FIM suffix if necessary (from the end)
 		if len(suffix) > maxFIMPartLen {
-			slog.Warn("Truncating FIM suffix", "original_length", len(suffix), "max_length", maxFIMPartLen)
+			logger.Warn("Truncating FIM suffix", "original_length", len(suffix), "max_length", maxFIMPartLen)
 			marker := "(suffix truncated)..."
 			endByte := maxFIMPartLen - len(marker)
 			if endByte < 0 {
@@ -1181,10 +1114,9 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 		}
 		finalPrompt = fmt.Sprintf(template, contextPreamble, prefix, suffix)
 	} else {
-		// Standard completion: use only the prefix as the snippet
 		snippet := snippetCtx.Prefix
 		if len(snippet) > maxSnippetLen {
-			slog.Warn("Truncating code snippet (prefix)", "original_length", len(snippet), "max_length", maxSnippetLen)
+			logger.Warn("Truncating code snippet (prefix)", "original_length", len(snippet), "max_length", maxSnippetLen)
 			marker := "...(code truncated)\n"
 			startByte := len(snippet) - maxSnippetLen + len(marker)
 			if startByte < 0 {
@@ -1198,69 +1130,66 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 }
 
 // =============================================================================
-// DeepCompleter Service (Remains in main package file)
+// DeepCompleter Service
 // =============================================================================
 
 // DeepCompleter orchestrates analysis, formatting, and LLM interaction.
 type DeepCompleter struct {
 	client    LLMClient
-	analyzer  Analyzer // Use the interface type
+	analyzer  Analyzer
 	formatter PromptFormatter
 	config    Config
-	configMu  sync.RWMutex // Protects concurrent read/write access to config.
+	configMu  sync.RWMutex
 }
 
 // NewDeepCompleter creates a new DeepCompleter service with default config.
+// Cycle 1: Returns non-fatal config error alongside the completer instance.
 func NewDeepCompleter() (*DeepCompleter, error) {
-	cfg, configErr := LoadConfig()
-	// Log warning but continue if only ErrConfig occurred
-	if configErr != nil && !errors.Is(configErr, ErrConfig) {
-		return nil, configErr // Fatal error during config load
-	}
-	if configErr != nil {
-		slog.Warn("Warning during initial config load", "error", configErr)
+	cfg, configErr := LoadConfig() // LoadConfig now returns non-fatal ErrConfig
+	logger := slog.Default()       // Use default logger
+
+	// Log warning if configErr is ErrConfig, but continue initialization
+	if configErr != nil && errors.Is(configErr, ErrConfig) {
+		logger.Warn("Non-fatal error during initial config load. Using loaded/default values.", "error", configErr)
+	} else if configErr != nil {
+		// If it's a different, fatal error, return it immediately
+		logger.Error("Fatal error during initial config load", "error", configErr)
+		return nil, configErr
 	}
 
-	// Validate the loaded/default config before creating components
+	// Validate the loaded/default config (LoadConfig already does this, but double-check)
 	if err := cfg.Validate(); err != nil {
-		slog.Warn("Initial config is invalid after load/merge. Using pure defaults.", "error", err)
-		cfg = DefaultConfig // Reset to pure defaults
-		if valErr := cfg.Validate(); valErr != nil {
-			slog.Error("Default config validation failed", "error", valErr)
-			return nil, fmt.Errorf("default config validation failed: %w", valErr)
-		}
+		logger.Error("Loaded/default config is invalid even after LoadConfig", "error", err)
+		// This indicates a problem with DefaultConfig or Validate itself
+		return nil, fmt.Errorf("initial config validation failed: %w", err)
 	}
 
-	// Initialize components
-	analyzer := NewGoPackagesAnalyzer() // Initializes bbolt and ristretto
+	analyzer := NewGoPackagesAnalyzer()
 	dc := &DeepCompleter{
 		client:    newHttpOllamaClient(),
-		analyzer:  analyzer, // Store concrete type satisfying interface
+		analyzer:  analyzer,
 		formatter: newTemplateFormatter(),
 		config:    cfg,
 	}
 
-	// Return the completer, potentially along with the non-fatal config load warning
+	// Return the completer instance AND the non-fatal config error if it occurred
 	if configErr != nil && errors.Is(configErr, ErrConfig) {
 		return dc, configErr
 	}
-	return dc, nil
+	return dc, nil // Success
 }
 
 // NewDeepCompleterWithConfig creates a new DeepCompleter service with provided config.
 func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
-	// Ensure templates are set if empty
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
 	}
 	if config.FimTemplate == "" {
 		config.FimTemplate = fimPromptTemplate
 	}
-	// Validate the provided config
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	// Initialize components
 	analyzer := NewGoPackagesAnalyzer()
 	return &DeepCompleter{
 		client:    newHttpOllamaClient(),
@@ -1270,39 +1199,35 @@ func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 	}, nil
 }
 
-// Close cleans up resources, primarily the analyzer's cache DB.
+// Close cleans up resources.
 func (dc *DeepCompleter) Close() error {
 	if dc.analyzer != nil {
-		return dc.analyzer.Close() // Close handles both bbolt and ristretto
+		return dc.analyzer.Close()
 	}
 	return nil
 }
 
 // UpdateConfig atomically updates the completer's configuration after validation.
 func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
-	// Ensure templates are set if empty
 	if newConfig.PromptTemplate == "" {
 		newConfig.PromptTemplate = promptTemplate
 	}
 	if newConfig.FimTemplate == "" {
 		newConfig.FimTemplate = fimPromptTemplate
 	}
-	// Validate before applying
 	if err := newConfig.Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	// Apply atomically
 	dc.configMu.Lock()
 	defer dc.configMu.Unlock()
 	dc.config = newConfig
-	// Use structured logging for config values
 	slog.Info("DeepCompleter configuration updated",
 		slog.String("ollama_url", newConfig.OllamaURL),
 		slog.String("model", newConfig.Model),
 		slog.Int("max_tokens", newConfig.MaxTokens),
 		slog.Any("stop", newConfig.Stop),
 		slog.Float64("temperature", newConfig.Temperature),
-		slog.String("log_level", newConfig.LogLevel), // **ADDED: Cycle 1** Log new level
+		slog.String("log_level", newConfig.LogLevel),
 		slog.Bool("use_ast", newConfig.UseAst),
 		slog.Bool("use_fim", newConfig.UseFim),
 		slog.Int("max_preamble_len", newConfig.MaxPreambleLen),
@@ -1315,7 +1240,6 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 func (dc *DeepCompleter) GetCurrentConfig() Config {
 	dc.configMu.RLock()
 	defer dc.configMu.RUnlock()
-	// Return a copy to prevent external modification
 	cfgCopy := dc.config
 	if cfgCopy.Stop != nil {
 		stopsCopy := make([]string, len(cfgCopy.Stop))
@@ -1334,7 +1258,6 @@ func (dc *DeepCompleter) InvalidateAnalyzerCache(dir string) error {
 }
 
 // InvalidateMemoryCacheForURI provides access to the analyzer's memory cache invalidation.
-// **FIX:** Changed DocumentURI to string.
 func (dc *DeepCompleter) InvalidateMemoryCacheForURI(uri string, version int) error {
 	if dc.analyzer == nil {
 		return errors.New("analyzer not initialized")
@@ -1342,68 +1265,59 @@ func (dc *DeepCompleter) InvalidateMemoryCacheForURI(uri string, version int) er
 	return dc.analyzer.InvalidateMemoryCacheForURI(uri, version)
 }
 
-// GetAnalyzer returns the analyzer instance (needed for Cycle 9 metrics/invalidation).
-// Consider if this is the best way to expose cache access.
+// GetAnalyzer returns the analyzer instance.
 func (dc *DeepCompleter) GetAnalyzer() Analyzer {
 	return dc.analyzer
 }
 
-// GetCompletion provides basic completion for a direct code snippet (no AST analysis).
+// GetCompletion provides basic completion for a direct code snippet.
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
 	logger := slog.Default().With("operation", "GetCompletion")
 	logger.Info("Handling basic completion request")
-
-	currentConfig := dc.GetCurrentConfig() // Get config safely
-
+	currentConfig := dc.GetCurrentConfig()
 	contextPreamble := "// Provide Go code completion below."
 	snippetCtx := SnippetContext{Prefix: codeSnippet}
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig)
 	logger.Debug("Generated basic prompt", "length", len(prompt))
 
-	// Call the LLM client via retry logic
 	var buffer bytes.Buffer
 	apiCallFunc := func() error {
 		select {
 		case <-ctx.Done():
-			return ctx.Err() // Check context before attempt
+			return ctx.Err()
 		default:
 		}
 		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
 		defer cancelApi()
-
 		logger.Debug("Calling Ollama GenerateStream for basic completion")
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig)
 		if apiErr != nil {
 			return apiErr
-		} // Return error to potentially retry
-
-		// Process stream
+		}
 		streamCtx, cancelStream := context.WithTimeout(apiCtx, 50*time.Second)
 		defer cancelStream()
-		buffer.Reset()                                            // Clear buffer for this attempt
-		streamErr := streamCompletion(streamCtx, reader, &buffer) // Uses slog
+		buffer.Reset()
+		streamErr := streamCompletion(streamCtx, reader, &buffer)
 		if streamErr != nil {
 			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
-		} // Wrap stream errors
-		return nil // Success for this attempt
+		}
+		return nil
 	}
 
-	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, logger) // retry uses slog
+	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, logger)
 	if err != nil {
-		// Check context cancellation one last time
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		default:
 		}
-		// Categorize final error
 		if errors.Is(err, ErrOllamaUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			logger.Error("Ollama unavailable for basic completion after retries", "error", err)
 			return "", fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 		}
 		if errors.Is(err, ErrStreamProcessing) {
 			logger.Error("Stream processing error for basic completion after retries", "error", err)
-			return "", err // Return the wrapped ErrStreamProcessing
+			return "", err
 		}
 		logger.Error("Failed to get basic completion after retries", "error", err)
 		return "", fmt.Errorf("failed to get basic completion after %d retries: %w", maxRetries, err)
@@ -1414,35 +1328,26 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 }
 
 // GetCompletionStreamFromFile provides context-aware completion using analysis, streaming the result.
-// Updated for Cycle 9 versioning and expects validated filename.
 func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFilename string, version int, line, col int, w io.Writer) error {
-	// Assume absFilename is already validated by the caller (handler)
 	logger := slog.Default().With("operation", "GetCompletionStreamFromFile", "path", absFilename, "version", version, "line", line, "col", col)
-
-	currentConfig := dc.GetCurrentConfig() // Get config safely
+	currentConfig := dc.GetCurrentConfig()
 	var contextPreamble string = "// Basic file context only."
 	var analysisInfo *AstContextInfo
-	var analysisErr error // To store non-fatal analysis errors
+	var analysisErr error
 
-	// Perform analysis if enabled
 	if currentConfig.UseAst {
 		logger.Info("Analyzing context (or checking cache)")
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 30*time.Second)
-		// Pass version to Analyze
 		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, absFilename, version, line, col)
 		cancelAnalysis()
 
-		// Handle analysis errors (fatal vs non-fatal)
 		if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) {
 			logger.Error("Fatal error during analysis/cache check", "error", analysisErr)
-			return fmt.Errorf("analysis failed fatally: %w", analysisErr) // Return fatal errors immediately
+			return fmt.Errorf("analysis failed fatally: %w", analysisErr)
 		}
-		// Keep non-fatal errors (wrapped in ErrAnalysisFailed) to potentially notify user later
 		if analysisErr != nil {
 			logger.Warn("Non-fatal error during analysis/cache check", "error", analysisErr)
 		}
-
-		// Use preamble if available
 		if analysisInfo != nil && analysisInfo.PromptPreamble != "" {
 			contextPreamble = analysisInfo.PromptPreamble
 		} else if analysisErr != nil {
@@ -1454,19 +1359,15 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 		logger.Info("AST analysis disabled by config.")
 	}
 
-	// Extract code snippet around cursor
-	// Pass validated absFilename
-	snippetCtx, snippetErr := extractSnippetContext(absFilename, line, col) // Uses slog
+	snippetCtx, snippetErr := extractSnippetContext(absFilename, line, col)
 	if snippetErr != nil {
 		logger.Error("Failed to extract code snippet context", "error", snippetErr)
 		return fmt.Errorf("failed to extract code snippet context: %w", snippetErr)
 	}
 
-	// Format the final prompt
-	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig) // Uses slog
+	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig)
 	logger.Debug("Generated prompt", "length", len(prompt))
 
-	// --- API Call with Retry ---
 	apiCallFunc := func() error {
 		select {
 		case <-ctx.Done():
@@ -1475,47 +1376,40 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 		}
 		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
 		defer cancelApi()
-
 		logger.Debug("Calling Ollama GenerateStream")
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig)
 		if apiErr != nil {
 			return apiErr
-		} // Let retry handler classify
-
-		// Process stream, write directly to provided writer w
-		streamErr := streamCompletion(apiCtx, reader, w) // streamCompletion uses slog
+		}
+		streamErr := streamCompletion(apiCtx, reader, w)
 		if streamErr != nil {
 			return fmt.Errorf("%w: %w", ErrStreamProcessing, streamErr)
-		} // Wrap stream errors
+		}
 		return nil
 	}
 
-	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, logger) // retry uses slog
+	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, logger)
 	if err != nil {
 		select {
 		case <-ctx.Done():
-			return ctx.Err() // Prefer context error if cancelled
+			return ctx.Err()
 		default:
 		}
-		// Categorize final error
 		if errors.Is(err, ErrOllamaUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			logger.Error("Ollama unavailable for stream after retries", "error", err)
-			// Return specific error for handler to potentially notify user
 			return fmt.Errorf("%w: %w", ErrOllamaUnavailable, err)
 		}
 		if errors.Is(err, ErrStreamProcessing) {
 			logger.Error("Stream processing error for stream after retries", "error", err)
-			return err // Return wrapped ErrStreamProcessing
+			return err
 		}
 		logger.Error("Failed to get completion stream after retries", "error", err)
 		return fmt.Errorf("failed to get completion stream after %d retries: %w", maxRetries, err)
 	}
 
-	// Log analysis warnings if stream succeeded
 	if analysisErr != nil {
 		logger.Warn("Completion stream successful, but context analysis encountered non-fatal errors", "analysis_error", analysisErr)
-		// Don't return analysisErr here, as completion succeeded. Handler might notify user based on analysisErr.
 	}
 	logger.Info("Completion stream successful")
-	return nil // Success
+	return nil
 }
