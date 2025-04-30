@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/match"
 )
 
 // ============================================================================
@@ -913,6 +912,7 @@ func (s *Server) handleShutdown(ctx context.Context, event Event, logger *slog.L
 	return nil, nil
 }
 
+// ** MODIFIED: Cycle 1 - Refined CompletionItem generation **
 func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog.Logger) (result any, errObj *ErrorObject) {
 	logger.Info("Core handler: completion")
 	var params CompletionParams
@@ -941,7 +941,7 @@ func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog
 
 	if !ok {
 		logger.Error("Document not found for completion")
-		return nil, nil
+		return nil, nil // Return empty list if doc not found
 	}
 
 	// Update LastAccess time (needs write lock)
@@ -955,7 +955,7 @@ func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog
 	goLine, goCol, byteOffset, posErr := LspPositionToBytePosition(docInfo.Content, LSPPosition{Line: params.Position.Line, Character: params.Position.Character})
 	if posErr != nil {
 		logger.Error("Error converting LSP position", "error", posErr)
-		return nil, nil
+		return nil, nil // Return empty list on position conversion error
 	}
 
 	s.docStoreMutex.RLock()
@@ -971,12 +971,13 @@ func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog
 			logger.Warn("Completion cancelled during core completer execution.")
 			return nil, &ErrorObject{Code: JsonRpcRequestCancelled, Message: "Request cancelled"}
 		} else if errors.Is(err, ErrOllamaUnavailable) {
-			logger.Error("Ollama unavailable for completion", "error", err)
+			logger.Error("Model backend unavailable for completion", "error", err)
 			s.sendShowMessageNotification(MessageTypeError, "Completion backend (Ollama) is unavailable.")
 			return nil, &ErrorObject{Code: JsonRpcRequestFailed, Message: "Completion backend unavailable."}
 		} else if errors.Is(err, ErrAnalysisFailed) {
 			logger.Warn("Analysis failed non-fatally during completion", "error", err)
 			s.sendShowMessageNotification(MessageTypeWarning, fmt.Sprintf("Analysis issues: %v. Completion may be less accurate.", err))
+			// Continue to provide completion if possible, even with analysis errors
 		} else {
 			logger.Error("Error getting completion from core", "error", err)
 			s.sendShowMessageNotification(MessageTypeError, "Internal error generating completion.")
@@ -988,6 +989,7 @@ func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog
 	completionResult := CompletionList{IsIncomplete: false, Items: []CompletionItem{}}
 	if completionText != "" {
 		keepCompletion := true
+		// Filter based on subsequent text (basic check)
 		if byteOffset >= 0 && byteOffset <= len(docInfo.Content) {
 			maxSubsequentLen := 50
 			endSubsequent := byteOffset + maxSubsequentLen
@@ -996,15 +998,23 @@ func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog
 			}
 			subsequentBytes := docInfo.Content[byteOffset:endSubsequent]
 			subsequentText := string(subsequentBytes)
-			if len(subsequentText) > 0 && !match.Match(completionText, subsequentText+"*") {
-				logger.Info("Filtering completion due to subsequent text mismatch")
+			// Basic check: if the completion starts with the same text that's already there, filter it out.
+			// More advanced filtering (e.g., fuzzy matching) could be added.
+			if len(subsequentText) > 0 && strings.HasPrefix(completionText, subsequentText) {
+				logger.Info("Filtering completion because it matches subsequent text", "completion_start", firstN(completionText, 20), "subsequent_text", subsequentText)
 				keepCompletion = false
 			}
+			// Original match.Match filtering (might be too strict?)
+			// if len(subsequentText) > 0 && !match.Match(completionText, subsequentText+"*") {
+			// 	logger.Info("Filtering completion due to subsequent text mismatch (match.Match)")
+			// 	keepCompletion = false
+			// }
 		} else {
 			logger.Warn("Invalid byte offset for filtering", "offset", byteOffset)
 		}
 
 		if keepCompletion {
+			// Generate a user-friendly label (e.g., first line or truncated)
 			label := strings.TrimSpace(completionText)
 			if firstNewline := strings.Index(label, "\n"); firstNewline != -1 {
 				label = label[:firstNewline]
@@ -1012,17 +1022,20 @@ func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog
 			if len(label) > 50 {
 				label = label[:50] + "..."
 			}
-			// Use package function for kind mapping (defined in lsp_protocol.go)
-			kind := mapTypeToCompletionKind(nil) // Pass nil as we don't have the object yet
-			logger.Debug("Completion kind mapping not fully implemented, using default.", "default_kind", kind)
+
+			// Use package function for kind mapping (defaults to Snippet if obj is nil)
+			kind := mapTypeToCompletionKind(nil)
 
 			item := CompletionItem{
 				Label:  label,
 				Kind:   kind,
-				Detail: "DeepComplete Suggestion",
+				Detail: "Model Suggestion", // ** MODIFIED: Cycle 1 **
 			}
+
+			// Apply snippet formatting if client supports it
 			if s.clientSupportsSnippets {
 				item.InsertTextFormat = SnippetFormat
+				// Add $0 for final cursor position after insertion
 				item.InsertText = completionText + "$0"
 			} else {
 				item.InsertTextFormat = PlainTextFormat
@@ -1032,6 +1045,7 @@ func (s *Server) handleCompletion(ctx context.Context, event Event, logger *slog
 		}
 	}
 
+	// Return the list (might be empty if completion was empty or filtered)
 	return completionResult, nil
 }
 

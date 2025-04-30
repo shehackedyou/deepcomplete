@@ -11,6 +11,7 @@ import (
 	"go/token" // Needed for tokenPosToLSPLocation, nodeRangeToLSPRange
 	"go/types" // Needed for mapTypeToCompletionKind
 	"log/slog" // Needed for helpers
+
 	// Needed for tokenPosToLSPLocation
 	// Needed for formatObjectForHover (if moved back here)
 	"unicode/utf8" // Needed for byteOffsetToLSPPosition, bytesToUTF16Offset
@@ -218,6 +219,7 @@ type CompletionItem struct {
 	Documentation    string             `json:"documentation,omitempty"`    // Documentation string (can be MarkupContent later)
 	InsertTextFormat InsertTextFormat   `json:"insertTextFormat,omitempty"` // PlainText or Snippet
 	InsertText       string             `json:"insertText,omitempty"`       // Text to insert
+	// TODO: Add preselect, sortText, filterText etc. later if needed
 }
 
 // CompletionItemKind defines the kind of completion item.
@@ -239,7 +241,7 @@ const (
 	CompletionItemKindValue         CompletionItemKind = 12
 	CompletionItemKindEnum          CompletionItemKind = 13
 	CompletionItemKindKeyword       CompletionItemKind = 14
-	CompletionItemKindSnippet       CompletionItemKind = 15
+	CompletionItemKindSnippet       CompletionItemKind = 15 // ** MODIFIED: Cycle 1 - Now default for model suggestions **
 	CompletionItemKindColor         CompletionItemKind = 16
 	CompletionItemKindFile          CompletionItemKind = 17
 	CompletionItemKindReference     CompletionItemKind = 18
@@ -394,9 +396,11 @@ type ErrorObject struct {
 
 // mapTypeToCompletionKind maps a Go types.Object to an LSP CompletionItemKind.
 // (Moved from lsp_server.go)
+// ** MODIFIED: Cycle 1 - Default to Snippet for model suggestions **
 func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	if obj == nil {
-		return CompletionItemKindText // Default if no object info
+		// Default to Snippet kind for completions generated without specific type info (e.g., LLM suggestions)
+		return CompletionItemKindSnippet
 	}
 
 	switch o := obj.(type) {
@@ -431,7 +435,8 @@ func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	case *types.Nil:
 		return CompletionItemKindValue
 	default:
-		return CompletionItemKindText // Default fallback
+		// Fallback for other known types.Object types
+		return CompletionItemKindText
 	}
 }
 
