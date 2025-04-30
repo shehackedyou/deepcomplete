@@ -388,7 +388,14 @@ func buildPreamble(
 
 	// --- Build Preamble Sections ---
 	// Add file/package context
-	if !addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), info.PackageName)) {
+	pkgName := info.PackageName
+	if pkgName == "" && info.TargetPackage != nil && info.TargetPackage.Types != nil {
+		pkgName = info.TargetPackage.Types.Name() // Get package name from types if available
+	}
+	if pkgName == "" {
+		pkgName = "[unknown]" // Fallback
+	}
+	if !addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), pkgName)) {
 		return preamble.String()
 	}
 
@@ -467,7 +474,12 @@ func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo,
 		sigStr := types.TypeString(info.EnclosingFunc.Type(), qualifier)
 		// Clean up signature string for methods
 		if info.ReceiverType != "" && strings.HasPrefix(sigStr, "func(") {
-			sigStr = strings.TrimPrefix(sigStr, "func") // Keep func keyword for clarity? Maybe remove only first 'func'? Let's keep func for now.
+			// Remove the receiver part from the signature string as we add it separately
+			if firstParen := strings.Index(sigStr, "("); firstParen != -1 {
+				if secondParen := strings.Index(sigStr[firstParen+1:], ")"); secondParen != -1 {
+					sigStr = "func" + sigStr[firstParen+1+secondParen+1:]
+				}
+			}
 		}
 		funcHeader = fmt.Sprintf("// Enclosing %s: %s%s%s\n", funcOrMethod, receiverStr, name, sigStr)
 	} else if info.EnclosingFuncNode != nil { // Fallback to AST node
@@ -1275,7 +1287,8 @@ func findContextNodes(
 							// Definition is in another file in the package. Find its AST.
 							if pkg != nil {
 								for _, syntaxFile := range pkg.Syntax {
-									if fset.File(syntaxFile.Pos()) == defFile {
+									// Check if the file object associated with the syntax file's position matches the definition file object
+									if syntaxFile != nil && fset.File(syntaxFile.Pos()) == defFile {
 										defAST = syntaxFile
 										break
 									}
@@ -1314,6 +1327,17 @@ func findContextNodes(
 											if name != nil && name.Pos() == defPos {
 												isDeclNode = true
 												break
+											}
+										}
+									case *ast.AssignStmt: // Check for short variable declaration
+										if n.Tok == token.DEFINE {
+											for _, lhsExpr := range n.Lhs {
+												if id, ok := lhsExpr.(*ast.Ident); ok && id.Pos() == defPos {
+													// We found the identifier in the LHS of :=
+													// The AssignStmt itself is the closest we get to a "declaration" node here.
+													isDeclNode = true
+													break
+												}
 											}
 										}
 									}
@@ -1547,11 +1571,13 @@ func listStructFields(st *types.Struct, qualifier types.Qualifier) []MemberInfo 
 // ============================================================================
 
 // formatObjectForHover creates a Markdown string for hover info.
+// ** MODIFIED: Cycle 2 - Refined doc comment extraction and formatting **
 func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.Logger) string {
 	if obj == nil {
 		logger.Debug("formatObjectForHover called with nil object")
 		return ""
 	}
+	hoverLogger := logger.With("object_name", obj.Name(), "object_type", fmt.Sprintf("%T", obj))
 
 	var hoverText strings.Builder
 
@@ -1559,21 +1585,26 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 	var qualifier types.Qualifier
 	if info.TargetPackage != nil && info.TargetPackage.Types != nil {
 		qualifier = types.RelativeTo(info.TargetPackage.Types)
+		hoverLogger.Debug("Using package qualifier for hover formatting")
 	} else {
-		qualifier = func(other *types.Package) string {
+		qualifier = func(other *types.Package) string { // Fallback qualifier
 			if other != nil {
 				return other.Name()
 			}
 			return ""
-		} // Fallback
+		}
+		hoverLogger.Warn("Target package or types missing, using fallback qualifier for hover.")
 	}
+
+	// Use types.ObjectString for a concise definition string
 	definition := types.ObjectString(obj, qualifier)
 	if definition != "" {
 		hoverText.WriteString("```go\n")
 		hoverText.WriteString(definition)
 		hoverText.WriteString("\n```") // End code block
+		hoverLogger.Debug("Formatted object definition", "definition", definition)
 	} else {
-		logger.Warn("Could not format object definition string", "object", obj.Name())
+		hoverLogger.Warn("Could not format object definition string")
 	}
 
 	// --- 2. Find and Format Documentation ---
@@ -1582,37 +1613,51 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 
 	// Attempt to get comment from the definition node found earlier
 	if info.IdentifierDefNode != nil {
+		hoverLogger.Debug("Attempting to find doc comment on definition node", "def_node_type", fmt.Sprintf("%T", info.IdentifierDefNode), "def_node_pos", getPosString(info.TargetFileSet, info.IdentifierDefNode.Pos()))
 		switch n := info.IdentifierDefNode.(type) {
 		case *ast.FuncDecl:
 			commentGroup = n.Doc
 		case *ast.GenDecl: // Handles var, const, type blocks
 			// For GenDecl, find the specific Spec that matches the object's position
 			// This is more accurate than just using n.Doc, which applies to the whole block.
+			foundSpecDoc := false
 			for _, spec := range n.Specs {
+				var specDoc *ast.CommentGroup
+				var specPos token.Pos = token.NoPos
+				match := false
 				switch s := spec.(type) {
 				case *ast.ValueSpec: // var, const
 					for _, name := range s.Names {
-						if name.Pos() == obj.Pos() {
-							commentGroup = s.Doc
-							if commentGroup == nil { // Fallback to GenDecl doc if spec doc is nil
-								commentGroup = n.Doc
-							}
-							goto foundDoc // Exit spec loop
+						if name != nil && name.Pos() == obj.Pos() {
+							specDoc = s.Doc
+							specPos = s.Pos()
+							match = true
+							break
 						}
 					}
 				case *ast.TypeSpec: // type
 					if s.Name != nil && s.Name.Pos() == obj.Pos() {
-						commentGroup = s.Doc
-						if commentGroup == nil { // Fallback
-							commentGroup = n.Doc
-						}
-						goto foundDoc // Exit spec loop
+						specDoc = s.Doc
+						specPos = s.Pos()
+						match = true
 					}
+				}
+				if match {
+					commentGroup = specDoc
+					if commentGroup == nil { // Fallback to GenDecl doc if spec doc is nil
+						commentGroup = n.Doc
+						hoverLogger.Debug("Using GenDecl doc as fallback", "spec_type", fmt.Sprintf("%T", spec), "spec_pos", getPosString(info.TargetFileSet, specPos))
+					} else {
+						hoverLogger.Debug("Found doc comment on specific Spec node", "spec_type", fmt.Sprintf("%T", spec), "spec_pos", getPosString(info.TargetFileSet, specPos))
+					}
+					foundSpecDoc = true
+					break // Exit spec loop
 				}
 			}
 			// If no specific spec matched, use the GenDecl doc as a last resort
-			if commentGroup == nil {
+			if !foundSpecDoc {
 				commentGroup = n.Doc
+				hoverLogger.Debug("No matching Spec found in GenDecl, using GenDecl doc", "gen_decl_pos", getPosString(info.TargetFileSet, n.Pos()))
 			}
 		case *ast.TypeSpec: // Handles individual type specs outside GenDecl (less common)
 			commentGroup = n.Doc
@@ -1622,22 +1667,23 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 			commentGroup = n.Doc
 		case *ast.AssignStmt: // Handle short variable declarations (var := value)
 			// Check if the object's position matches one of the Lhs identifiers
-			for _, lhsExpr := range n.Lhs {
-				if ident, ok := lhsExpr.(*ast.Ident); ok && ident.Pos() == obj.Pos() {
-					// Short var decls don't have their own .Doc field.
-					// We might look for comments *preceding* the AssignStmt in the CommentMap,
-					// but that requires passing the CommentMap or re-creating it here.
-					// For now, we won't find docs for short var decls this way.
-					logger.Debug("Hover object is a short variable declaration; doc comment lookup not implemented for this case.", "object", obj.Name())
-					break
+			if n.Tok == token.DEFINE {
+				for _, lhsExpr := range n.Lhs {
+					if ident, ok := lhsExpr.(*ast.Ident); ok && ident.Pos() == obj.Pos() {
+						// Short var decls don't have their own .Doc field.
+						// We might look for comments *preceding* the AssignStmt in the CommentMap,
+						// but that requires passing the CommentMap or re-creating it here.
+						// For now, we won't find docs for short var decls this way.
+						hoverLogger.Debug("Hover object is a short variable declaration; doc comment lookup not supported for this case.")
+						break
+					}
 				}
 			}
 		default:
-			logger.Debug("Hover documentation lookup: Unhandled definition node type", "type", fmt.Sprintf("%T", n))
+			hoverLogger.Debug("Hover documentation lookup: Unhandled definition node type", "type", fmt.Sprintf("%T", n))
 		}
-	foundDoc: // Label to jump to after finding doc in GenDecl specs
 	} else {
-		logger.Debug("Defining node (IdentifierDefNode) not found in AstContextInfo", "object", obj.Name())
+		hoverLogger.Debug("Defining node (IdentifierDefNode) not found in AstContextInfo")
 		// TODO: Fallback? Could try finding comments near obj.Pos() using CommentMap if available?
 	}
 
@@ -1657,9 +1703,9 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 			}
 		}
 		docComment = doc.String()
-		logger.Debug("Found and formatted doc comment for object", "object", obj.Name())
+		hoverLogger.Debug("Found and formatted doc comment", "comment_length", len(docComment))
 	} else if info.IdentifierDefNode != nil {
-		logger.Debug("No doc comment found on definition node", "object", obj.Name(), "node_type", fmt.Sprintf("%T", info.IdentifierDefNode))
+		hoverLogger.Debug("No doc comment found on definition node")
 	}
 
 	// Combine definition and documentation
@@ -1672,10 +1718,11 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 
 	finalContent := hoverText.String()
 	// Avoid returning just an empty code block if definition is empty and no docs found
-	if strings.TrimSpace(finalContent) == "```go\n```" {
+	if strings.TrimSpace(finalContent) == "```go\n```" || strings.TrimSpace(finalContent) == "" {
+		hoverLogger.Debug("No hover content generated (empty definition and no docs).")
 		return ""
 	}
-	logger.Debug("Formatted hover content", "object", obj.Name(), "content_length", len(finalContent))
+	hoverLogger.Debug("Formatted hover content generated", "content_length", len(finalContent))
 	return finalContent
 }
 
