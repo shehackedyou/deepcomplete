@@ -99,7 +99,6 @@ type Config struct {
 }
 
 // Validate checks if configuration values are valid, applying defaults for some fields.
-// Cycle 1: Added more explicit logging for default application.
 func (c *Config) Validate() error {
 	var validationErrors []error
 	logger := slog.Default() // Use default logger for validation warnings
@@ -339,18 +338,17 @@ var (
 )
 
 // =============================================================================
-// Configuration Loading (Cycle 1: Refined error handling and logging)
+// Configuration Loading
 // =============================================================================
 
 // LoadConfig loads configuration from standard locations, merges with defaults,
 // and attempts to write a default config if none exists or is invalid.
-// Returns the loaded config and a potential non-fatal ErrConfig wrapping specific issues.
 func LoadConfig() (Config, error) {
-	logger := slog.Default() // Use default logger, assume initialized by caller
+	logger := slog.Default()
 	cfg := DefaultConfig
 	var loadedFromFile bool
 	var loadErrors []error
-	var configParseError error // Store the first JSON parsing error encountered
+	var configParseError error
 
 	primaryPath, secondaryPath, pathErr := getConfigPaths()
 	if pathErr != nil {
@@ -358,14 +356,12 @@ func LoadConfig() (Config, error) {
 		logger.Warn("Could not determine config paths", "error", pathErr)
 	}
 
-	// Try loading from primary path
 	if primaryPath != "" {
 		logger.Debug("Attempting to load config", "path", primaryPath)
-		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg, logger) // Pass logger
+		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg, logger)
 		if loadErr != nil {
-			// Check if it's a parsing error specifically
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				configParseError = loadErr // Record the parse error
+				configParseError = loadErr
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", primaryPath, loadErr))
 			logger.Warn("Failed to load or merge config", "path", primaryPath, "error", loadErr)
@@ -377,20 +373,17 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Try secondary path if primary wasn't found or failed to parse
 	primaryNotFoundOrFailed := !loadedFromFile || configParseError != nil
 	if primaryNotFoundOrFailed && secondaryPath != "" {
 		logger.Debug("Attempting to load config from secondary path", "path", secondaryPath)
-		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg, logger) // Pass logger
+		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg, logger)
 		if loadErr != nil {
-			// Record parse error only if we haven't recorded one already
 			if configParseError == nil && strings.Contains(loadErr.Error(), "parsing config file JSON") {
 				configParseError = loadErr
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", secondaryPath, loadErr))
 			logger.Warn("Failed to load or merge config", "path", secondaryPath, "error", loadErr)
 		} else if loaded {
-			// Only set loadedFromFile if it wasn't already true from primary
 			if !loadedFromFile {
 				loadedFromFile = true
 				logger.Info("Loaded config", "path", secondaryPath)
@@ -400,7 +393,6 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Write default config if no file was loaded successfully OR if parsing failed
 	loadSucceeded := loadedFromFile && configParseError == nil
 	if !loadSucceeded {
 		if configParseError != nil {
@@ -408,7 +400,6 @@ func LoadConfig() (Config, error) {
 		} else {
 			logger.Info("No valid config file found. Attempting to write default.")
 		}
-		// Determine write path (prefer primary)
 		writePath := primaryPath
 		if writePath == "" {
 			writePath = secondaryPath
@@ -424,12 +415,10 @@ func LoadConfig() (Config, error) {
 			logger.Warn("Cannot determine path to write default config.")
 			loadErrors = append(loadErrors, errors.New("cannot determine default config path"))
 		}
-		// Reset to defaults if load/write failed
 		cfg = DefaultConfig
 		logger.Info("Using default configuration values.")
 	}
 
-	// Ensure internal templates are set (they are not loaded from file)
 	if cfg.PromptTemplate == "" {
 		cfg.PromptTemplate = promptTemplate
 	}
@@ -437,27 +426,21 @@ func LoadConfig() (Config, error) {
 		cfg.FimTemplate = fimPromptTemplate
 	}
 
-	// Final validation of the resulting config (could be merged or default)
 	finalCfg := cfg
 	if err := finalCfg.Validate(); err != nil {
-		// If the merged/loaded config is invalid, log it and fall back to pure defaults
 		logger.Warn("Config after load/merge failed validation. Falling back to pure defaults.", "error", err)
 		loadErrors = append(loadErrors, fmt.Errorf("post-load config validation failed: %w", err))
-		// Validate pure defaults as a safety check
 		if valErr := DefaultConfig.Validate(); valErr != nil {
-			// This should not happen if DefaultConfig is correct
 			logger.Error("FATAL: Default config is invalid", "error", valErr)
 			return DefaultConfig, fmt.Errorf("default config is invalid: %w", valErr)
 		}
 		finalCfg = DefaultConfig
 	}
 
-	// Return config and potentially wrapped non-fatal errors
 	if len(loadErrors) > 0 {
-		// Wrap all collected errors under ErrConfig
 		return finalCfg, fmt.Errorf("%w: %w", ErrConfig, errors.Join(loadErrors...))
 	}
-	return finalCfg, nil // Success or non-fatal recoverable errors occurred
+	return finalCfg, nil
 }
 
 // getConfigPaths determines the primary (XDG) and secondary (~/.config) config paths.
@@ -490,27 +473,24 @@ func getConfigPaths() (primary string, secondary string, err error) {
 }
 
 // loadAndMergeConfig attempts to load config from a path and merge into cfg.
-// Cycle 1: Added logger parameter.
 func loadAndMergeConfig(path string, cfg *Config, logger *slog.Logger) (loaded bool, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil // File not found is not an error here
+			return false, nil
 		}
 		return false, fmt.Errorf("reading config file %q failed: %w", path, err)
 	}
 	if len(data) == 0 {
 		logger.Warn("Config file exists but is empty, ignoring.", "path", path)
-		return true, nil // Treat as loaded but empty
+		return true, nil
 	}
 
 	var fileCfg FileConfig
 	if err := json.Unmarshal(data, &fileCfg); err != nil {
-		// Return a specific error message for easier identification upstream
 		return true, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
 	}
 
-	// Merge loaded fields into cfg, overwriting defaults only if field was present in JSON
 	mergedFields := 0
 	if fileCfg.OllamaURL != nil {
 		cfg.OllamaURL = *fileCfg.OllamaURL
@@ -554,7 +534,7 @@ func loadAndMergeConfig(path string, cfg *Config, logger *slog.Logger) (loaded b
 	}
 	logger.Debug("Merged configuration from file", "path", path, "fields_merged", mergedFields)
 
-	return true, nil // Loaded and merged successfully
+	return true, nil
 }
 
 // writeDefaultConfig creates the directory and writes the default config as JSON.
@@ -563,7 +543,6 @@ func writeDefaultConfig(path string, defaultConfig Config) error {
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
-	// Create an exportable struct containing only the fields to write
 	type ExportableConfig struct {
 		OllamaURL      string   `json:"ollama_url"`
 		Model          string   `json:"model"`
@@ -791,6 +770,7 @@ func (a *GoPackagesAnalyzer) Close() error {
 }
 
 // Analyze performs code analysis, orchestrating calls to helpers.
+// Cycle 2 Fix: Correctly handle the 5 return values from loadPackageAndFile.
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, version int, line, col int) (info *AstContextInfo, analysisErr error) {
 	logger := slog.Default().With("absFile", absFilename, "version", version, "line", line, "col", col)
 	info = &AstContextInfo{
@@ -909,17 +889,18 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		loadStart := time.Now()
 		fset := token.NewFileSet()
 		info.TargetFileSet = fset
-		targetPkg, targetFileAST, targetFile, loadErrors := loadPackageAndFile(ctx, absFilename, fset, logger)
+
+		// Cycle 2 Fix: Capture all 5 return values from loadPackageAndFile
+		var loadDiagnostics []Diagnostic
+		var loadErrors []error
+		targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := loadPackageAndFile(ctx, absFilename, fset, logger)
+		info.Diagnostics = append(info.Diagnostics, loadDiagnostics...) // Append diagnostics from loading
+
 		loadDuration = time.Since(loadStart)
 		logger.Debug("packages.Load completed", "duration", loadDuration)
 		for _, loadErr := range loadErrors {
 			addAnalysisError(info, loadErr, logger)
-			if pkgErr, ok := loadErr.(*packages.Error); ok {
-				diag := packagesErrorToDiagnostic(*pkgErr, fset, logger)
-				if diag != nil {
-					info.Diagnostics = append(info.Diagnostics, *diag)
-				}
-			}
+			// Diagnostics already created in loadPackageAndFile
 		}
 		info.TargetPackage = targetPkg
 		info.TargetAstFile = targetFileAST
@@ -1143,24 +1124,19 @@ type DeepCompleter struct {
 }
 
 // NewDeepCompleter creates a new DeepCompleter service with default config.
-// Cycle 1: Returns non-fatal config error alongside the completer instance.
 func NewDeepCompleter() (*DeepCompleter, error) {
-	cfg, configErr := LoadConfig() // LoadConfig now returns non-fatal ErrConfig
-	logger := slog.Default()       // Use default logger
+	cfg, configErr := LoadConfig()
+	logger := slog.Default()
 
-	// Log warning if configErr is ErrConfig, but continue initialization
 	if configErr != nil && errors.Is(configErr, ErrConfig) {
 		logger.Warn("Non-fatal error during initial config load. Using loaded/default values.", "error", configErr)
 	} else if configErr != nil {
-		// If it's a different, fatal error, return it immediately
 		logger.Error("Fatal error during initial config load", "error", configErr)
 		return nil, configErr
 	}
 
-	// Validate the loaded/default config (LoadConfig already does this, but double-check)
 	if err := cfg.Validate(); err != nil {
 		logger.Error("Loaded/default config is invalid even after LoadConfig", "error", err)
-		// This indicates a problem with DefaultConfig or Validate itself
 		return nil, fmt.Errorf("initial config validation failed: %w", err)
 	}
 
@@ -1172,11 +1148,10 @@ func NewDeepCompleter() (*DeepCompleter, error) {
 		config:    cfg,
 	}
 
-	// Return the completer instance AND the non-fatal config error if it occurred
 	if configErr != nil && errors.Is(configErr, ErrConfig) {
 		return dc, configErr
 	}
-	return dc, nil // Success
+	return dc, nil
 }
 
 // NewDeepCompleterWithConfig creates a new DeepCompleter service with provided config.
