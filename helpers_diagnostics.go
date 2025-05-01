@@ -56,8 +56,9 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 	kind := pkgErr.Kind // 0=Unknown, 1=ParseError, 2=TypeError
 
 	// Default position if parsing fails (start of file)
-	startPos := Position{Line: 0, Character: 0} // 0-based line, 0-based byte offset
-	endPos := Position{Line: 0, Character: 1}   // Default to 1 character length
+	// Use internal Position struct (0-based line, 0-based byte offset)
+	startPos := Position{Line: 0, Character: 0}
+	endPos := Position{Line: 0, Character: 1} // Default to 1 byte length
 
 	parts := strings.SplitN(posStr, ":", 4)
 	var filename string
