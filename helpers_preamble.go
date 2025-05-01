@@ -36,37 +36,50 @@ func constructPromptPreamble(
 
 // buildPreamble constructs the context string sent to the LLM from analysis info.
 // Internal helper called by constructPromptPreamble.
+// ** MODIFIED: Cycle 3 - Ensure logger is used correctly, improve limit handling **
 func buildPreamble(
 	analyzer *GoPackagesAnalyzer, // Pass down for potential future use
 	info *AstContextInfo,
 	qualifier types.Qualifier,
 	logger *slog.Logger,
 ) string {
+	if logger == nil {
+		logger = slog.Default() // Ensure logger is not nil
+	}
 	var preamble strings.Builder
 	// Use a reasonable internal limit, final truncation happens later in FormatPrompt
 	const internalPreambleLimit = 8192
 	currentLen := 0
+	limitReached := false // Track if limit was hit
 
 	// Helper to add string to preamble if within limit
 	addToPreamble := func(s string) bool {
+		if limitReached {
+			return false // Stop adding if limit already hit
+		}
 		if currentLen+len(s) < internalPreambleLimit {
 			preamble.WriteString(s)
 			currentLen += len(s)
 			return true
 		}
+		// Limit reached *now*
+		limitReached = true
 		logger.Debug("Internal preamble limit reached during construction", "limit", internalPreambleLimit)
-		return false // Limit reached
+		return false
 	}
 
 	// Helper to add truncation marker if within limit
 	addTruncMarker := func(section string) {
+		if limitReached { // Don't add marker if limit was already hit before this section
+			return
+		}
 		msg := fmt.Sprintf("//   ... (%s truncated)\n", section)
+		// Try to add the marker itself, respecting the limit
 		if currentLen+len(msg) < internalPreambleLimit {
 			preamble.WriteString(msg)
 			currentLen += len(msg)
-		} else {
-			// Don't log here, addToPreamble already logged limit reached
 		}
+		limitReached = true // Mark limit as reached even if marker couldn't be added
 	}
 
 	// --- Build Preamble Sections ---
@@ -78,29 +91,19 @@ func buildPreamble(
 	if pkgName == "" {
 		pkgName = "[unknown]" // Fallback
 	}
-	if !addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), pkgName)) {
-		return preamble.String() // Stop if limit reached
-	}
+	addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), pkgName))
 
 	// 2. Add imports section
-	if !formatImportsSection(&preamble, info, addToPreamble, addTruncMarker, logger) {
-		return preamble.String() // Stop if limit reached
-	}
+	formatImportsSection(&preamble, info, addToPreamble, addTruncMarker, logger)
 
 	// 3. Add enclosing function/method section
-	if !formatEnclosingFuncSection(&preamble, info, qualifier, addToPreamble) {
-		return preamble.String() // Stop if limit reached
-	}
+	formatEnclosingFuncSection(&preamble, info, qualifier, addToPreamble)
 
 	// 4. Add relevant comments section
-	if !formatCommentsSection(&preamble, info, addToPreamble, addTruncMarker, logger) {
-		return preamble.String() // Stop if limit reached
-	}
+	formatCommentsSection(&preamble, info, addToPreamble, addTruncMarker, logger)
 
 	// 5. Add specific cursor context (call, selector, etc.) section
-	if !formatCursorContextSection(&preamble, info, qualifier, addToPreamble, logger) {
-		return preamble.String() // Stop if limit reached
-	}
+	formatCursorContextSection(&preamble, info, qualifier, addToPreamble, logger)
 
 	// 6. Add variables/constants/types in scope section
 	formatScopeSection(&preamble, info, qualifier, addToPreamble, addTruncMarker, logger)
@@ -111,6 +114,7 @@ func buildPreamble(
 
 // formatImportsSection formats the import list, respecting limits.
 // Returns false if the internal preamble limit was reached during processing.
+// ** MODIFIED: Cycle 3 - Handle nil imports gracefully **
 func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add func(string) bool, addTrunc func(string), logger *slog.Logger) bool {
 	if len(info.Imports) == 0 {
 		return true // No imports, section skipped successfully
@@ -123,6 +127,7 @@ func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add f
 	maxImports := 20 // Limit number of imports shown for brevity
 	for _, imp := range info.Imports {
 		if imp == nil || imp.Path == nil {
+			logger.Warn("Skipping nil import spec or import path during preamble generation")
 			continue // Skip nil imports
 		}
 		if count >= maxImports {
@@ -146,6 +151,7 @@ func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add f
 
 // formatEnclosingFuncSection formats the enclosing function/method info.
 // Returns false if the internal preamble limit was reached.
+// ** MODIFIED: Cycle 3 - Improve fallback logic **
 func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool) bool {
 	funcOrMethod := "Function"
 	receiverStr := ""
@@ -218,9 +224,16 @@ func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo, add 
 
 // formatCursorContextSection formats specific context like calls, selectors, etc.
 // Returns false if the internal preamble limit was reached.
+// ** MODIFIED: Cycle 3 - Improve handling of unknown types/members and logging **
 func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, logger *slog.Logger) bool {
+	if logger == nil {
+		logger = slog.Default() // Ensure logger is not nil
+	}
+	contextAdded := false // Track if any context was added
+
 	// --- Function Call Context ---
 	if info.CallExpr != nil {
+		contextAdded = true
 		funcName := "[unknown function]"
 		// Attempt to get function name from AST
 		switch fun := info.CallExpr.Fun.(type) {
@@ -258,7 +271,11 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 							highlight += " (variadic)"
 						}
 					}
-					if !add(fmt.Sprintf("//     - %s%s\n", types.ObjectString(p, qualifier), highlight)) {
+					paramStr := types.ObjectString(p, qualifier)
+					if paramStr == "" {
+						paramStr = fmt.Sprintf("[unnamed %s]", types.TypeString(p.Type(), qualifier))
+					}
+					if !add(fmt.Sprintf("//     - %s%s\n", paramStr, highlight)) {
 						return false
 					}
 				}
@@ -277,7 +294,11 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 					if r == nil {
 						continue
 					}
-					if !add(fmt.Sprintf("//     - %s\n", types.ObjectString(r, qualifier))) {
+					resultStr := types.ObjectString(r, qualifier)
+					if resultStr == "" {
+						resultStr = fmt.Sprintf("[unnamed %s]", types.TypeString(r.Type(), qualifier))
+					}
+					if !add(fmt.Sprintf("//     - %s\n", resultStr)) {
 						return false
 					}
 				}
@@ -288,6 +309,7 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 			}
 		} else {
 			// Indicate if type analysis failed for the call expression
+			logger.Warn("Could not determine function signature for call expression", "function_name", funcName)
 			if !add("// Function Signature: (unknown - type analysis failed for call expression)\n") {
 				return false
 			}
@@ -297,6 +319,7 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 
 	// --- Selector Expression Context ---
 	if info.SelectorExpr != nil {
+		contextAdded = true
 		selName := ""
 		if info.SelectorExpr.Sel != nil {
 			selName = info.SelectorExpr.Sel.Name
@@ -368,12 +391,14 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 					}
 				}
 			} else { // Selected member is explicitly unknown
+				logger.Debug("Not listing members because selected member is unknown", "selector", selName, "base_type", typeName)
 				if !add("//   (Cannot list members: selected member is unknown)\n") {
 					return false
 				}
 			}
 		} else {
 			// Base expression type unknown
+			logger.Warn("Cannot list members for selector because base expression type is unknown")
 			if !add("//   (Cannot list members: type analysis failed for base expression)\n") {
 				return false
 			}
@@ -383,6 +408,7 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 
 	// --- Composite Literal Context ---
 	if info.CompositeLit != nil {
+		contextAdded = true
 		typeName := "(unknown - type analysis failed for literal)"
 		if info.CompositeLitType != nil {
 			typeName = types.TypeString(info.CompositeLitType, qualifier)
@@ -399,6 +425,7 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 				if ptr.Elem() != nil {
 					currentType = ptr.Elem().Underlying()
 				} else {
+					logger.Warn("Composite literal pointer type has nil element", "type", info.CompositeLitType.String())
 					currentType = nil // Invalid pointer type
 				}
 			}
@@ -446,6 +473,7 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 			}
 		} else {
 			// Literal type is unknown
+			logger.Warn("Cannot determine missing fields for composite literal: type analysis failed")
 			if !add("//   (Cannot determine missing fields: type analysis failed)\n") {
 				return false
 			}
@@ -455,10 +483,13 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 
 	// --- Identifier Context ---
 	if info.IdentifierAtCursor != nil {
+		contextAdded = true
 		identName := info.IdentifierAtCursor.Name
 		identTypeStr := "(Type unknown)"
 		if info.IdentifierType != nil {
 			identTypeStr = fmt.Sprintf("(Type: %s)", types.TypeString(info.IdentifierType, qualifier))
+		} else {
+			logger.Warn("Identifier found at cursor, but type is unknown", "identifier", identName)
 		}
 		if !add(fmt.Sprintf("// Identifier at cursor: %s %s\n", identName, identTypeStr)) {
 			return false
@@ -466,11 +497,18 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		return true // Handled identifier context successfully (within limits)
 	}
 
+	// If no specific context was added, maybe add a generic marker?
+	if !contextAdded {
+		// Optionally add a line indicating no specific context was identified
+		// add("// No specific call, selector, or literal context identified at cursor.\n")
+	}
+
 	return true // No specific cursor context found or limit reached earlier
 }
 
 // formatScopeSection formats variables/constants/types in scope, respecting limits.
 // Returns false if the internal preamble limit was reached.
+// ** MODIFIED: Cycle 3 - Ensure sorting and truncation work correctly **
 func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, addTrunc func(string), logger *slog.Logger) bool {
 	if len(info.VariablesInScope) == 0 {
 		return true // No scope variables, section skipped successfully
@@ -483,7 +521,12 @@ func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifi
 	var items []string
 	for name := range info.VariablesInScope {
 		obj := info.VariablesInScope[name]
-		items = append(items, fmt.Sprintf("//   %s\n", types.ObjectString(obj, qualifier))) // Use types.ObjectString for standard Go representation
+		objStr := types.ObjectString(obj, qualifier)
+		if objStr == "" {
+			// Fallback for objects that don't format well (e.g., unnamed results)
+			objStr = fmt.Sprintf("%s (type: %s)", obj.Name(), types.TypeString(obj.Type(), qualifier))
+		}
+		items = append(items, fmt.Sprintf("//   %s\n", objStr))
 	}
 	sort.Strings(items) // Sort for consistent order
 

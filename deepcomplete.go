@@ -892,6 +892,7 @@ func (a *GoPackagesAnalyzer) Close() error {
 // It orchestrates calls to loading, analysis steps, and preamble generation helpers.
 // Returns the populated AstContextInfo and any fatal error encountered during loading/analysis.
 // Non-fatal errors are collected within AstContextInfo.AnalysisErrors.
+// ** MODIFIED: Cycle 3 Fix - Pass ctx to performAnalysisSteps and gatherScopeContext **
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, version int, line, col int) (info *AstContextInfo, analysisErr error) {
 	logger := stdslog.Default().With("absFile", absFilename, "version", version, "line", line, "col", col)
 	// Initialize the result struct
@@ -1051,7 +1052,8 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		// Perform detailed analysis steps only if loading was somewhat successful
 		stepsStart := time.Now()
 		if targetFile != nil { // Need the token.File for position calculations
-			analyzeStepErr := performAnalysisSteps(targetFile, targetFileAST, targetPkg, fset, line, col, a, info, logger) // From helpers_analysis_steps.go
+			// ** MODIFIED: Cycle 3 Fix - Pass ctx **
+			analyzeStepErr := performAnalysisSteps(ctx, targetFile, targetFileAST, targetPkg, fset, line, col, a, info, logger) // From helpers_analysis_steps.go
 			if analyzeStepErr != nil {
 				// This function adds errors to info internally, but return fatal ones
 				addAnalysisError(info, analyzeStepErr, logger) // Log/store potentially fatal error
@@ -1062,7 +1064,8 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				addAnalysisError(info, errors.New("cannot perform analysis steps: target token.File is nil"), logger)
 			}
 			// Attempt to gather package scope even without file/AST context
-			gatherScopeContext(nil, targetPkg, fset, info, logger) // From helpers_analysis_steps.go
+			// ** MODIFIED: Cycle 3 Fix - Pass ctx **
+			gatherScopeContext(ctx, nil, targetPkg, fset, info, logger) // From helpers_analysis_steps.go
 		}
 		stepsDuration = time.Since(stepsStart)
 		logger.Debug("Analysis steps completed", "duration", stepsDuration)

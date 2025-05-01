@@ -3,6 +3,7 @@ package deepcomplete
 
 import (
 	"bytes"
+	"context" // Added for potential future context passing
 	"errors"
 	"fmt"
 	"go/ast"
@@ -23,7 +24,9 @@ import (
 // It populates the AstContextInfo struct with findings and diagnostics.
 // Returns an error only if a fatal error occurs preventing further analysis (e.g., invalid cursor).
 // Non-fatal errors are added to info.AnalysisErrors.
+// ** MODIFIED: Cycle 3 - Improved error handling and flow **
 func performAnalysisSteps(
+	ctx context.Context, // Added context
 	targetFile *token.File,
 	targetFileAST *ast.File,
 	targetPkg *packages.Package,
@@ -34,10 +37,17 @@ func performAnalysisSteps(
 	logger *slog.Logger,
 ) error {
 	// Defensive check for required inputs
-	if targetFile == nil || fset == nil {
-		err := errors.New("performAnalysisSteps requires non-nil targetFile and fset")
+	if fset == nil {
+		err := errors.New("performAnalysisSteps requires non-nil fset")
 		addAnalysisError(info, err, logger) // Assumes helpers_diagnostics.go exists
-		return err                          // Cannot proceed without file/fileset
+		return err                          // Cannot proceed without fileset
+	}
+	if targetFile == nil {
+		// Can still attempt package scope analysis even if target file is missing
+		logger.Warn("Target token.File is nil, proceeding with package scope analysis only.")
+		addAnalysisError(info, errors.New("target token.File is nil, cannot perform file-specific analysis"), logger)
+		gatherScopeContext(ctx, nil, targetPkg, fset, info, logger) // Pass nil path
+		return nil                                                  // Not a fatal error for the whole analysis process
 	}
 
 	// Calculate cursor position first (0-based token.Pos)
@@ -47,8 +57,8 @@ func performAnalysisSteps(
 		err := fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
 		addAnalysisError(info, err, logger)
 		// Attempt to gather package scope anyway, as it doesn't depend on cursor position
-		gatherScopeContext(nil, targetPkg, fset, info, logger) // Pass nil path
-		return err                                             // Return error to indicate failure
+		gatherScopeContext(ctx, nil, targetPkg, fset, info, logger) // Pass nil path
+		return err                                                  // Return error to indicate failure to get cursor context
 	}
 	info.CursorPos = cursorPos // Store valid cursor position
 	logger = logger.With("cursorPos", info.CursorPos, "cursorPosStr", fset.PositionFor(info.CursorPos, true).String())
@@ -60,22 +70,23 @@ func performAnalysisSteps(
 		// These functions populate the 'info' struct directly and add errors/diagnostics.
 
 		// 1. Find enclosing path and identify specific context nodes (call, selector, etc.)
-		path, pathErr := findEnclosingPathAndNodes(targetFileAST, info.CursorPos, targetPkg, fset, analyzer, info, logger)
+		path, pathErr := findEnclosingPathAndNodes(ctx, targetFileAST, info.CursorPos, targetPkg, fset, analyzer, info, logger)
 		if pathErr != nil {
 			// Error already added to info by the function
-			// Continue analysis if possible, but context might be less accurate
+			logger.Warn("Error finding enclosing path or nodes, context may be less accurate", "error", pathErr)
+			// Continue analysis if possible
 		}
 
 		// 2. Extract scope information based on path and package info
-		scopeErr := extractScopeInformation(path, targetPkg, info.CursorPos, analyzer, info, logger)
+		scopeErr := extractScopeInformation(ctx, path, targetPkg, info.CursorPos, analyzer, info, logger)
 		if scopeErr != nil {
-			// Error already added to info by the function
+			logger.Warn("Error extracting scope information", "error", scopeErr)
 		}
 
 		// 3. Extract relevant comments near the cursor
-		commentErr := extractRelevantComments(targetFileAST, path, info.CursorPos, fset, analyzer, info, logger)
+		commentErr := extractRelevantComments(ctx, targetFileAST, path, info.CursorPos, fset, analyzer, info, logger)
 		if commentErr != nil {
-			// Error already added to info by the function
+			logger.Warn("Error extracting relevant comments", "error", commentErr)
 		}
 
 		// --- Add analysis-based diagnostics ---
@@ -85,7 +96,7 @@ func performAnalysisSteps(
 		// AST is missing, likely due to load errors.
 		addAnalysisError(info, errors.New("cannot perform detailed AST analysis: targetFileAST is nil"), logger)
 		// Attempt to gather package scope anyway
-		gatherScopeContext(nil, targetPkg, fset, info, logger)
+		gatherScopeContext(ctx, nil, targetPkg, fset, info, logger)
 	}
 
 	// Return nil, non-fatal errors are collected in info.AnalysisErrors
@@ -94,7 +105,9 @@ func performAnalysisSteps(
 
 // findEnclosingPathAndNodes finds the AST path and identifies context nodes.
 // Populates info struct directly. Returns the path and any fatal error.
+// ** MODIFIED: Cycle 3 - Pass context, ensure errors added correctly **
 func findEnclosingPathAndNodes(
+	ctx context.Context, // Added context
 	targetFileAST *ast.File,
 	cursorPos token.Pos,
 	pkg *packages.Package,
@@ -106,17 +119,22 @@ func findEnclosingPathAndNodes(
 	// --- Memory Cache Check (Conceptual - Omitted for now) ---
 
 	// --- Direct Implementation ---
-	path := findEnclosingPath(targetFileAST, cursorPos, info, logger)
+	path, pathFindErr := findEnclosingPath(ctx, targetFileAST, cursorPos, info, logger)
+	if pathFindErr != nil {
+		// Error already added by findEnclosingPath
+		return nil, pathFindErr // Return the error if path finding failed
+	}
 	// findContextNodes populates info directly and adds errors to info.AnalysisErrors
-	findContextNodes(path, cursorPos, pkg, fset, analyzer, info, logger)
-	// Return the path, errors are collected in info.AnalysisErrors
-	// No fatal error expected here unless path finding fails fundamentally (handled in findEnclosingPath)
+	findContextNodes(ctx, path, cursorPos, pkg, fset, analyzer, info, logger)
+	// Return the path, non-fatal errors are collected in info.AnalysisErrors
 	return path, nil
 }
 
 // extractScopeInformation gathers variables/types in scope.
 // Populates info struct directly. Returns any fatal error.
+// ** MODIFIED: Cycle 3 - Pass context **
 func extractScopeInformation(
+	ctx context.Context, // Added context
 	path []ast.Node,
 	targetPkg *packages.Package,
 	cursorPos token.Pos,
@@ -127,13 +145,15 @@ func extractScopeInformation(
 	// --- Memory Cache Check (Conceptual - Omitted for now) ---
 
 	// --- Direct Implementation ---
-	gatherScopeContext(path, targetPkg, info.TargetFileSet, info, logger) // Populates info, adds errors internally
-	return nil                                                            // Errors are added to info.AnalysisErrors internally
+	gatherScopeContext(ctx, path, targetPkg, info.TargetFileSet, info, logger) // Populates info, adds errors internally
+	return nil                                                                 // Errors are added to info.AnalysisErrors internally
 }
 
 // extractRelevantComments finds comments near the cursor.
 // Populates info struct directly. Returns any fatal error.
+// ** MODIFIED: Cycle 3 - Pass context **
 func extractRelevantComments(
+	ctx context.Context, // Added context
 	targetFileAST *ast.File,
 	path []ast.Node,
 	cursorPos token.Pos,
@@ -145,31 +165,36 @@ func extractRelevantComments(
 	// --- Memory Cache Check (Conceptual - Omitted for now) ---
 
 	// --- Direct Implementation ---
-	findRelevantComments(targetFileAST, path, cursorPos, fset, info, logger) // Populates info, adds errors internally
-	return nil                                                               // Errors are added to info.AnalysisErrors internally
+	findRelevantComments(ctx, targetFileAST, path, cursorPos, fset, info, logger) // Populates info, adds errors internally
+	return nil                                                                    // Errors are added to info.AnalysisErrors internally
 }
 
 // findEnclosingPath finds the AST node path from the root to the node enclosing the cursor.
-func findEnclosingPath(targetFileAST *ast.File, cursorPos token.Pos, info *AstContextInfo, logger *slog.Logger) []ast.Node {
+// ** MODIFIED: Cycle 3 - Pass context, return error **
+func findEnclosingPath(ctx context.Context, targetFileAST *ast.File, cursorPos token.Pos, info *AstContextInfo, logger *slog.Logger) ([]ast.Node, error) {
 	if targetFileAST == nil {
-		addAnalysisError(info, errors.New("cannot find enclosing path: targetFileAST is nil"), logger)
-		return nil
+		err := errors.New("cannot find enclosing path: targetFileAST is nil")
+		addAnalysisError(info, err, logger)
+		return nil, err
 	}
 	if !cursorPos.IsValid() {
-		addAnalysisError(info, errors.New("cannot find enclosing path: invalid cursor position"), logger)
-		return nil
+		err := errors.New("cannot find enclosing path: invalid cursor position")
+		addAnalysisError(info, err, logger)
+		return nil, err
 	}
 	// astutil.PathEnclosingInterval finds the tightest enclosing node sequence
 	path, _ := astutil.PathEnclosingInterval(targetFileAST, cursorPos, cursorPos)
 	if path == nil {
 		logger.Debug("No AST path found enclosing cursor position", "pos", cursorPos)
+		// Not necessarily an error, could be whitespace
 	}
-	return path
+	return path, nil
 }
 
 // gatherScopeContext walks the enclosing path to find relevant scope information.
-func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
-	addPackageScope(targetPkg, info, logger) // Add package scope first
+// ** MODIFIED: Cycle 3 - Pass context, improve error handling/logging **
+func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *packages.Package, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
+	addPackageScope(ctx, targetPkg, info, logger) // Add package scope first
 
 	if path != nil {
 		for i := len(path) - 1; i >= 0; i-- { // Iterate from outermost to innermost relevant scope
@@ -187,13 +212,19 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *toke
 						if err := format.Node(&buf, fset, n.Recv.List[0].Type); err == nil {
 							info.ReceiverType = buf.String()
 						} else {
-							logger.Warn("could not format receiver type", "error", err)
+							logger.Warn("Could not format receiver type", "error", err)
 							info.ReceiverType = "[error formatting receiver]"
 							addAnalysisError(info, fmt.Errorf("receiver format error: %w", err), logger)
 						}
+					} else if n.Recv != nil {
+						logger.Debug("Could not get receiver type string from AST", "recv", n.Recv)
 					}
 				}
 				// Try to get type info for the function
+				funcName := "[anonymous]"
+				if n.Name != nil {
+					funcName = n.Name.Name
+				}
 				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Defs != nil && n.Name != nil {
 					if obj, ok := targetPkg.TypesInfo.Defs[n.Name]; ok && obj != nil {
 						if fn, ok := obj.(*types.Func); ok {
@@ -203,17 +234,17 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *toke
 							// Add signature parameters/results to the current scope map
 							if sig, ok := fn.Type().(*types.Signature); ok {
 								addSignatureToScope(sig, info.VariablesInScope)
+							} else {
+								logger.Warn("Function object type is not a signature", "func", funcName, "type", fn.Type())
 							}
+						} else {
+							logger.Warn("Object defined for func name is not a *types.Func", "func", funcName, "object_type", fmt.Sprintf("%T", obj))
 						}
 					} else if info.EnclosingFunc == nil { // Only log error if we haven't found type info yet
-						addAnalysisError(info, fmt.Errorf("definition for func '%s' not found in TypesInfo", n.Name.Name), logger)
+						addAnalysisError(info, fmt.Errorf("definition for func '%s' not found in TypesInfo", funcName), logger)
 					}
 				} else if info.EnclosingFunc == nil { // Log if type info is missing and we need it
 					reason := getMissingTypeInfoReason(targetPkg)
-					funcName := "[anonymous]"
-					if n.Name != nil {
-						funcName = n.Name.Name
-					}
 					addAnalysisError(info, fmt.Errorf("type info for enclosing func '%s' unavailable: %s", funcName, reason), logger)
 				}
 
@@ -222,17 +253,16 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *toke
 				if info.EnclosingBlock == nil {
 					info.EnclosingBlock = n
 				} // Capture the innermost block
+				posStr := getPosString(fset, n.Pos()) // Use helper for safe position string
 				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Scopes != nil {
 					if scope := targetPkg.TypesInfo.Scopes[n]; scope != nil {
 						// Add variables declared *before* the cursor within this block
 						addScopeVariables(scope, info.CursorPos, info.VariablesInScope)
 					} else { // Scope info missing for this node
-						posStr := getPosString(fset, n.Pos())
 						addAnalysisError(info, fmt.Errorf("scope info missing for block at %s", posStr), logger)
 					}
 				} else if info.EnclosingBlock == n { // Log if type info is missing for the innermost block
 					reason := getMissingTypeInfoReason(targetPkg)
-					posStr := getPosString(fset, n.Pos())
 					addAnalysisError(info, fmt.Errorf("cannot get scope variables for block at %s: %s", posStr, reason), logger)
 				}
 				// TODO: Add other scope-introducing nodes if necessary (e.g., *ast.IfStmt, *ast.ForStmt)
@@ -244,7 +274,8 @@ func gatherScopeContext(path []ast.Node, targetPkg *packages.Package, fset *toke
 }
 
 // addPackageScope adds package-level identifiers to the scope map.
-func addPackageScope(targetPkg *packages.Package, info *AstContextInfo, logger *slog.Logger) {
+// ** MODIFIED: Cycle 3 - Pass context, improve error handling **
+func addPackageScope(ctx context.Context, targetPkg *packages.Package, info *AstContextInfo, logger *slog.Logger) {
 	if targetPkg != nil && targetPkg.Types != nil {
 		pkgScope := targetPkg.Types.Scope()
 		if pkgScope != nil {
@@ -309,17 +340,31 @@ func addTupleToScope(tuple *types.Tuple, scopeMap map[string]types.Object) {
 }
 
 // findRelevantComments uses ast.CommentMap to find comments near the cursor.
-func findRelevantComments(targetFileAST *ast.File, path []ast.Node, cursorPos token.Pos, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
+// ** MODIFIED: Cycle 3 - Pass context, ensure cmap creation is robust **
+func findRelevantComments(ctx context.Context, targetFileAST *ast.File, path []ast.Node, cursorPos token.Pos, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
 	if targetFileAST == nil || fset == nil {
 		addAnalysisError(info, errors.New("cannot find comments: targetFileAST or fset is nil"), logger)
 		return
 	}
 	// Create a comment map for efficient lookup
+	// Check for nil Comments field before creating map
+	if targetFileAST.Comments == nil {
+		logger.Debug("No comments found in target AST file.")
+		info.CommentsNearCursor = []string{} // Ensure it's an empty slice, not nil
+		return
+	}
 	cmap := ast.NewCommentMap(fset, targetFileAST, targetFileAST.Comments)
+	if cmap == nil {
+		// This might happen if fset or node is nil internally, though we checked targetFileAST
+		addAnalysisError(info, errors.New("failed to create ast.CommentMap"), logger)
+		info.CommentsNearCursor = []string{}
+		return
+	}
 	info.CommentsNearCursor = findCommentsWithMap(cmap, path, cursorPos, fset, logger)
 }
 
 // findCommentsWithMap implements the logic to find preceding or enclosing doc comments.
+// ** MODIFIED: Cycle 3 - Improve preceding vs enclosing logic **
 func findCommentsWithMap(cmap ast.CommentMap, path []ast.Node, cursorPos token.Pos, fset *token.FileSet, logger *slog.Logger) []string {
 	var comments []string
 	if cmap == nil || !cursorPos.IsValid() || fset == nil {
@@ -327,14 +372,17 @@ func findCommentsWithMap(cmap ast.CommentMap, path []ast.Node, cursorPos token.P
 		return comments
 	}
 
-	cursorLine := fset.Position(cursorPos).Line
+	cursorPosInfo := fset.Position(cursorPos) // Get position info once
+	cursorLine := cursorPosInfo.Line
+
 	var precedingComments []string
 	foundPrecedingOnLine := false
 	minCommentPos := token.Pos(-1) // Track the closest preceding comment start
 
 	// Strategy 1: Find comments immediately preceding the cursor line.
-	for node, groups := range cmap {
-		if node == nil {
+	// Iterate through all comment groups associated with any node in the file.
+	for _, groups := range cmap { // Iterate over map values (comment groups for each node)
+		if groups == nil {
 			continue
 		}
 		for _, cg := range groups {
@@ -343,7 +391,12 @@ func findCommentsWithMap(cmap ast.CommentMap, path []ast.Node, cursorPos token.P
 			}
 
 			// Check if the comment group ENDS on the line immediately before the cursor
-			commentEndLine := fset.Position(cg.End()).Line
+			commentEndPosInfo := fset.Position(cg.End())
+			if !commentEndPosInfo.IsValid() {
+				continue // Skip invalid comment positions
+			}
+			commentEndLine := commentEndPosInfo.Line
+
 			if commentEndLine == cursorLine-1 {
 				// Check if this comment is closer than previously found ones on this line
 				if !foundPrecedingOnLine || cg.Pos() > minCommentPos {
@@ -418,7 +471,9 @@ cleanup:
 // findContextNodes identifies specific AST nodes (call expr, selector expr, identifier)
 // at or enclosing the cursor position and populates the AstContextInfo struct.
 // It also attempts to resolve type information for these nodes using the provided package info.
+// ** MODIFIED: Cycle 3 - Pass context, improve logging/error handling **
 func findContextNodes(
+	ctx context.Context, // Added context
 	path []ast.Node,
 	cursorPos token.Pos,
 	pkg *packages.Package,
@@ -430,6 +485,8 @@ func findContextNodes(
 	if len(path) == 0 || fset == nil {
 		if fset == nil {
 			addAnalysisError(info, errors.New("Fset is nil in findContextNodes"), logger)
+		} else {
+			logger.Debug("Cannot find context nodes: AST path is empty.")
 		}
 		return // Cannot determine context without path or fileset
 	}
@@ -460,16 +517,17 @@ func findContextNodes(
 	// --- Check for Composite Literal ---
 	innermostNode := path[0]
 	if compLit, ok := innermostNode.(*ast.CompositeLit); ok && cursorPos >= compLit.Lbrace && cursorPos <= compLit.Rbrace {
-		logger.Debug("Cursor inside Composite Literal", "pos", posStr(compLit.Pos()))
+		litPosStr := posStr(compLit.Pos())
+		logger.Debug("Cursor inside Composite Literal", "pos", litPosStr)
 		info.CompositeLit = compLit
 		if hasTypeInfo && typesMap != nil {
 			if tv, ok := typesMap[compLit]; ok {
 				info.CompositeLitType = tv.Type
 				if info.CompositeLitType == nil {
-					addAnalysisError(info, fmt.Errorf("composite literal type resolved to nil at %s", posStr(compLit.Pos())), logger)
+					addAnalysisError(info, fmt.Errorf("composite literal type resolved to nil at %s", litPosStr), logger)
 				}
 			} else {
-				addAnalysisError(info, fmt.Errorf("missing type info for composite literal at %s", posStr(compLit.Pos())), logger)
+				addAnalysisError(info, fmt.Errorf("missing type info for composite literal at %s", litPosStr), logger)
 			}
 		}
 		return // Found context, exit
@@ -485,7 +543,9 @@ func findContextNodes(
 		}
 	}
 	if callExpr != nil && cursorPos > callExpr.Lparen && cursorPos <= callExpr.Rparen {
-		logger.Debug("Cursor inside Call Expression arguments", "pos", posStr(callExpr.Pos()))
+		callPosStr := posStr(callExpr.Pos())
+		funPosStr := posStr(callExpr.Fun.Pos())
+		logger.Debug("Cursor inside Call Expression arguments", "pos", callPosStr)
 		info.CallExpr = callExpr
 		info.CallArgIndex = calculateArgIndex(callExpr.Args, cursorPos)
 		if hasTypeInfo && typesMap != nil {
@@ -494,14 +554,14 @@ func findContextNodes(
 					info.CallExprFuncType = sig
 					info.ExpectedArgType = determineExpectedArgType(sig, info.CallArgIndex)
 				} else {
-					addAnalysisError(info, fmt.Errorf("type of call func (%T) at %s is %T, not signature", callExpr.Fun, posStr(callExpr.Fun.Pos()), tv.Type), logger)
+					addAnalysisError(info, fmt.Errorf("type of call func (%T) at %s is %T, not signature", callExpr.Fun, funPosStr, tv.Type), logger)
 				}
 			} else {
 				reason := "missing type info entry"
 				if ok && tv.Type == nil {
 					reason = "type info resolved to nil"
 				}
-				addAnalysisError(info, fmt.Errorf("%s for call func (%T) at %s", reason, callExpr.Fun, posStr(callExpr.Fun.Pos())), logger)
+				addAnalysisError(info, fmt.Errorf("%s for call func (%T) at %s", reason, callExpr.Fun, funPosStr), logger)
 			}
 		}
 		return // Found context, exit
@@ -511,16 +571,18 @@ func findContextNodes(
 	// Check first two nodes in path for selector, cursor must be *after* the dot
 	for i := 0; i < len(path) && i < 2; i++ {
 		if selExpr, ok := path[i].(*ast.SelectorExpr); ok && cursorPos > selExpr.X.End() {
-			logger.Debug("Cursor inside Selector Expression", "pos", posStr(selExpr.Pos()))
+			selPosStr := posStr(selExpr.Pos())
+			basePosStr := posStr(selExpr.X.Pos())
+			logger.Debug("Cursor inside Selector Expression", "pos", selPosStr)
 			info.SelectorExpr = selExpr
 			if hasTypeInfo && typesMap != nil {
 				if tv, ok := typesMap[selExpr.X]; ok {
 					info.SelectorExprType = tv.Type
 					if tv.Type == nil {
-						addAnalysisError(info, fmt.Errorf("type info resolved to nil for selector base expr (%T) starting at %s", selExpr.X, posStr(selExpr.X.Pos())), logger)
+						addAnalysisError(info, fmt.Errorf("type info resolved to nil for selector base expr (%T) starting at %s", selExpr.X, basePosStr), logger)
 					}
 				} else {
-					addAnalysisError(info, fmt.Errorf("missing type info entry for selector base expr (%T) starting at %s", selExpr.X, posStr(selExpr.X.Pos())), logger)
+					addAnalysisError(info, fmt.Errorf("missing type info entry for selector base expr (%T) starting at %s", selExpr.X, basePosStr), logger)
 				}
 			}
 			// Check if selected member is known (moved to addAnalysisDiagnostics)
@@ -544,7 +606,8 @@ func findContextNodes(
 	}
 
 	if ident != nil {
-		logger.Debug("Cursor at Identifier", "name", ident.Name, "pos", posStr(ident.Pos()))
+		identPosStr := posStr(ident.Pos())
+		logger.Debug("Cursor at Identifier", "name", ident.Name, "pos", identPosStr)
 		info.IdentifierAtCursor = ident
 		if hasTypeInfo {
 			var obj types.Object
@@ -560,12 +623,13 @@ func findContextNodes(
 			if obj != nil {
 				info.IdentifierObject = obj
 				info.IdentifierType = obj.Type()
+				defPosStr := posStr(obj.Pos()) // Get pos string here for logging
 				if info.IdentifierType == nil {
-					addAnalysisError(info, fmt.Errorf("object '%s' at %s found but type is nil", obj.Name(), posStr(obj.Pos())), logger)
+					addAnalysisError(info, fmt.Errorf("object '%s' at %s found but type is nil", obj.Name(), defPosStr), logger)
 				}
 
 				// --- Find Defining Node for Hover/Definition ---
-				findDefiningNode(obj, fset, pkg, info, logger) // Populates info.IdentifierDefNode
+				findDefiningNode(ctx, obj, fset, pkg, info, logger) // Populates info.IdentifierDefNode
 
 			} else { // Object not found in defs or uses (diagnostic added elsewhere)
 				// Try fallback to type map for the identifier itself
@@ -574,10 +638,10 @@ func findContextNodes(
 						info.IdentifierType = tv.Type
 					} else {
 						// Only add error if object wasn't found AND type map failed
-						addAnalysisError(info, fmt.Errorf("missing object and type info for identifier '%s' at %s", ident.Name, posStr(ident.Pos())), logger)
+						addAnalysisError(info, fmt.Errorf("missing object and type info for identifier '%s' at %s", ident.Name, identPosStr), logger)
 					}
 				} else {
-					addAnalysisError(info, fmt.Errorf("object not found for identifier '%s' at %s (and Types map is nil)", ident.Name, posStr(ident.Pos())), logger)
+					addAnalysisError(info, fmt.Errorf("object not found for identifier '%s' at %s (and Types map is nil)", ident.Name, identPosStr), logger)
 				}
 			}
 		} else {
@@ -591,46 +655,63 @@ func findContextNodes(
 
 // findDefiningNode attempts to find the AST node where a types.Object is defined.
 // Populates info.IdentifierDefNode.
-func findDefiningNode(obj types.Object, fset *token.FileSet, pkg *packages.Package, info *AstContextInfo, logger *slog.Logger) {
+// ** MODIFIED: Cycle 3 - Pass context, improve error handling **
+func findDefiningNode(ctx context.Context, obj types.Object, fset *token.FileSet, pkg *packages.Package, info *AstContextInfo, logger *slog.Logger) {
 	defPos := obj.Pos()
 	if !defPos.IsValid() {
 		logger.Debug("Object has invalid definition position, cannot find defining node.", "object", obj.Name())
 		return
 	}
+	defPosStr := getPosString(fset, defPos) // Get pos string once
 
 	// Find the token.File containing the definition
 	defFile := fset.File(defPos)
 	if defFile == nil {
-		addAnalysisError(info, fmt.Errorf("could not find token.File for definition of '%s' at pos %s", obj.Name(), getPosString(fset, defPos)), logger)
+		addAnalysisError(info, fmt.Errorf("could not find token.File for definition of '%s' at pos %s", obj.Name(), defPosStr), logger)
 		return
 	}
+	defFileName := defFile.Name()
+	logger = logger.With("def_file", defFileName)
 
 	var defAST *ast.File
 	// Check if definition is in the currently analyzed file
-	if defFile.Name() == info.FilePath {
+	if defFileName == info.FilePath {
 		defAST = info.TargetAstFile
+		logger.Debug("Definition is in the current file")
 	} else {
 		// Definition is in another file in the package. Find its AST.
-		if pkg != nil {
+		if pkg != nil && pkg.Syntax != nil {
+			found := false
 			for _, syntaxFile := range pkg.Syntax {
 				// Check if the file object associated with the syntax file's position matches the definition file object
 				if syntaxFile != nil && fset.File(syntaxFile.Pos()) == defFile {
 					defAST = syntaxFile
+					found = true
+					logger.Debug("Found definition AST in package syntax")
 					break
 				}
 			}
+			if !found {
+				logger.Warn("Definition file AST not found within package syntax", "package", pkg.PkgPath)
+			}
+		} else {
+			reason := "package is nil"
+			if pkg != nil {
+				reason = "package.Syntax is nil"
+			}
+			logger.Warn("Cannot search for definition AST in other files", "reason", reason)
 		}
 	}
 
 	if defAST == nil {
-		addAnalysisError(info, fmt.Errorf("could not find AST for definition file '%s' of object '%s'", defFile.Name(), obj.Name()), logger)
+		addAnalysisError(info, fmt.Errorf("could not find AST for definition file '%s' of object '%s'", defFileName, obj.Name()), logger)
 		return
 	}
 
 	// Find the specific AST node at the definition position
 	defPath, _ := astutil.PathEnclosingInterval(defAST, defPos, defPos)
 	if len(defPath) == 0 {
-		addAnalysisError(info, fmt.Errorf("could not find AST path for definition of '%s' at pos %s", obj.Name(), getPosString(fset, defPos)), logger)
+		addAnalysisError(info, fmt.Errorf("could not find AST path for definition of '%s' at pos %s", obj.Name(), defPosStr), logger)
 		return
 	}
 
@@ -680,16 +761,26 @@ func findDefiningNode(obj types.Object, fset *token.FileSet, pkg *packages.Packa
 	// Could not find a specific decl node, maybe use innermost node at defPos?
 	info.IdentifierDefNode = defPath[0]
 	logger.Warn("Could not pinpoint specific defining declaration node, using innermost node at definition position", "object", obj.Name(), "innermost_type", fmt.Sprintf("%T", defPath[0]))
-	addAnalysisError(info, fmt.Errorf("could not find specific defining node for '%s' at pos %s", obj.Name(), getPosString(fset, defPos)), logger)
+	// Don't add an error here, as we still found *a* node, just maybe not the best one.
+	// addAnalysisError(info, fmt.Errorf("could not find specific defining node for '%s' at pos %s", obj.Name(), defPosStr), logger)
 }
 
 // calculateArgIndex determines the 0-based index of the argument the cursor is in.
+// ** MODIFIED: Cycle 3 - Handle nil arguments **
 func calculateArgIndex(args []ast.Expr, cursorPos token.Pos) int {
 	if len(args) == 0 {
 		return 0 // No args, cursor is effectively at index 0
 	}
 	for i, arg := range args {
 		if arg == nil {
+			// Handle nil argument - treat its span as minimal?
+			// Or assume cursor cannot be "inside" a nil argument.
+			// Let's assume cursor must be before or after the position where the nil arg would be.
+			// If cursor is before the next non-nil arg's start, associate with this nil arg's index.
+			if i+1 < len(args) && args[i+1] != nil && cursorPos < args[i+1].Pos() {
+				return i
+			}
+			// Otherwise, continue checking subsequent args.
 			continue
 		}
 		argStart := arg.Pos()
@@ -699,6 +790,10 @@ func calculateArgIndex(args []ast.Expr, cursorPos token.Pos) int {
 		if i > 0 && args[i-1] != nil {
 			// Slot starts after the previous argument's end (and potential comma/whitespace)
 			slotStart = args[i-1].End() + 1
+		} else if i > 0 {
+			// Previous arg was nil, need to find the position of the comma before this arg
+			// This is complex, fallback to argStart for now.
+			slotStart = argStart
 		}
 
 		// Cursor is between start of this arg's slot and end of this arg
@@ -775,7 +870,11 @@ func determineExpectedArgType(sig *types.Signature, argIndex int) types.Type {
 }
 
 // listTypeMembers attempts to list exported fields and methods for a given type.
+// ** MODIFIED: Cycle 3 - Add logging, handle nil gracefully **
 func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, logger *slog.Logger) []MemberInfo {
+	if logger == nil {
+		logger = slog.Default() // Ensure logger is not nil
+	}
 	if typ == nil {
 		logger.Debug("Cannot list members: input type is nil")
 		return nil
@@ -796,6 +895,9 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 	}
 
 	for _, mset := range msets {
+		if mset == nil {
+			continue // Should not happen, but defensive check
+		}
 		for i := 0; i < mset.Len(); i++ {
 			sel := mset.At(i)
 			if sel == nil {
@@ -826,6 +928,10 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 		currentType = ptr.Elem()
 	}
 	underlying := currentType.Underlying()
+	if underlying == nil { // Handle cases where underlying type might be nil
+		logger.Debug("Cannot list members: underlying type is nil")
+		return members
+	}
 
 	if st, ok := underlying.(*types.Struct); ok {
 		logger.Debug("Type is a struct, listing fields", "num_fields", st.NumFields())
