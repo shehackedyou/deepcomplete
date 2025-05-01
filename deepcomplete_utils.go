@@ -16,7 +16,7 @@ import (
 	"net/http" // Needed for OllamaError status codes
 	"net/url"
 	"os"
-	"path/filepath" // Keep for potential future OS-specific needs, though not used now
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -133,7 +133,7 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 // Utf16OffsetToBytes converts a 0-based UTF-16 offset within a line to a 0-based byte offset.
 // Uses slog for logging warnings.
 func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
-	logger := slog.Default() // Use default logger, assumes initialized by caller
+	//logger := slog.Default() // Use default logger, assumes initialized by caller
 
 	if utf16Offset < 0 {
 		return 0, fmt.Errorf("%w: invalid utf16Offset: %d (must be >= 0)", ErrInvalidPositionInput, utf16Offset)
@@ -268,28 +268,28 @@ func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
 // ValidateAndGetFilePath converts a file:// DocumentURI string to a clean, absolute local path.
 // It returns an error if the URI scheme is not 'file' or parsing/cleaning fails.
 // Uses slog for logging warnings.
-// REMOVED loggerParam parameter. Now always uses slog.Default().
+// ** MODIFIED: Cycle 2 - Removed unused logger variable **
 func ValidateAndGetFilePath(uri string) (string, error) {
 	// Use default logger directly.
-	logger := slog.Default()
+	// logger := slog.Default() // <-- This line should be gone or commented out
 
 	if uri == "" {
 		// Log here to ensure logger is used before potential early return
-		logger.Warn("ValidateAndGetFilePath called with empty URI") // Explicitly use logger
+		slog.Warn("ValidateAndGetFilePath called with empty URI") // Use slog.Default() directly
 		return "", errors.New("document URI cannot be empty")
 	}
 	// Log the entry point after the empty check
-	logger.Debug("Validating URI", "uri", uri)
+	slog.Debug("Validating URI", "uri", uri) // Use slog.Default() directly
 
 	parsedURL, err := url.Parse(uri)
 	if err != nil {
-		logger.Warn("Failed to parse document URI", "uri", uri, "error", err)
+		slog.Warn("Failed to parse document URI", "uri", uri, "error", err) // Use slog.Default() directly
 		return "", fmt.Errorf("%w: invalid document URI '%s': %w", ErrInvalidURI, uri, err)
 	}
 
 	// --- Security Check: Ensure scheme is 'file' ---
 	if parsedURL.Scheme != "file" {
-		logger.Warn("Received non-file document URI", "uri", uri, "scheme", parsedURL.Scheme)
+		slog.Warn("Received non-file document URI", "uri", uri, "scheme", parsedURL.Scheme) // Use slog.Default() directly
 		return "", fmt.Errorf("%w: unsupported URI scheme: '%s' (only 'file://' is supported)", ErrInvalidURI, parsedURL.Scheme)
 	}
 
@@ -303,7 +303,7 @@ func ValidateAndGetFilePath(uri string) (string, error) {
 	if parsedURL.Host != "" {
 		// Allow 'localhost' as a host for file URIs (some clients might send this)
 		if strings.ToLower(parsedURL.Host) != "localhost" {
-			logger.Warn("File URI includes unexpected host component", "uri", uri, "host", parsedURL.Host)
+			slog.Warn("File URI includes unexpected host component", "uri", uri, "host", parsedURL.Host) // Use slog.Default() directly
 			return "", fmt.Errorf("%w: file URI should not contain host component for local files (host: %s)", ErrInvalidURI, parsedURL.Host)
 		}
 	}
@@ -311,11 +311,11 @@ func ValidateAndGetFilePath(uri string) (string, error) {
 	// --- Security Check: Ensure absolute and clean path ---
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
-		logger.Warn("Failed to get absolute path", "uri_path", filePath, "error", err)
+		slog.Warn("Failed to get absolute path", "uri_path", filePath, "error", err) // Use slog.Default() directly
 		return "", fmt.Errorf("failed to resolve absolute path for '%s': %w", filePath, err)
 	}
 
-	logger.Debug("Validated and converted URI to path", "uri", uri, "path", absPath)
+	slog.Debug("Validated and converted URI to path", "uri", uri, "path", absPath) // Use slog.Default() directly
 	return absPath, nil
 }
 
@@ -395,23 +395,28 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 	// Use compiled files from package info if available and seems valid.
 	filesFromPkg := false
 	if pkg != nil && len(pkg.CompiledGoFiles) > 0 {
-		firstFileAbs, _ := filepath.Abs(pkg.CompiledGoFiles[0])
-		dirAbs, _ := filepath.Abs(dir)
-		// Ensure first file is absolute and within the target directory
-		if len(pkg.CompiledGoFiles[0]) > 0 && filepath.IsAbs(firstFileAbs) && strings.HasPrefix(firstFileAbs, dirAbs) {
-			filesFromPkg = true
-			logger.Debug("Hashing based on CompiledGoFiles", "count", len(pkg.CompiledGoFiles), "package", pkg.ID)
-			for _, fpath := range pkg.CompiledGoFiles {
-				// Ensure path is absolute before adding
-				if absPath, absErr := filepath.Abs(fpath); absErr == nil {
-					filesToHash[absPath] = struct{}{}
-				} else {
-					logger.Warn("Could not get absolute path for compiled file, skipping hash", "file", fpath, "error", absErr)
+		// Check if CompiledGoFiles actually contains paths before trying to use the first one
+		if len(pkg.CompiledGoFiles[0]) > 0 {
+			firstFileAbs, _ := filepath.Abs(pkg.CompiledGoFiles[0])
+			dirAbs, _ := filepath.Abs(dir)
+			// Ensure first file is absolute and within the target directory
+			if filepath.IsAbs(firstFileAbs) && strings.HasPrefix(firstFileAbs, dirAbs) {
+				filesFromPkg = true
+				logger.Debug("Hashing based on CompiledGoFiles", "count", len(pkg.CompiledGoFiles), "package", pkg.ID)
+				for _, fpath := range pkg.CompiledGoFiles {
+					// Ensure path is absolute before adding
+					if absPath, absErr := filepath.Abs(fpath); absErr == nil {
+						filesToHash[absPath] = struct{}{}
+					} else {
+						logger.Warn("Could not get absolute path for compiled file, skipping hash", "file", fpath, "error", absErr)
+					}
 				}
+			} else {
+				logger.Warn("CompiledGoFiles paths seem invalid or not absolute/relative to dir, falling back to directory scan.",
+					"first_file", pkg.CompiledGoFiles[0], "dir", dir)
 			}
 		} else {
-			logger.Warn("CompiledGoFiles paths seem invalid or not absolute/relative to dir, falling back to directory scan.",
-				"first_file", pkg.CompiledGoFiles[0], "dir", dir)
+			logger.Warn("First entry in CompiledGoFiles is empty, falling back to directory scan.")
 		}
 	}
 

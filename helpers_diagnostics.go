@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"go/types"
 	"log/slog"
+	"path/filepath" // Added for path normalization
 	"strconv"
 	"strings"
 
@@ -35,7 +36,6 @@ func addAnalysisError(info *AstContextInfo, err error, logger *slog.Logger) {
 }
 
 // logAnalysisErrors logs joined non-fatal analysis errors if any occurred.
-// Useful for summarizing errors at the end of an operation.
 func logAnalysisErrors(errs []error, logger *slog.Logger) {
 	if len(errs) > 0 {
 		combinedErr := errors.Join(errs...) // Use errors.Join for cleaner wrapping
@@ -44,14 +44,14 @@ func logAnalysisErrors(errs []error, logger *slog.Logger) {
 }
 
 // packagesErrorToDiagnostic converts a packages.Error into our internal Diagnostic format.
-// It parses the error position string and maps the error kind to severity.
+// ** MODIFIED: Cycle 1 - Improved position parsing robustness **
 func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logger *slog.Logger) *Diagnostic {
 	if fset == nil {
 		logger.Warn("Cannot convert packages.Error to Diagnostic: FileSet is nil")
 		return nil
 	}
 
-	posStr := pkgErr.Pos // Format: "filename:line:col: message" or "filename:line:col"
+	posStr := pkgErr.Pos // Format: "filename:line:col: message" or "filename:line:col" or just "filename:"
 	msg := pkgErr.Msg
 	kind := pkgErr.Kind // 0=Unknown, 1=ParseError, 2=TypeError
 
@@ -64,8 +64,23 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 	var lineNum, colNum int = 1, 1 // 1-based defaults
 	var parseErrs []error
 
-	if len(parts) >= 3 {
+	if len(parts) >= 1 {
 		filename = parts[0]
+		// Normalize filename for comparison
+		absFilename, absErr := filepath.Abs(filename)
+		if absErr != nil {
+			logger.Warn("Could not get absolute path for diagnostic filename", "filename", filename, "error", absErr)
+			// Keep original filename if absolute path fails
+		} else {
+			filename = absFilename
+		}
+	} else {
+		// Position string is empty or malformed, cannot determine filename
+		parseErrs = append(parseErrs, errors.New("cannot determine filename from position string"))
+		filename = "[unknown]" // Use placeholder
+	}
+
+	if len(parts) >= 3 { // Check if line and col parts exist
 		var lineErr, colErr error
 		lineNum, lineErr = strconv.Atoi(parts[1])
 		colNum, colErr = strconv.Atoi(parts[2])
@@ -75,31 +90,39 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 		if colErr != nil {
 			parseErrs = append(parseErrs, fmt.Errorf("parsing column: %w", colErr))
 		}
+		// Ensure line/col are at least 1
+		if lineNum <= 0 {
+			lineNum = 1
+			parseErrs = append(parseErrs, errors.New("line number is not positive"))
+		}
+		if colNum <= 0 {
+			colNum = 1
+			parseErrs = append(parseErrs, errors.New("column number is not positive"))
+		}
 
 		if len(parseErrs) == 0 {
 			// Successfully parsed line and column (1-based)
 			// Find the corresponding token.File
 			var tokenFile *token.File
 			fset.Iterate(func(f *token.File) bool {
-				// Note: Comparing file names might be fragile if paths differ (abs vs rel).
-				// Consider normalizing paths before comparison if issues arise.
-				// For now, assume names provided by packages.Load are consistent within the fset.
-				if f != nil && f.Name() == filename {
-					tokenFile = f
-					return false // Stop iteration
+				if f != nil {
+					// Compare absolute paths for robustness
+					fAbs, fAbsErr := filepath.Abs(f.Name())
+					if fAbsErr == nil && fAbs == filename {
+						tokenFile = f
+						return false // Stop iteration
+					}
 				}
 				return true // Continue iteration
 			})
 
 			if tokenFile != nil {
 				// Convert 1-based line/col to 0-based byte offset
-				lineStartPos := tokenFile.LineStart(lineNum)
-				if lineStartPos.IsValid() {
-					lineStartOffset := tokenFile.Offset(lineStartPos)
+				lineStartTokenPos := tokenFile.LineStart(lineNum)
+				if lineStartTokenPos.IsValid() {
+					lineStartOffset := tokenFile.Offset(lineStartTokenPos)
 					// Calculate 0-based byte offset from file start
-					// Note: packages.Error 'col' is often byte-based, but treat as character for safety.
-					// A more robust approach might involve reading the line content.
-					// For simplicity, assume col is byte-based for now.
+					// Assume col is byte-based for simplicity.
 					byteOffset := lineStartOffset + colNum - 1
 
 					// Ensure offset is within file bounds
@@ -114,12 +137,16 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 					startPos.Line = lineNum - 1
 					startPos.Character = byteOffset // Use byte offset directly for internal format
 
-					// Default end position to start + 1 byte for now
+					// Default end position to start + 1 byte for now (can be improved)
 					endPos = startPos
 					endPos.Character++
 					// Ensure end position doesn't exceed file size
 					if endPos.Character > tokenFile.Size() {
 						endPos.Character = tokenFile.Size()
+					}
+					// Ensure end is not before start
+					if endPos.Character < startPos.Character {
+						endPos.Character = startPos.Character
 					}
 
 				} else {
@@ -134,7 +161,7 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 		if len(parts) == 4 && len(parseErrs) == 0 { // Only use message part if pos parsed ok
 			msg = strings.TrimSpace(parts[3])
 		}
-	} else if posStr != "" { // Position string exists but couldn't be parsed
+	} else if posStr != "" && !strings.HasSuffix(posStr, ":") { // Position string exists but missing parts
 		parseErrs = append(parseErrs, errors.New("position string format not filename:line:col"))
 	}
 
@@ -164,6 +191,7 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 }
 
 // createDiagnosticForNode creates a diagnostic targeting a specific AST node's range.
+// ** MODIFIED: Cycle 1 - Improved offset validation **
 func createDiagnosticForNode(fset *token.FileSet, node ast.Node, severity DiagnosticSeverity, code, source, message string, logger *slog.Logger) *Diagnostic {
 	if fset == nil || node == nil {
 		logger.Warn("Cannot create diagnostic for node: FileSet or Node is nil")
@@ -180,25 +208,32 @@ func createDiagnosticForNode(fset *token.FileSet, node ast.Node, severity Diagno
 
 	file := fset.File(startTokenPos)
 	if file == nil {
-		logger.Warn("Cannot create diagnostic: Could not get token.File for node", "node_type", fmt.Sprintf("%T", node))
+		logger.Warn("Cannot create diagnostic: Could not get token.File for node", "node_type", fmt.Sprintf("%T", node), "start_pos", startTokenPos)
+		return nil
+	}
+	// Ensure end position is also in the same file
+	if fset.File(endTokenPos) != file {
+		logger.Warn("Cannot create diagnostic: Node spans multiple files", "node_type", fmt.Sprintf("%T", node), "start_file", file.Name(), "end_file", fset.File(endTokenPos).Name())
 		return nil
 	}
 
 	startOffset := file.Offset(startTokenPos)
 	endOffset := file.Offset(endTokenPos)
+	fileSize := file.Size()
 
-	// Validate offsets
-	if startOffset < 0 || endOffset < 0 || endOffset < startOffset || endOffset > file.Size() || startOffset > file.Size() {
-		logger.Warn("Cannot create diagnostic: Invalid offsets calculated from node", "node_type", fmt.Sprintf("%T", node), "start", startOffset, "end", endOffset, "file_size", file.Size())
+	// Validate offsets more rigorously
+	if startOffset < 0 || endOffset < 0 || startOffset > fileSize || endOffset > fileSize || endOffset < startOffset {
+		logger.Warn("Cannot create diagnostic: Invalid offsets calculated from node", "node_type", fmt.Sprintf("%T", node), "start", startOffset, "end", endOffset, "file_size", fileSize)
 		// Attempt to recover with a zero-length range at the start if possible
-		if startOffset >= 0 && startOffset <= file.Size() {
-			endOffset = startOffset
+		if startOffset >= 0 && startOffset <= fileSize {
+			endOffset = startOffset // Clamp end to start
 		} else {
 			return nil // Cannot recover
 		}
 	}
 
 	// Get 0-based line numbers corresponding to the offsets
+	// Note: file.Line() returns 1-based line number
 	startLineNum := file.Line(startTokenPos) - 1
 	endLineNum := file.Line(endTokenPos) - 1
 	if startLineNum < 0 || endLineNum < 0 {
@@ -231,7 +266,7 @@ func addAnalysisDiagnostics(fset *token.FileSet, info *AstContextInfo, logger *s
 	if info.IdentifierAtCursor != nil && info.IdentifierObject == nil && info.IdentifierType == nil {
 		// Check if it's a known builtin before reporting as unresolved
 		isBuiltin := false
-		if obj, _ := types.Universe.Lookup(info.IdentifierAtCursor.Name).(*types.Builtin); obj != nil {
+		if obj, ok := types.Universe.Lookup(info.IdentifierAtCursor.Name).(*types.Builtin); ok && obj != nil {
 			isBuiltin = true
 		}
 		if !isBuiltin {

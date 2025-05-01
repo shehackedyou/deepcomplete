@@ -1,18 +1,15 @@
 // deepcomplete/lsp_protocol.go
 // Contains LSP specific data structures and utility functions
-// moved from cmd/deepcomplete-lsp/main.go
 package deepcomplete
 
 import (
 	"encoding/json"
-	"errors"   // Needed for errors in helpers
-	"fmt"      // Needed for errors in helpers
+	"errors"
+	"fmt"
 	"go/ast"   // Needed for nodeRangeToLSPRange
 	"go/token" // Needed for tokenPosToLSPLocation, nodeRangeToLSPRange
 	"go/types" // Needed for mapTypeToCompletionKind
-	"log/slog" // Needed for helpers
-	// Needed for tokenPosToLSPLocation
-	// Needed for formatObjectForHover (if moved back here)
+	"log/slog"
 	// "unicode/utf8" // No longer needed here, functions moved to utils
 )
 
@@ -394,8 +391,7 @@ type ErrorObject struct {
 // ============================================================================
 
 // mapTypeToCompletionKind maps a Go types.Object to an LSP CompletionItemKind.
-// (Moved from lsp_server.go)
-// ** MODIFIED: Cycle 1 - Default to Snippet for model suggestions **
+// ** MODIFIED: Cycle 1 - Default to Snippet for model suggestions, map Builtin **
 func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	if obj == nil {
 		// Default to Snippet kind for completions generated without specific type info (e.g., LLM suggestions)
@@ -417,31 +413,33 @@ func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	case *types.Const:
 		return CompletionItemKindConstant
 	case *types.TypeName:
+		// Check underlying type for more specific kinds
 		switch o.Type().Underlying().(type) {
 		case *types.Struct:
 			return CompletionItemKindStruct
 		case *types.Interface:
 			return CompletionItemKindInterface
-		// Add cases for *types.Basic (like int, string), *types.Map, *types.Slice, etc. if needed
+		case *types.Basic: // Basic types like int, string, bool
+			return CompletionItemKindKeyword // Or Value? Keyword seems reasonable for type names
 		default:
-			return CompletionItemKindClass // General fallback for types
+			return CompletionItemKindClass // General fallback for other type names
 		}
 	case *types.PkgName:
 		return CompletionItemKindModule
 	case *types.Builtin:
-		// Could potentially map specific builtins (e.g., append, make) to Function?
-		return CompletionItemKindFunction // Treat builtins like functions
+		// Map built-in functions (like append, make, println) to Function kind
+		return CompletionItemKindFunction
 	case *types.Nil:
 		return CompletionItemKindValue
 	default:
-		// Fallback for other known types.Object types
+		// Fallback for other known types.Object types or unknown types
 		return CompletionItemKindText
 	}
 }
 
 // tokenPosToLSPLocation converts a token.Pos to an LSP Location.
 // Requires the token.File containing the position and the file content.
-// (Moved from lsp_server.go)
+// ** MODIFIED: Cycle 1 - Improved error handling **
 func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logger *slog.Logger) (*Location, error) {
 	if file == nil {
 		return nil, errors.New("cannot convert position: token.File is nil")
@@ -449,11 +447,16 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 	if !pos.IsValid() {
 		return nil, errors.New("cannot convert position: token.Pos is invalid")
 	}
+	if content == nil {
+		// Content is required for accurate UTF-16 conversion
+		return nil, errors.New("cannot convert position: file content is nil")
+	}
 
 	// Get the 0-based offset within the file
 	offset := file.Offset(pos)
-	if offset < 0 || offset > file.Size() {
-		return nil, fmt.Errorf("invalid offset %d calculated from pos %d in file %s (size %d)", offset, pos, file.Name(), file.Size())
+	// Validate offset against file size *and* content length (they should match)
+	if offset < 0 || offset > file.Size() || offset > len(content) {
+		return nil, fmt.Errorf("invalid offset %d calculated from pos %d in file %s (size %d, content len %d)", offset, pos, file.Name(), file.Size(), len(content))
 	}
 
 	// Convert 0-based byte offset to 0-based LSP line/char (UTF-16)
@@ -467,12 +470,15 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 	// Use the version from deepcomplete_utils.go
 	fileURIStr, uriErr := PathToURI(file.Name())
 	if uriErr != nil {
+		// Log the error but don't necessarily fail the whole operation if URI is just for display
 		logger.Warn("Failed to convert definition file path to URI", "path", file.Name(), "error", uriErr)
+		// Depending on usage, might return error or proceed with a placeholder URI
+		// For definition, the URI is critical, so return error.
 		return nil, fmt.Errorf("failed to create URI for definition file %s: %w", file.Name(), uriErr)
 	}
 	lspFileURI := DocumentURI(fileURIStr)
 
-	// Create LSP Position and Range (range spans just the single point for now)
+	// Create LSP Position and Range (range spans just the single point for definition)
 	lspPosition := LSPPosition{Line: lspLine, Character: lspChar}
 	lspRange := LSPRange{Start: lspPosition, End: lspPosition}
 
@@ -487,7 +493,7 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 // REMOVED bytesToUTF16Offset - Use version from deepcomplete_utils.go
 
 // nodeRangeToLSPRange converts an AST node's position range to an LSP Range.
-// (Moved from lsp_server.go)
+// ** MODIFIED: Cycle 1 - Improved error handling & offset validation **
 func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, logger *slog.Logger) (*LSPRange, error) {
 	if fset == nil || node == nil {
 		return nil, errors.New("fset or node is nil")
@@ -496,19 +502,29 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 	endTokenPos := node.End()
 
 	if !startTokenPos.IsValid() || !endTokenPos.IsValid() {
-		return nil, errors.New("node position is invalid")
+		return nil, fmt.Errorf("node position is invalid (start: %v, end: %v)", startTokenPos.IsValid(), endTokenPos.IsValid())
 	}
 
 	file := fset.File(startTokenPos)
 	if file == nil {
-		return nil, errors.New("could not get token.File for node")
+		return nil, fmt.Errorf("could not get token.File for node starting at pos %d", startTokenPos)
+	}
+	// Ensure end position is also in the same file
+	if fset.File(endTokenPos) != file {
+		return nil, fmt.Errorf("node spans multiple files (start: %s, end: %s)", file.Name(), fset.File(endTokenPos).Name())
+	}
+	if content == nil {
+		return nil, errors.New("cannot convert node range: file content is nil")
 	}
 
 	startOffset := file.Offset(startTokenPos)
 	endOffset := file.Offset(endTokenPos)
 
-	if startOffset < 0 || endOffset < 0 || startOffset > len(content) || endOffset > len(content) || endOffset < startOffset {
-		return nil, fmt.Errorf("invalid byte offsets calculated: start=%d, end=%d, content_len=%d", startOffset, endOffset, len(content))
+	// Validate offsets against file size and content length
+	fileSize := file.Size()
+	contentLen := len(content)
+	if startOffset < 0 || endOffset < 0 || startOffset > fileSize || endOffset > fileSize || startOffset > contentLen || endOffset > contentLen || endOffset < startOffset {
+		return nil, fmt.Errorf("invalid byte offsets calculated: start=%d, end=%d, file_size=%d, content_len=%d", startOffset, endOffset, fileSize, contentLen)
 	}
 
 	// Use the version from deepcomplete_utils.go
@@ -525,5 +541,4 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 	}, nil
 }
 
-// NOTE: formatObjectForHover remains in deepcomplete_helpers.go as it depends
-// heavily on AstContextInfo which is defined there.
+// NOTE: formatObjectForHover remains in deepcomplete_helpers.go
