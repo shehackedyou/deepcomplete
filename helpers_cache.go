@@ -1,4 +1,6 @@
 // deepcomplete/helpers_cache.go
+// Contains helper functions for memory caching (Ristretto).
+// Cycle 2 Fix: Ensured call to analyzer.MemoryCacheEnabled() is correct.
 package deepcomplete
 
 import (
@@ -23,7 +25,7 @@ func generateCacheKey(prefix string, info *AstContextInfo) string {
 // stores the result with cost and ttl, and returns it.
 // Returns the result (cached or computed), a boolean indicating cache hit, and any error from computeFn.
 func withMemoryCache[T any](
-	analyzer *GoPackagesAnalyzer,
+	analyzer Analyzer, // Use the Analyzer interface
 	cacheKey string,
 	cost int64, // Estimated cost for Ristretto (e.g., size in bytes, or just 1)
 	ttl time.Duration, // Time-to-live for the cache entry
@@ -31,47 +33,63 @@ func withMemoryCache[T any](
 	logger *slog.Logger,
 ) (T, bool, error) {
 	var zero T // Zero value for the return type T
+	if logger == nil {
+		logger = slog.Default()
+	}
 
-	// Check if analyzer or memory cache is available
+	// Check if analyzer or memory cache is available via the interface method
+	// Cycle 2 Fix: Call MemoryCacheEnabled() via the Analyzer interface.
+	// The implementation is now correctly on GoPackagesAnalyzer in deepcomplete.go.
 	if analyzer == nil || !analyzer.MemoryCacheEnabled() {
 		logger.Debug("Memory cache check skipped (analyzer or cache disabled)", "key", cacheKey)
 		result, err := computeFn()
 		return result, false, err // Execute compute function directly
 	}
 
+	// --- Ristretto Cache Interaction ---
+	// NOTE: Accessing the underlying Ristretto cache directly requires casting
+	// the Analyzer interface back to the concrete type (*GoPackagesAnalyzer)
+	// or adding Get/Set methods to the Analyzer interface itself.
+	// For simplicity in this example, we assume direct access is possible
+	// IF the concrete type is known or methods are added to the interface.
+	// A more robust solution would involve adding cache methods to the Analyzer interface.
+
+	// Example assuming we can get the concrete type (less ideal design):
+	concreteAnalyzer, ok := analyzer.(*GoPackagesAnalyzer)
+	if !ok || concreteAnalyzer.memoryCache == nil {
+		logger.Warn("Memory cache enabled but cannot access concrete cache instance. Skipping cache.", "key", cacheKey)
+		result, err := computeFn()
+		return result, false, err
+	}
+	ristrettoCache := concreteAnalyzer.memoryCache // Access the Ristretto cache
+
 	// 1. Check cache
-	if cachedResult, found := analyzer.memoryCache.Get(cacheKey); found {
-		// Attempt to cast cached result to the expected type T
+	if cachedResult, found := ristrettoCache.Get(cacheKey); found {
 		if typedResult, ok := cachedResult.(T); ok {
 			logger.Debug("Ristretto cache hit", "key", cacheKey)
 			return typedResult, true, nil // Return cached value
 		}
-		// Cache contained wrong type - this indicates a programming error (e.g., inconsistent key usage)
 		logger.Error("Ristretto cache type assertion failed", "key", cacheKey, "expected_type", fmt.Sprintf("%T", zero), "actual_type", fmt.Sprintf("%T", cachedResult))
-		analyzer.memoryCache.Del(cacheKey) // Delete the invalid entry
-		// Proceed to compute as if it was a miss
+		ristrettoCache.Del(cacheKey) // Delete invalid entry
 	}
 	logger.Debug("Ristretto cache miss", "key", cacheKey)
 
 	// 2. Cache miss: Compute the value
 	computedResult, err := computeFn()
 	if err != nil {
-		// Do not cache errors
-		return zero, false, err // Return zero value and the error
+		return zero, false, err // Do not cache errors
 	}
 
-	// 3. Store computed value in cache (only if no error occurred)
+	// 3. Store computed value in cache
 	if cost <= 0 {
 		cost = 1 // Ristretto cost must be positive
 	}
-	setOk := analyzer.memoryCache.SetWithTTL(cacheKey, computedResult, cost, ttl)
+	setOk := ristrettoCache.SetWithTTL(cacheKey, computedResult, cost, ttl)
 	if !setOk {
-		// Set might fail if item cost > max cache cost, or other internal reasons
 		logger.Warn("Ristretto cache Set failed, item not cached", "key", cacheKey, "cost", cost)
 	} else {
 		logger.Debug("Ristretto cache set", "key", cacheKey, "cost", cost, "ttl", ttl)
 	}
 
-	// Return the newly computed value
-	return computedResult, false, nil
+	return computedResult, false, nil // Return computed value
 }

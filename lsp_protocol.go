@@ -1,5 +1,6 @@
 // deepcomplete/lsp_protocol.go
-// Contains LSP specific data structures and utility functions
+// Contains LSP specific data structures and utility functions.
+// Cycle 2: Updated utility function calls and cleaned comments.
 package deepcomplete
 
 import (
@@ -10,7 +11,6 @@ import (
 	"go/token" // Needed for tokenPosToLSPLocation, nodeRangeToLSPRange
 	"go/types" // Needed for mapTypeToCompletionKind
 	"log/slog"
-	// "unicode/utf8" // No longer needed here, functions moved to utils
 )
 
 // ============================================================================
@@ -75,7 +75,6 @@ type ClientCapabilities struct {
 // WorkspaceClientCapabilities workspace specific client capabilities.
 type WorkspaceClientCapabilities struct {
 	Configuration bool `json:"configuration,omitempty"`
-	// Add other workspace capabilities if needed
 }
 
 // TextDocumentClientCapabilities text document specific client capabilities.
@@ -83,7 +82,6 @@ type TextDocumentClientCapabilities struct {
 	Completion *CompletionClientCapabilities `json:"completion,omitempty"`
 	Hover      *HoverClientCapabilities      `json:"hover,omitempty"`
 	Definition *DefinitionClientCapabilities `json:"definition,omitempty"`
-	// Add other text document capabilities if needed
 }
 
 // CompletionClientCapabilities client capabilities for completion.
@@ -103,7 +101,7 @@ type HoverClientCapabilities struct {
 
 // DefinitionClientCapabilities client capabilities for definition.
 type DefinitionClientCapabilities struct {
-	LinkSupport bool `json:"linkSupport,omitempty"` // Example: If client supports LocationLink
+	LinkSupport bool `json:"linkSupport,omitempty"`
 }
 
 // InitializeResult result of the initialize request.
@@ -176,7 +174,7 @@ type TextDocumentContentChangeEvent struct {
 
 // DidChangeConfigurationParams parameters for workspace/didChangeConfiguration.
 type DidChangeConfigurationParams struct {
-	Settings json.RawMessage `json:"settings"` // Can be anything, use gjson to parse needed parts
+	Settings json.RawMessage `json:"settings"` // Can be anything
 }
 
 // CompletionParams parameters for textDocument/completion.
@@ -212,15 +210,13 @@ type CompletionItem struct {
 	Label            string             `json:"label"`                      // Text shown in list
 	Kind             CompletionItemKind `json:"kind,omitempty"`             // Type of completion (function, variable, etc.)
 	Detail           string             `json:"detail,omitempty"`           // Additional info (e.g., type signature)
-	Documentation    string             `json:"documentation,omitempty"`    // Documentation string (can be MarkupContent later)
+	Documentation    string             `json:"documentation,omitempty"`    // Documentation string
 	InsertTextFormat InsertTextFormat   `json:"insertTextFormat,omitempty"` // PlainText or Snippet
 	InsertText       string             `json:"insertText,omitempty"`       // Text to insert
-	// TODO: Add preselect, sortText, filterText etc. later if needed
 }
 
-// CompletionItemKind defines the kind of completion item.
-// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionItemKind
-type CompletionItemKind int // Standard LSP kinds
+// CompletionItemKind defines the kind of completion item (LSP standard).
+type CompletionItemKind int
 
 const (
 	CompletionItemKindText          CompletionItemKind = 1
@@ -237,7 +233,7 @@ const (
 	CompletionItemKindValue         CompletionItemKind = 12
 	CompletionItemKindEnum          CompletionItemKind = 13
 	CompletionItemKindKeyword       CompletionItemKind = 14
-	CompletionItemKindSnippet       CompletionItemKind = 15 // ** MODIFIED: Cycle 1 - Now default for model suggestions **
+	CompletionItemKindSnippet       CompletionItemKind = 15 // Default for model suggestions
 	CompletionItemKindColor         CompletionItemKind = 16
 	CompletionItemKindFile          CompletionItemKind = 17
 	CompletionItemKindReference     CompletionItemKind = 18
@@ -272,7 +268,7 @@ type HoverParams struct {
 // HoverResult result for textDocument/hover.
 type HoverResult struct {
 	Contents MarkupContent `json:"contents"`
-	Range    *LSPRange     `json:"range,omitempty"` // Optional: range of the hovered symbol (LSP Range)
+	Range    *LSPRange     `json:"range,omitempty"` // Optional: range of the hovered symbol
 }
 
 // MarkupContent represents structured content for hover/documentation.
@@ -327,18 +323,16 @@ const (
 type LspDiagnostic struct {
 	Range    LSPRange              `json:"range"`            // The range (LSP UTF-16) at which the message applies.
 	Severity LspDiagnosticSeverity `json:"severity"`         // The diagnostic's severity.
-	Code     any                   `json:"code,omitempty"`   // The diagnostic's code, which might be a number or string.
-	Source   string                `json:"source,omitempty"` // A human-readable string describing the source of this diagnostic, e.g. 'go' or 'deepcomplete'.
+	Code     any                   `json:"code,omitempty"`   // The diagnostic's code (number or string).
+	Source   string                `json:"source,omitempty"` // e.g. 'go' or 'deepcomplete'.
 	Message  string                `json:"message"`          // The diagnostic's message.
-	// RelatedInformation []DiagnosticRelatedInformation `json:"relatedInformation,omitempty"` // Optional related locations.
-	// Tags []DiagnosticTag `json:"tags,omitempty"` // Optional tags like Unnecessary or Deprecated.
 }
 
 // PublishDiagnosticsParams parameters for textDocument/publishDiagnostics notification.
 type PublishDiagnosticsParams struct {
 	URI         DocumentURI     `json:"uri"`
-	Version     *int            `json:"version,omitempty"` // Optional: The version number of the document the diagnostics are published for.
-	Diagnostics []LspDiagnostic `json:"diagnostics"`       // An array of diagnostic items (LSP Diagnostics).
+	Version     *int            `json:"version,omitempty"` // Optional: Document version.
+	Diagnostics []LspDiagnostic `json:"diagnostics"`       // Array of diagnostic items.
 }
 
 // ============================================================================
@@ -387,15 +381,13 @@ type ErrorObject struct {
 }
 
 // ============================================================================
-// LSP Utility Functions (Moved from cmd/deepcomplete-lsp/main.go and utils)
+// LSP Utility Functions
 // ============================================================================
 
 // mapTypeToCompletionKind maps a Go types.Object to an LSP CompletionItemKind.
-// ** MODIFIED: Cycle 1 - Default to Snippet for model suggestions, map Builtin **
 func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	if obj == nil {
-		// Default to Snippet kind for completions generated without specific type info (e.g., LLM suggestions)
-		return CompletionItemKindSnippet
+		return CompletionItemKindSnippet // Default for LLM suggestions
 	}
 
 	switch o := obj.(type) {
@@ -413,33 +405,29 @@ func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	case *types.Const:
 		return CompletionItemKindConstant
 	case *types.TypeName:
-		// Check underlying type for more specific kinds
 		switch o.Type().Underlying().(type) {
 		case *types.Struct:
 			return CompletionItemKindStruct
 		case *types.Interface:
 			return CompletionItemKindInterface
-		case *types.Basic: // Basic types like int, string, bool
-			return CompletionItemKindKeyword // Or Value? Keyword seems reasonable for type names
+		case *types.Basic:
+			return CompletionItemKindKeyword
 		default:
-			return CompletionItemKindClass // General fallback for other type names
+			return CompletionItemKindClass
 		}
 	case *types.PkgName:
 		return CompletionItemKindModule
 	case *types.Builtin:
-		// Map built-in functions (like append, make, println) to Function kind
 		return CompletionItemKindFunction
 	case *types.Nil:
 		return CompletionItemKindValue
 	default:
-		// Fallback for other known types.Object types or unknown types
 		return CompletionItemKindText
 	}
 }
 
 // tokenPosToLSPLocation converts a token.Pos to an LSP Location.
 // Requires the token.File containing the position and the file content.
-// ** MODIFIED: Cycle 1 - Improved error handling **
 func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logger *slog.Logger) (*Location, error) {
 	if file == nil {
 		return nil, errors.New("cannot convert position: token.File is nil")
@@ -448,39 +436,30 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 		return nil, errors.New("cannot convert position: token.Pos is invalid")
 	}
 	if content == nil {
-		// Content is required for accurate UTF-16 conversion
 		return nil, errors.New("cannot convert position: file content is nil")
 	}
 
-	// Get the 0-based offset within the file
 	offset := file.Offset(pos)
-	// Validate offset against file size *and* content length (they should match)
 	if offset < 0 || offset > file.Size() || offset > len(content) {
 		return nil, fmt.Errorf("invalid offset %d calculated from pos %d in file %s (size %d, content len %d)", offset, pos, file.Name(), file.Size(), len(content))
 	}
 
-	// Convert 0-based byte offset to 0-based LSP line/char (UTF-16)
-	// Use the version from deepcomplete_utils.go
-	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger) // Assumes utils.go exists
+	// Use utility function from deepcomplete_utils.go
+	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger)
 	if convErr != nil {
 		return nil, fmt.Errorf("failed converting byte offset %d to LSP position: %w", offset, convErr)
 	}
 
-	// Construct file URI
-	// Use the version from deepcomplete_utils.go
-	fileURIStr, uriErr := PathToURI(file.Name()) // Assumes utils.go exists
+	// Construct file URI using utility function from deepcomplete_utils.go
+	fileURIStr, uriErr := PathToURI(file.Name())
 	if uriErr != nil {
-		// Log the error but don't necessarily fail the whole operation if URI is just for display
 		logger.Warn("Failed to convert definition file path to URI", "path", file.Name(), "error", uriErr)
-		// Depending on usage, might return error or proceed with a placeholder URI
-		// For definition, the URI is critical, so return error.
 		return nil, fmt.Errorf("failed to create URI for definition file %s: %w", file.Name(), uriErr)
 	}
 	lspFileURI := DocumentURI(fileURIStr)
 
-	// Create LSP Position and Range (range spans just the single point for definition)
 	lspPosition := LSPPosition{Line: lspLine, Character: lspChar}
-	lspRange := LSPRange{Start: lspPosition, End: lspPosition}
+	lspRange := LSPRange{Start: lspPosition, End: lspPosition} // Point range
 
 	return &Location{
 		URI:   lspFileURI,
@@ -489,7 +468,6 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 }
 
 // nodeRangeToLSPRange converts an AST node's position range to an LSP Range.
-// ** MODIFIED: Cycle 1 - Improved error handling & offset validation **
 func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, logger *slog.Logger) (*LSPRange, error) {
 	if fset == nil || node == nil {
 		return nil, errors.New("fset or node is nil")
@@ -505,7 +483,6 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 	if file == nil {
 		return nil, fmt.Errorf("could not get token.File for node starting at pos %d", startTokenPos)
 	}
-	// Ensure end position is also in the same file
 	if fset.File(endTokenPos) != file {
 		return nil, fmt.Errorf("node spans multiple files (start: %s, end: %s)", file.Name(), fset.File(endTokenPos).Name())
 	}
@@ -515,17 +492,16 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 
 	startOffset := file.Offset(startTokenPos)
 	endOffset := file.Offset(endTokenPos)
-
-	// Validate offsets against file size and content length
 	fileSize := file.Size()
 	contentLen := len(content)
+
 	if startOffset < 0 || endOffset < 0 || startOffset > fileSize || endOffset > fileSize || startOffset > contentLen || endOffset > contentLen || endOffset < startOffset {
 		return nil, fmt.Errorf("invalid byte offsets calculated: start=%d, end=%d, file_size=%d, content_len=%d", startOffset, endOffset, fileSize, contentLen)
 	}
 
-	// Use the version from deepcomplete_utils.go
-	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger) // Assumes utils.go exists
-	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)         // Assumes utils.go exists
+	// Use utility functions from deepcomplete_utils.go
+	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger)
+	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)
 
 	if startErr != nil || endErr != nil {
 		return nil, fmt.Errorf("failed converting offsets to LSP positions: startErr=%v, endErr=%v", startErr, endErr)
@@ -536,13 +512,3 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 		End:   LSPPosition{Line: endLine, Character: endChar},
 	}, nil
 }
-
-// REMOVED DUPLICATE DIAGNOSTIC HELPER FUNCTIONS
-// - addAnalysisError
-// - logAnalysisErrors
-// - packagesErrorToDiagnostic
-// - createDiagnosticForNode
-// - addAnalysisDiagnostics
-// - getMissingTypeInfoReason
-// - getPosString
-// These functions are correctly defined in helpers_diagnostics.go
