@@ -64,7 +64,7 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 	var lineNum, colNum int = 1, 1 // 1-based defaults
 	var parseErrs []error
 
-	if len(parts) >= 1 {
+	if len(parts) >= 1 && parts[0] != "" { // Ensure filename part exists and is not empty
 		filename = parts[0]
 		// Normalize filename for comparison
 		absFilename, absErr := filepath.Abs(filename)
@@ -109,6 +109,12 @@ func packagesErrorToDiagnostic(pkgErr packages.Error, fset *token.FileSet, logge
 					// Compare absolute paths for robustness
 					fAbs, fAbsErr := filepath.Abs(f.Name())
 					if fAbsErr == nil && fAbs == filename {
+						tokenFile = f
+						return false // Stop iteration
+					}
+					// Fallback: compare base names if absolute path fails or doesn't match
+					if fAbsErr != nil && filepath.Base(f.Name()) == filepath.Base(filename) {
+						logger.Debug("Matched diagnostic file by base name (absolute path failed/mismatched)", "f_name", f.Name(), "diag_filename", filename)
 						tokenFile = f
 						return false // Stop iteration
 					}

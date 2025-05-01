@@ -461,14 +461,14 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 
 	// Convert 0-based byte offset to 0-based LSP line/char (UTF-16)
 	// Use the version from deepcomplete_utils.go
-	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger)
+	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger) // Assumes utils.go exists
 	if convErr != nil {
 		return nil, fmt.Errorf("failed converting byte offset %d to LSP position: %w", offset, convErr)
 	}
 
 	// Construct file URI
 	// Use the version from deepcomplete_utils.go
-	fileURIStr, uriErr := PathToURI(file.Name())
+	fileURIStr, uriErr := PathToURI(file.Name()) // Assumes utils.go exists
 	if uriErr != nil {
 		// Log the error but don't necessarily fail the whole operation if URI is just for display
 		logger.Warn("Failed to convert definition file path to URI", "path", file.Name(), "error", uriErr)
@@ -487,10 +487,6 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 		Range: lspRange,
 	}, nil
 }
-
-// REMOVED byteOffsetToLSPPosition - Use version from deepcomplete_utils.go
-
-// REMOVED bytesToUTF16Offset - Use version from deepcomplete_utils.go
 
 // nodeRangeToLSPRange converts an AST node's position range to an LSP Range.
 // ** MODIFIED: Cycle 1 - Improved error handling & offset validation **
@@ -528,8 +524,8 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 	}
 
 	// Use the version from deepcomplete_utils.go
-	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger)
-	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)
+	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger) // Assumes utils.go exists
+	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)         // Assumes utils.go exists
 
 	if startErr != nil || endErr != nil {
 		return nil, fmt.Errorf("failed converting offsets to LSP positions: startErr=%v, endErr=%v", startErr, endErr)
@@ -541,4 +537,12 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 	}, nil
 }
 
-// NOTE: formatObjectForHover remains in deepcomplete_helpers.go
+// REMOVED DUPLICATE DIAGNOSTIC HELPER FUNCTIONS
+// - addAnalysisError
+// - logAnalysisErrors
+// - packagesErrorToDiagnostic
+// - createDiagnosticForNode
+// - addAnalysisDiagnostics
+// - getMissingTypeInfoReason
+// - getPosString
+// These functions are correctly defined in helpers_diagnostics.go

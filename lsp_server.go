@@ -299,7 +299,7 @@ func (s *Server) handleDidOpen(ctx context.Context, conn *jsonrpc2.Conn, req *js
 	s.filesMu.Unlock()
 
 	// Validate URI before triggering diagnostics
-	absPath, pathErr := ValidateAndGetFilePath(string(uri))
+	absPath, pathErr := ValidateAndGetFilePath(string(uri)) // Assumes utils.go exists
 	if pathErr != nil {
 		s.logger.Error("Invalid URI in didOpen, cannot trigger diagnostics", "uri", uri, "error", pathErr)
 		s.sendShowMessage(MessageTypeError, fmt.Sprintf("Invalid document URI: %v", pathErr))
@@ -322,7 +322,7 @@ func (s *Server) handleDidChange(ctx context.Context, conn *jsonrpc2.Conn, req *
 	s.logger.Info("Handling textDocument/didChange", "uri", uri, "new_version", version, "new_size", len(newContent))
 
 	// Validate URI before updating cache or triggering diagnostics
-	absPath, pathErr := ValidateAndGetFilePath(string(uri))
+	absPath, pathErr := ValidateAndGetFilePath(string(uri)) // Assumes utils.go exists
 	if pathErr != nil {
 		s.logger.Error("Invalid URI in didChange", "uri", uri, "error", pathErr)
 		s.sendShowMessage(MessageTypeError, fmt.Sprintf("Invalid document URI: %v", pathErr))
@@ -398,7 +398,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	}
 
 	// Convert LSP position (0-based, UTF-16) to Go position (1-based line/col, byte offset)
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos)
+	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos) // Assumes utils.go exists
 	if posErr != nil {
 		completionLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
 		// Return empty list on position error, don't fail the request
@@ -407,7 +407,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	completionLogger = completionLogger.With("go_line", line, "go_col", col)
 
 	// Validate URI and get absolute path
-	absPath, pathErr := ValidateAndGetFilePath(string(uri))
+	absPath, pathErr := ValidateAndGetFilePath(string(uri)) // Assumes utils.go exists
 	if pathErr != nil {
 		completionLogger.Error("Invalid file URI", "error", pathErr)
 		return nil, fmt.Errorf("invalid file URI: %w", pathErr)
@@ -499,7 +499,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos)
+	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos) // Assumes utils.go exists
 	if posErr != nil {
 		hoverLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
 		return nil, nil // Return nil result for hover on position error
@@ -507,7 +507,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	hoverLogger = hoverLogger.With("go_line", line, "go_col", col)
 
 	// Validate URI and get absolute path
-	absPath, pathErr := ValidateAndGetFilePath(string(uri))
+	absPath, pathErr := ValidateAndGetFilePath(string(uri)) // Assumes utils.go exists
 	if pathErr != nil {
 		hoverLogger.Error("Invalid file URI", "error", pathErr)
 		return nil, fmt.Errorf("invalid file URI: %w", pathErr)
@@ -536,7 +536,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	}
 
 	// Format the hover content using the resolved object and analysis info
-	hoverContent := formatObjectForHover(analysisInfo.IdentifierObject, analysisInfo, hoverLogger)
+	hoverContent := formatObjectForHover(analysisInfo.IdentifierObject, analysisInfo, hoverLogger) // Assumes helpers_hover.go exists
 	if hoverContent == "" {
 		hoverLogger.Debug("No hover content generated for identifier", "identifier", analysisInfo.IdentifierObject.Name())
 		return nil, nil // Return nil result
@@ -546,7 +546,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	var hoverRange *LSPRange
 	if analysisInfo.TargetFileSet != nil {
 		// Use the identifier node itself for the hover range
-		lspRange, rangeErr := nodeRangeToLSPRange(analysisInfo.TargetFileSet, analysisInfo.IdentifierAtCursor, file.Content, hoverLogger)
+		lspRange, rangeErr := nodeRangeToLSPRange(analysisInfo.TargetFileSet, analysisInfo.IdentifierAtCursor, file.Content, hoverLogger) // Assumes lsp_protocol.go exists
 		if rangeErr == nil {
 			hoverRange = lspRange
 		} else {
@@ -589,7 +589,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos)
+	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos) // Assumes utils.go exists
 	if posErr != nil {
 		defLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
 		return nil, nil // Return nil result on position error
@@ -597,7 +597,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	defLogger = defLogger.With("go_line", line, "go_col", col)
 
 	// Validate URI and get absolute path
-	absPath, pathErr := ValidateAndGetFilePath(string(uri))
+	absPath, pathErr := ValidateAndGetFilePath(string(uri)) // Assumes utils.go exists
 	if pathErr != nil {
 		defLogger.Error("Invalid file URI", "error", pathErr)
 		return nil, fmt.Errorf("invalid file URI: %w", pathErr)
@@ -654,7 +654,8 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	}
 
 	// Convert the definition position (token.Pos) to an LSP Location
-	location, locErr := tokenPosToLSPLocation(defFile, defPos, defFileContent, defLogger)
+	// ** MODIFIED: Cycle 1 - Pass definition file content **
+	location, locErr := tokenPosToLSPLocation(defFile, defPos, defFileContent, defLogger) // Assumes lsp_protocol.go exists
 	if locErr != nil {
 		defLogger.Error("Failed to convert definition position to LSP Location", "identifier", obj.Name(), "error", locErr)
 		return nil, nil // Return nil result
@@ -747,7 +748,7 @@ func (s *Server) handleDidChangeConfiguration(ctx context.Context, conn *jsonrpc
 			s.config = s.completer.GetCurrentConfig()
 			s.logger.Info("Server configuration updated successfully via workspace/didChangeConfiguration")
 			// Potentially update server's logger level if it changed
-			newLevel, parseErr := ParseLogLevel(s.config.LogLevel)
+			newLevel, parseErr := ParseLogLevel(s.config.LogLevel) // Assumes utils.go exists
 			if parseErr == nil {
 				// Assuming logger supports dynamic level changes or recreation
 				// This part depends heavily on how the logger is implemented/passed
@@ -863,18 +864,22 @@ func internalRangeToLSPRange(content []byte, internalRange Range, logger *slog.L
 	if content == nil {
 		return nil, errors.New("cannot convert range: content is nil")
 	}
-	// Validate internal range offsets
-	if internalRange.Start.Character < 0 || internalRange.End.Character < internalRange.Start.Character || internalRange.End.Character > len(content) {
-		return nil, fmt.Errorf("invalid internal byte offset range: start=%d, end=%d, content_len=%d", internalRange.Start.Character, internalRange.End.Character, len(content))
+	// Validate internal range offsets (Character field holds byte offset here)
+	startByteOffset := internalRange.Start.Character
+	endByteOffset := internalRange.End.Character
+	contentLen := len(content)
+
+	if startByteOffset < 0 || endByteOffset < startByteOffset || endByteOffset > contentLen {
+		return nil, fmt.Errorf("invalid internal byte offset range: start=%d, end=%d, content_len=%d", startByteOffset, endByteOffset, contentLen)
 	}
 
-	startLine, startChar, startErr := byteOffsetToLSPPosition(content, internalRange.Start.Character, logger)
+	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startByteOffset, logger) // Assumes utils.go exists
 	if startErr != nil {
-		return nil, fmt.Errorf("failed converting start offset %d: %w", internalRange.Start.Character, startErr)
+		return nil, fmt.Errorf("failed converting start offset %d: %w", startByteOffset, startErr)
 	}
-	endLine, endChar, endErr := byteOffsetToLSPPosition(content, internalRange.End.Character, logger)
+	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endByteOffset, logger) // Assumes utils.go exists
 	if endErr != nil {
-		return nil, fmt.Errorf("failed converting end offset %d: %w", internalRange.End.Character, endErr)
+		return nil, fmt.Errorf("failed converting end offset %d: %w", endByteOffset, endErr)
 	}
 
 	// Basic validation: ensure start is not after end in LSP coordinates

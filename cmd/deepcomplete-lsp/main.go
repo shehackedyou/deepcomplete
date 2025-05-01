@@ -27,18 +27,23 @@ func main() {
 	}
 	defer logFile.Close()
 
+	// --- Setup Temporary Logger for Initialization ---
+	// Use a basic stderr logger initially until the final level is determined.
+	tempLogger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logFile), &slog.HandlerOptions{Level: slog.LevelInfo})) // Default to Info for init
+
 	// --- Initialize Core Service ---
 	// This loads configuration internally
-	completer, initErr := deepcomplete.NewDeepCompleter()
+	// ** MODIFIED: Cycle 1 Fix - Pass tempLogger to NewDeepCompleter **
+	completer, initErr := deepcomplete.NewDeepCompleter(tempLogger)
 	if initErr != nil {
 		// Log initial error using a temporary basic logger before full slog setup
-		tempLogger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logFile), &slog.HandlerOptions{Level: slog.LevelWarn}))
 		tempLogger.Error("Failed to initialize DeepCompleter service", "error", initErr)
 		// Exit on fatal init errors, but allow config warnings to proceed
 		if !errors.Is(initErr, deepcomplete.ErrConfig) {
 			os.Exit(1)
 		}
 		if completer == nil { // Ensure completer is non-nil even with config errors
+			tempLogger.Error("DeepCompleter initialization returned nil unexpectedly, exiting.")
 			os.Exit(1)
 		}
 	}
@@ -56,7 +61,6 @@ func main() {
 	if parseLevelErr != nil {
 		logLevel = slog.LevelInfo // Default to Info
 		// Log warning using a temporary logger if parsing fails
-		tempLogger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logFile), &slog.HandlerOptions{Level: slog.LevelWarn}))
 		tempLogger.Warn("Invalid log level in config, using default 'info'", "config_level", initialConfig.LogLevel, "error", parseLevelErr)
 	}
 	logWriter := io.MultiWriter(os.Stderr, logFile)
