@@ -1,8 +1,7 @@
 package main
 
 import (
-	"errors"
-	"expvar" // For publishing metrics
+	"errors" // For publishing metrics
 	"io"
 	stlog "log" // Renamed standard log
 	"log/slog"
@@ -30,15 +29,13 @@ func main() {
 	tempLogger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logFile), &slog.HandlerOptions{Level: slog.LevelInfo})) // Default to Info for init
 
 	// --- Initialize Core Service ---
-	// Pass tempLogger to NewDeepCompleter
 	completer, initErr := deepcomplete.NewDeepCompleter(tempLogger)
 	if initErr != nil {
 		tempLogger.Error("Failed to initialize DeepCompleter service", "error", initErr)
-		// Exit on fatal init errors, but allow config warnings to proceed
 		if !errors.Is(initErr, deepcomplete.ErrConfig) {
 			os.Exit(1)
 		}
-		if completer == nil { // Ensure completer is non-nil even with config errors
+		if completer == nil {
 			tempLogger.Error("DeepCompleter initialization returned nil unexpectedly, exiting.")
 			os.Exit(1)
 		}
@@ -52,14 +49,13 @@ func main() {
 
 	// --- Setup Global Logger ---
 	initialConfig := completer.GetCurrentConfig()
-	// Use utility function from deepcomplete package
-	logLevel, parseLevelErr := deepcomplete.ParseLogLevel(initialConfig.LogLevel)
+	logLevel, parseLevelErr := deepcomplete.ParseLogLevel(initialConfig.LogLevel) // Util func
 	if parseLevelErr != nil {
 		logLevel = slog.LevelInfo // Default to Info
 		tempLogger.Warn("Invalid log level in config, using default 'info'", "config_level", initialConfig.LogLevel, "error", parseLevelErr)
 	}
 	logWriter := io.MultiWriter(os.Stderr, logFile)
-	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: true} // Add source for debugging
+	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: true}
 	handler := slog.NewTextHandler(logWriter, &handlerOpts)
 	logger := slog.New(handler)
 	slog.SetDefault(logger) // Set the configured logger as default
@@ -78,8 +74,9 @@ func main() {
 	startDebugServer() // Start pprof/expvar HTTP server
 
 	// --- Initialize and Run LSP Server ---
-	// Create the LSP server instance
+	// Create the LSP server instance, passing the final logger
 	lspServer := deepcomplete.NewServer(completer, logger, appVersion)
+	// Note: Metrics publishing is now handled within NewServer/publishExpvarMetrics
 
 	// Run the server (blocks until shutdown)
 	lspServer.Run(os.Stdin, os.Stdout)
@@ -88,20 +85,14 @@ func main() {
 }
 
 // startDebugServer starts the HTTP server for pprof and expvar.
+// Cycle 4: No changes needed here, expvar registration is automatic.
 func startDebugServer() {
 	debugListenAddr := "localhost:6061" // Consider making configurable
 	go func() {
 		slog.Info("Starting debug server for pprof/expvar", "addr", debugListenAddr)
-		debugMux := http.NewServeMux()
-		// Register pprof handlers
-		debugMux.HandleFunc("/debug/pprof/", http.DefaultServeMux.ServeHTTP)
-		debugMux.HandleFunc("/debug/pprof/cmdline", http.DefaultServeMux.ServeHTTP)
-		debugMux.HandleFunc("/debug/pprof/profile", http.DefaultServeMux.ServeHTTP)
-		debugMux.HandleFunc("/debug/pprof/symbol", http.DefaultServeMux.ServeHTTP)
-		debugMux.HandleFunc("/debug/pprof/trace", http.DefaultServeMux.ServeHTTP)
-		// Register expvar handler
-		debugMux.HandleFunc("/debug/vars", expvar.Handler().ServeHTTP)
-		if err := http.ListenAndServe(debugListenAddr, debugMux); err != nil {
+		// Use DefaultServeMux which already has pprof and expvar handlers registered.
+		// If you needed a custom mux, you'd register expvar.Handler() and pprof handlers manually.
+		if err := http.ListenAndServe(debugListenAddr, nil); err != nil {
 			slog.Error("Debug server failed", "error", err) // Use default slog logger
 		}
 	}()
