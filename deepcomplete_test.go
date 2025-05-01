@@ -1,5 +1,5 @@
 // deepcomplete/deepcomplete_test.go
-// Cycle 2: Updated utility function calls and cleaned comments.
+// Cycle 3: Updated utility function calls, explicit logger passing, context propagation.
 package deepcomplete
 
 import (
@@ -46,6 +46,7 @@ func main() { // Line 5
 // Line 9`
 
 	// Ensure a default slog logger is set (even if discarding output)
+	// calculateCursorPos uses slog.Default() internally via helpers.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	fset := token.NewFileSet()
@@ -139,7 +140,11 @@ func MyFunction(arg1 int, arg2 string) (res int, err error) {
 		t.Fatalf("Failed to write temp file: %v", err)
 	}
 
-	analyzer := NewGoPackagesAnalyzer(slog.Default()) // Pass logger
+	// Setup logger for the test
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil)) // Discard logs for this test
+
+	// Analyzer without DB path disables caching for this test.
+	analyzer := NewGoPackagesAnalyzer(testLogger) // Pass logger
 	t.Cleanup(func() {
 		if err := analyzer.Close(); err != nil {
 			t.Errorf("Error closing analyzer: %v", err)
@@ -149,6 +154,7 @@ func MyFunction(arg1 int, arg2 string) (res int, err error) {
 	t.Run("Inside MyFunction", func(t *testing.T) {
 		line, col := 18, 2
 		ctx := context.Background()
+		// Analyze now uses the logger configured in the analyzer instance
 		info, analysisErr := analyzer.Analyze(ctx, tmpFilename, 1, line, col)
 		isNonFatalLoadErr := analysisErr != nil && errors.Is(analysisErr, ErrAnalysisFailed)
 		if analysisErr != nil && !isNonFatalLoadErr {
@@ -168,8 +174,9 @@ func MyFunction(arg1 int, arg2 string) (res int, err error) {
 
 // TestLoadConfig tests configuration loading and default file writing.
 func TestLoadConfig(t *testing.T) {
-	// Ensure a default slog logger is set
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Setup logger for the test
+	var logBuf bytes.Buffer
+	testLogger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	origConfigDir := os.Getenv("XDG_CONFIG_HOME")
 	origHome := os.Getenv("HOME")
@@ -264,13 +271,10 @@ func TestLoadConfig(t *testing.T) {
 				t.Fatalf("Setup failed: %v", err)
 			}
 
-			var logBuf bytes.Buffer
-			testLogger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-			oldLogger := slog.Default()
-			slog.SetDefault(testLogger)
-			t.Cleanup(func() { slog.SetDefault(oldLogger) })
+			// Reset log buffer for each test
+			logBuf.Reset()
 
-			// Call LoadConfig directly (now in deepcomplete.go)
+			// Call LoadConfig directly (now in deepcomplete.go), passing the test logger
 			gotConfig, err := LoadConfig(testLogger)
 
 			if err != nil && !errors.Is(err, ErrConfig) {
@@ -314,6 +318,7 @@ func TestLoadConfig(t *testing.T) {
 
 // TestExtractSnippetContext tests prefix/suffix/line extraction.
 func TestExtractSnippetContext(t *testing.T) {
+	// Ensure default logger is set for the utility function
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	content := "line one\nline two\nline three"
@@ -380,8 +385,11 @@ func TestFindIdentifierAtCursor(t *testing.T) {
 }
 
 // setupTestAnalyzer creates an analyzer with a temporary DB for testing cache.
-func setupTestAnalyzer(t *testing.T) (*GoPackagesAnalyzer, string) {
+func setupTestAnalyzer(t *testing.T, logger *slog.Logger) (*GoPackagesAnalyzer, string) {
 	t.Helper()
+	if logger == nil { // Ensure logger is not nil
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	tmpDir := t.TempDir()
 	dbDir := filepath.Join(tmpDir, "test_bboltdb", fmt.Sprintf("v%d", cacheSchemaVersion))
 	if err := os.MkdirAll(dbDir, 0750); err != nil {
@@ -412,6 +420,7 @@ func setupTestAnalyzer(t *testing.T) (*GoPackagesAnalyzer, string) {
 		t.Fatalf("Failed to create test ristretto cache: %v", cacheErr)
 	}
 
+	// Create analyzer manually for testing internal state if needed
 	analyzer := &GoPackagesAnalyzer{db: db, memoryCache: memCache}
 
 	t.Cleanup(func() {
@@ -423,6 +432,7 @@ func setupTestAnalyzer(t *testing.T) (*GoPackagesAnalyzer, string) {
 }
 
 // captureSlogOutput executes a function while capturing slog output.
+// Note: This sets the *default* slog logger. Tests should pass the logger explicitly where needed.
 func captureSlogOutput(t *testing.T, action func()) string {
 	t.Helper()
 	var logBuf bytes.Buffer
@@ -439,13 +449,11 @@ func captureSlogOutput(t *testing.T, action func()) string {
 
 // TestGoPackagesAnalyzer_Cache tests cache invalidation and hit/miss logic.
 func TestGoPackagesAnalyzer_Cache(t *testing.T) {
-	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	oldLogger := slog.Default()
-	slog.SetDefault(testLogger)
-	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+	// Setup logger for this test suite
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil)) // Discard logs for this test run
 
 	t.Run("InvalidateCache", func(t *testing.T) {
-		analyzer, tmpDir := setupTestAnalyzer(t)
+		analyzer, tmpDir := setupTestAnalyzer(t, testLogger) // Pass logger
 		testFilename := filepath.Join(tmpDir, "cache_test.go")
 		testContent := `package main; func main() { println("hello") }`
 		if err := os.WriteFile(testFilename, []byte(testContent), 0644); err != nil {
@@ -455,7 +463,9 @@ func TestGoPackagesAnalyzer_Cache(t *testing.T) {
 		line, col := 1, 20
 		version := 1
 
+		// Use captureSlogOutput which sets the default logger
 		logOutput1 := captureSlogOutput(t, func() {
+			// Analyze uses the logger configured within the analyzer instance
 			_, err := analyzer.Analyze(ctx, testFilename, version, line, col)
 			if err != nil && !errors.Is(err, ErrAnalysisFailed) {
 				t.Fatalf("First Analyze failed unexpectedly: %v", err)
@@ -483,7 +493,9 @@ func TestGoPackagesAnalyzer_Cache(t *testing.T) {
 			t.Log("Skipping cache hit check for second analysis as first didn't save.")
 		}
 
+		// Invalidate cache - capture logs specifically for this action
 		logOutputInvalidate := captureSlogOutput(t, func() {
+			// InvalidateCache uses slog.Default() via helpers, so captureSlogOutput works
 			if err := analyzer.InvalidateCache(tmpDir); err != nil {
 				t.Fatalf("InvalidateCache failed: %v", err)
 			}
@@ -509,9 +521,10 @@ func TestGoPackagesAnalyzer_Cache(t *testing.T) {
 	// ... other cache tests ...
 }
 
-// TestDeepCompleter_GetCompletionStreamFromFile_Basic tests the basic flow.
+// TestDeepCompleter_GetCompletionStreamFromFile_Basic tests the basic flow and error handling.
 func TestDeepCompleter_GetCompletionStreamFromFile_Basic(t *testing.T) {
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Setup logger for this test suite
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil)) // Discard logs
 
 	t.Run("Success (mock or skip Ollama)", func(t *testing.T) {
 		t.Skip("Skipping success test: Requires mock Ollama or running instance.")
@@ -523,7 +536,7 @@ func TestDeepCompleter_GetCompletionStreamFromFile_Basic(t *testing.T) {
 			t.Fatalf("Failed to write test file: %v", err)
 		}
 
-		completer, err := NewDeepCompleter(slog.Default()) // Pass logger
+		completer, err := NewDeepCompleter(testLogger) // Pass logger
 		if err != nil && !errors.Is(err, ErrConfig) {
 			t.Fatalf("NewDeepCompleter failed: %v", err)
 		}
@@ -537,6 +550,7 @@ func TestDeepCompleter_GetCompletionStreamFromFile_Basic(t *testing.T) {
 		version := 1
 
 		var buf bytes.Buffer
+		// GetCompletionStreamFromFile uses the logger configured in the completer
 		err = completer.GetCompletionStreamFromFile(ctx, testFilename, version, line, col, &buf)
 
 		allowedErrors := []error{ErrOllamaUnavailable, ErrAnalysisFailed, ErrStreamProcessing}
@@ -563,8 +577,9 @@ func TestDeepCompleter_GetCompletionStreamFromFile_Basic(t *testing.T) {
 	})
 
 	t.Run("File Not Found", func(t *testing.T) {
+		// Capture logs specifically for this subtest if needed
 		logOutput := captureSlogOutput(t, func() {
-			completer, err := NewDeepCompleter(slog.Default()) // Pass logger
+			completer, err := NewDeepCompleter(testLogger) // Pass logger
 			if err != nil && !errors.Is(err, ErrConfig) {
 				t.Fatalf("NewDeepCompleter failed: %v", err)
 			}
@@ -594,9 +609,10 @@ func TestDeepCompleter_GetCompletionStreamFromFile_Basic(t *testing.T) {
 
 // TestDeepCompleter_UpdateConfig tests dynamic config updates.
 func TestDeepCompleter_UpdateConfig(t *testing.T) {
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Setup logger for this test suite
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil)) // Discard logs
 
-	completer, err := NewDeepCompleter(slog.Default()) // Pass logger
+	completer, err := NewDeepCompleter(testLogger) // Pass logger
 	if err != nil && !errors.Is(err, ErrConfig) {
 		t.Fatalf("NewDeepCompleter failed: %v", err)
 	}
@@ -613,6 +629,7 @@ func TestDeepCompleter_UpdateConfig(t *testing.T) {
 			newValidConfig.MaxTokens = 512
 			newValidConfig.Stop = []string{"\n\n", "//"}
 
+			// UpdateConfig uses the logger configured in the completer
 			err := completer.UpdateConfig(newValidConfig)
 			if err != nil {
 				t.Fatalf("UpdateConfig failed for valid config: %v", err)
@@ -666,7 +683,8 @@ func TestDeepCompleter_UpdateConfig(t *testing.T) {
 
 // TestBuildPreamble_Truncation tests preamble truncation logic.
 func TestBuildPreamble_Truncation(t *testing.T) {
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Setup logger for this test suite
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil)) // Discard logs
 
 	t.Run("ScopeTruncation", func(t *testing.T) {
 		logOutput := captureSlogOutput(t, func() {
@@ -685,8 +703,8 @@ func TestBuildPreamble_Truncation(t *testing.T) {
 				}
 				return ""
 			}
-			// Call helper from helpers_preamble.go
-			preamble := buildPreamble(nil, info, qualifier, slog.Default())
+			// Pass the specific test logger to buildPreamble
+			preamble := buildPreamble(nil, info, qualifier, testLogger) // From helpers_preamble.go
 			t.Logf("Generated Preamble (Scope Truncation Test):\n%s", preamble)
 
 			expectedMarker := "//   ... (scope truncated)"
@@ -710,6 +728,7 @@ func TestCompletionItemGeneration(t *testing.T) {
 // ============================================================================
 
 func TestLSPPositionConversion(t *testing.T) {
+	// Ensure default logger is set for utility functions if they use it
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	t.Run("TestUtf16OffsetToBytes", func(t *testing.T) {

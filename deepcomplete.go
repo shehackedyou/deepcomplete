@@ -3,6 +3,7 @@
 // Cycle 1: Moved core types and errors to separate files.
 // Cycle 2: Moved utility functions to deepcomplete_utils.go. Component implementations remain here for now.
 // Cycle 2 Fix: Moved MemoryCacheEnabled and GetMemoryCacheMetrics back here as methods. Updated calls to exported config utils.
+// Cycle 3: Added context propagation and explicit logger passing to Analyze method.
 package deepcomplete
 
 import (
@@ -62,9 +63,9 @@ type Analyzer interface {
 	// InvalidateMemoryCacheForURI removes memory-cached data for a specific file URI (e.g., on file change).
 	InvalidateMemoryCacheForURI(uri string, version int) error
 	// MemoryCacheEnabled returns true if the in-memory cache is configured and active.
-	MemoryCacheEnabled() bool // Cycle 2 Fix: Method defined on GoPackagesAnalyzer
+	MemoryCacheEnabled() bool
 	// GetMemoryCacheMetrics returns performance metrics for the in-memory cache.
-	GetMemoryCacheMetrics() *ristretto.Metrics // Cycle 2 Fix: Method defined on GoPackagesAnalyzer
+	GetMemoryCacheMetrics() *ristretto.Metrics
 }
 
 // PromptFormatter defines the interface for constructing the final prompt sent to the LLM.
@@ -80,7 +81,6 @@ type PromptFormatter interface {
 // LoadConfig loads configuration from standard locations, merges with defaults,
 // validates, and attempts to write a default config if needed.
 // Returns the final Config and a non-fatal ErrConfig if warnings occurred.
-// Cycle 2 Fix: Calls exported utility functions from deepcomplete_utils.go.
 func LoadConfig(logger *stdslog.Logger) (Config, error) {
 	if logger == nil {
 		logger = stdslog.Default() // Use default if nil
@@ -388,7 +388,9 @@ func (a *GoPackagesAnalyzer) Close() error {
 
 // Analyze performs code analysis for a given file and position, utilizing caching.
 // Returns the populated AstContextInfo and any fatal error encountered.
+// Cycle 3: Passes context down to helper functions.
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, version int, line, col int) (info *AstContextInfo, analysisErr error) {
+	// Use default logger for this top-level method, pass it down
 	logger := stdslog.Default().With("absFile", absFilename, "version", version, "line", line, "col", col)
 	info = &AstContextInfo{
 		FilePath:         absFilename,
@@ -403,7 +405,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		if r := recover(); r != nil {
 			panicErr := fmt.Errorf("internal panic during analysis: %v", r)
 			logger.Error("Panic recovered during Analyze", "error", r, "stack", string(debug.Stack()))
-			addAnalysisError(info, panicErr, logger)
+			addAnalysisError(info, panicErr, logger) // Use helper from helpers_diagnostics.go
 			if analysisErr == nil {
 				analysisErr = panicErr
 			} else {
@@ -509,6 +511,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 
 		var loadDiagnostics []Diagnostic
 		var loadErrors []error
+		// Pass context and logger down
 		targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := loadPackageAndFile(ctx, absFilename, fset, logger) // From helpers_loader.go
 		info.Diagnostics = append(info.Diagnostics, loadDiagnostics...)
 
@@ -522,6 +525,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 
 		stepsStart := time.Now()
 		if targetFile != nil {
+			// Pass context and logger down
 			analyzeStepErr := performAnalysisSteps(ctx, targetFile, targetFileAST, targetPkg, fset, line, col, a, info, logger) // From helpers_analysis_steps.go
 			if analyzeStepErr != nil {
 				addAnalysisError(info, analyzeStepErr, logger)
@@ -530,6 +534,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 			if len(loadErrors) == 0 {
 				addAnalysisError(info, errors.New("cannot perform analysis steps: target token.File is nil"), logger)
 			}
+			// Pass context and logger down
 			gatherScopeContext(ctx, nil, targetPkg, fset, info, logger) // From helpers_analysis_steps.go
 		}
 		stepsDuration = time.Since(stepsStart)
@@ -552,6 +557,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				}
 				logger.Debug("Building preamble with limited or no type info.")
 			}
+			// Pass logger down
 			info.PromptPreamble = constructPromptPreamble(a, info, qualifier, logger) // From helpers_preamble.go
 			preambleDuration = time.Since(preambleStart)
 			logger.Debug("Preamble construction completed", "duration", preambleDuration)
@@ -658,7 +664,6 @@ func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int
 }
 
 // MemoryCacheEnabled returns true if the Ristretto cache is initialized and available.
-// Cycle 2 Fix: Moved method back here to satisfy Analyzer interface.
 func (a *GoPackagesAnalyzer) MemoryCacheEnabled() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -666,7 +671,6 @@ func (a *GoPackagesAnalyzer) MemoryCacheEnabled() bool {
 }
 
 // GetMemoryCacheMetrics returns the performance metrics collected by Ristretto.
-// Cycle 2 Fix: Moved method back here to satisfy Analyzer interface.
 func (a *GoPackagesAnalyzer) GetMemoryCacheMetrics() *ristretto.Metrics {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -965,6 +969,7 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 	if currentConfig.UseAst {
 		logger.Info("Analyzing context (or checking cache)")
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 30*time.Second)
+		// Pass context down to Analyze
 		analysisInfo, analysisErr = dc.analyzer.Analyze(analysisCtx, absFilename, version, line, col)
 		cancelAnalysis()
 

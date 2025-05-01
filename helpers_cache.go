@@ -1,6 +1,6 @@
 // deepcomplete/helpers_cache.go
 // Contains helper functions for memory caching (Ristretto).
-// Cycle 2 Fix: Ensured call to analyzer.MemoryCacheEnabled() is correct.
+// Cycle 3: Added explicit logger passing.
 package deepcomplete
 
 import (
@@ -30,16 +30,14 @@ func withMemoryCache[T any](
 	cost int64, // Estimated cost for Ristretto (e.g., size in bytes, or just 1)
 	ttl time.Duration, // Time-to-live for the cache entry
 	computeFn func() (T, error), // Function to compute the value if cache miss
-	logger *slog.Logger,
+	logger *slog.Logger, // Accept logger explicitly
 ) (T, bool, error) {
 	var zero T // Zero value for the return type T
 	if logger == nil {
-		logger = slog.Default()
+		logger = slog.Default() // Fallback if logger is nil
 	}
 
 	// Check if analyzer or memory cache is available via the interface method
-	// Cycle 2 Fix: Call MemoryCacheEnabled() via the Analyzer interface.
-	// The implementation is now correctly on GoPackagesAnalyzer in deepcomplete.go.
 	if analyzer == nil || !analyzer.MemoryCacheEnabled() {
 		logger.Debug("Memory cache check skipped (analyzer or cache disabled)", "key", cacheKey)
 		result, err := computeFn()
@@ -52,7 +50,6 @@ func withMemoryCache[T any](
 	// or adding Get/Set methods to the Analyzer interface itself.
 	// For simplicity in this example, we assume direct access is possible
 	// IF the concrete type is known or methods are added to the interface.
-	// A more robust solution would involve adding cache methods to the Analyzer interface.
 
 	// Example assuming we can get the concrete type (less ideal design):
 	concreteAnalyzer, ok := analyzer.(*GoPackagesAnalyzer)

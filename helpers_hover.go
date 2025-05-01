@@ -1,4 +1,6 @@
 // deepcomplete/helpers_hover.go
+// Contains helper functions specifically for generating hover information.
+// Cycle 3: Added explicit logger passing.
 package deepcomplete
 
 import (
@@ -21,6 +23,9 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 		logger.Debug("formatObjectForHover called with nil object")
 		return ""
 	}
+	if logger == nil {
+		logger = slog.Default() // Fallback if logger is nil
+	}
 	hoverLogger := logger.With("object_name", obj.Name(), "object_type", fmt.Sprintf("%T", obj))
 
 	var hoverText strings.Builder
@@ -34,14 +39,14 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 		// Fallback qualifier if package context is unavailable
 		qualifier = func(other *types.Package) string {
 			if other != nil {
-				return other.Name() // Use package name if possible
+				return other.Name()
 			}
-			return "" // Empty string otherwise
+			return ""
 		}
 		hoverLogger.Warn("Target package or types missing, using fallback qualifier for hover.")
 	}
 
-	// Use types.ObjectString for a concise definition string (e.g., "var name type", "func name(...) ...")
+	// Use types.ObjectString for a concise definition string
 	definition := types.ObjectString(obj, qualifier)
 	if definition != "" {
 		hoverText.WriteString("```go\n") // Start Go code block
@@ -58,13 +63,13 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 
 	// Attempt to get comment from the definition node found earlier during analysis
 	if info.IdentifierDefNode != nil {
-		hoverLogger.Debug("Attempting to find doc comment on definition node", "def_node_type", fmt.Sprintf("%T", info.IdentifierDefNode), "def_node_pos", getPosString(info.TargetFileSet, info.IdentifierDefNode.Pos())) // Assumes helpers_diagnostics.go exists
+		// Use getPosString from utils
+		hoverLogger.Debug("Attempting to find doc comment on definition node", "def_node_type", fmt.Sprintf("%T", info.IdentifierDefNode), "def_node_pos", getPosString(info.TargetFileSet, info.IdentifierDefNode.Pos()))
 		// Extract the comment group based on the type of the definition node
 		switch n := info.IdentifierDefNode.(type) {
 		case *ast.FuncDecl:
 			commentGroup = n.Doc
 		case *ast.GenDecl: // Handles var, const, type blocks
-			// For GenDecl, find the specific Spec that matches the object's position
 			foundSpecDoc := false
 			for _, spec := range n.Specs {
 				var specDoc *ast.CommentGroup
@@ -87,33 +92,29 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 						match = true
 					}
 				}
-				// If the specific spec matched the object's definition position
 				if match {
 					commentGroup = specDoc
-					// If the spec itself has no doc, fall back to the GenDecl's doc
 					if commentGroup == nil {
-						commentGroup = n.Doc
+						commentGroup = n.Doc // Fallback to GenDecl doc
 						hoverLogger.Debug("Using GenDecl doc as fallback", "spec_type", fmt.Sprintf("%T", spec), "spec_pos", getPosString(info.TargetFileSet, specPos))
 					} else {
 						hoverLogger.Debug("Found doc comment on specific Spec node", "spec_type", fmt.Sprintf("%T", spec), "spec_pos", getPosString(info.TargetFileSet, specPos))
 					}
 					foundSpecDoc = true
-					break // Exit spec loop once the matching spec is found
+					break
 				}
 			}
-			// If no specific spec matched (e.g., cursor on `var` keyword itself?), use the GenDecl doc.
-			if !foundSpecDoc {
+			if !foundSpecDoc { // Fallback if no specific spec matched
 				commentGroup = n.Doc
 				hoverLogger.Debug("No matching Spec found in GenDecl, using GenDecl doc", "gen_decl_pos", getPosString(info.TargetFileSet, n.Pos()))
 			}
-		case *ast.TypeSpec: // Handles individual type specs outside GenDecl (less common)
+		case *ast.TypeSpec:
 			commentGroup = n.Doc
-		case *ast.Field: // Handles struct fields, interface methods, func params/results
+		case *ast.Field:
 			commentGroup = n.Doc
-		case *ast.ValueSpec: // Handles individual var/const specs outside GenDecl
+		case *ast.ValueSpec:
 			commentGroup = n.Doc
 		case *ast.AssignStmt: // Handle short variable declarations (var := value)
-			// Short variable declarations (`:=`) don't have associated doc comments in the AST.
 			if n.Tok == token.DEFINE {
 				for _, lhsExpr := range n.Lhs {
 					if ident, ok := lhsExpr.(*ast.Ident); ok && ident.Pos() == obj.Pos() {
@@ -134,12 +135,12 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 		var doc strings.Builder
 		for _, c := range commentGroup.List {
 			if c != nil {
-				// Basic cleaning: remove comment markers, trim space
+				// Basic cleaning
 				text := strings.TrimSpace(strings.TrimPrefix(c.Text, "//"))
 				text = strings.TrimSpace(strings.TrimPrefix(text, "/*"))
 				text = strings.TrimSpace(strings.TrimSuffix(text, "*/"))
 				if doc.Len() > 0 {
-					doc.WriteString("\n") // Add newline between comment lines for readability
+					doc.WriteString("\n")
 				}
 				doc.WriteString(text)
 			}
@@ -147,15 +148,13 @@ func formatObjectForHover(obj types.Object, info *AstContextInfo, logger *slog.L
 		docComment = doc.String()
 		hoverLogger.Debug("Found and formatted doc comment", "comment_length", len(docComment))
 	} else if info.IdentifierDefNode != nil {
-		// Log only if we expected to find a node but it had no comment
 		hoverLogger.Debug("No doc comment found on definition node")
 	}
 
 	// --- 3. Combine Definition and Documentation ---
 	if docComment != "" {
 		if hoverText.Len() > 0 {
-			// Add a separator if both definition and documentation exist
-			hoverText.WriteString("\n\n---\n\n")
+			hoverText.WriteString("\n\n---\n\n") // Separator
 		}
 		hoverText.WriteString(docComment)
 	}

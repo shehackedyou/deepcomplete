@@ -1,14 +1,19 @@
 // deepcomplete/helpers_preamble.go
+// Contains helper functions specifically for constructing the LLM prompt preamble.
+// Cycle 3: Added explicit logger passing, refined limit handling.
+// Cycle 3 Fix: Corrected unused variable 'contextAdded'.
 package deepcomplete
 
 import (
 	"fmt"
-	"go/ast"
 	"go/types"
 	"log/slog"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	// Import necessary packages if missing (e.g., go/ast)
+	"go/ast"
 )
 
 // ============================================================================
@@ -17,28 +22,22 @@ import (
 
 // constructPromptPreamble builds the final preamble string from analyzed info.
 // This acts as the main entry point for preamble generation.
-// Conceptual: Could be wrapped by memory cache in the future.
 func constructPromptPreamble(
-	analyzer *GoPackagesAnalyzer, // Pass down for potential future use (e.g., cache checks within)
+	analyzer Analyzer, // Use interface type
 	info *AstContextInfo,
 	qualifier types.Qualifier,
 	logger *slog.Logger,
 ) string {
 	// --- Memory Cache Check (Conceptual - Omitted for now) ---
-	// cacheKey := generateCacheKey("preamble", info) // Assumes helpers_cache.go exists
-	// cachedPreamble, hit, err := withMemoryCache[string](...)
-	// if err != nil { ... }
-	// if hit { return cachedPreamble }
 
 	// --- Direct Implementation ---
-	return buildPreamble(analyzer, info, qualifier, logger)
+	return buildPreamble(analyzer, info, qualifier, logger) // Pass logger
 }
 
 // buildPreamble constructs the context string sent to the LLM from analysis info.
 // Internal helper called by constructPromptPreamble.
-// ** MODIFIED: Cycle 3 - Ensure logger is used correctly, improve limit handling **
 func buildPreamble(
-	analyzer *GoPackagesAnalyzer, // Pass down for potential future use
+	analyzer Analyzer, // Use interface type
 	info *AstContextInfo,
 	qualifier types.Qualifier,
 	logger *slog.Logger,
@@ -86,35 +85,33 @@ func buildPreamble(
 	// 1. Add file/package context
 	pkgName := info.PackageName
 	if pkgName == "" && info.TargetPackage != nil && info.TargetPackage.Types != nil {
-		pkgName = info.TargetPackage.Types.Name() // Get package name from types if available
+		pkgName = info.TargetPackage.Types.Name()
 	}
 	if pkgName == "" {
-		pkgName = "[unknown]" // Fallback
+		pkgName = "[unknown]"
 	}
 	addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), pkgName))
 
 	// 2. Add imports section
-	formatImportsSection(&preamble, info, addToPreamble, addTruncMarker, logger)
+	formatImportsSection(&preamble, info, addToPreamble, addTruncMarker, logger) // Pass logger
 
 	// 3. Add enclosing function/method section
-	formatEnclosingFuncSection(&preamble, info, qualifier, addToPreamble)
+	formatEnclosingFuncSection(&preamble, info, qualifier, addToPreamble, logger) // Pass logger
 
 	// 4. Add relevant comments section
-	formatCommentsSection(&preamble, info, addToPreamble, addTruncMarker, logger)
+	formatCommentsSection(&preamble, info, addToPreamble, addTruncMarker, logger) // Pass logger
 
 	// 5. Add specific cursor context (call, selector, etc.) section
-	formatCursorContextSection(&preamble, info, qualifier, addToPreamble, logger)
+	formatCursorContextSection(&preamble, info, qualifier, addToPreamble, logger) // Pass logger
 
 	// 6. Add variables/constants/types in scope section
-	formatScopeSection(&preamble, info, qualifier, addToPreamble, addTruncMarker, logger)
-	// Don't return early here, even if truncated, as scope is often the largest part
+	formatScopeSection(&preamble, info, qualifier, addToPreamble, addTruncMarker, logger) // Pass logger
 
 	return preamble.String()
 }
 
 // formatImportsSection formats the import list, respecting limits.
 // Returns false if the internal preamble limit was reached during processing.
-// ** MODIFIED: Cycle 3 - Handle nil imports gracefully **
 func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add func(string) bool, addTrunc func(string), logger *slog.Logger) bool {
 	if len(info.Imports) == 0 {
 		return true // No imports, section skipped successfully
@@ -151,8 +148,7 @@ func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add f
 
 // formatEnclosingFuncSection formats the enclosing function/method info.
 // Returns false if the internal preamble limit was reached.
-// ** MODIFIED: Cycle 3 - Improve fallback logic **
-func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool) bool {
+func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, logger *slog.Logger) bool {
 	funcOrMethod := "Function"
 	receiverStr := ""
 	if info.ReceiverType != "" {
@@ -166,7 +162,6 @@ func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo,
 		sigStr := types.TypeString(info.EnclosingFunc.Type(), qualifier)
 		// Clean up signature string for methods to avoid duplicating receiver
 		if info.ReceiverType != "" && strings.HasPrefix(sigStr, "func(") {
-			// Remove the receiver part from the signature string as we add it separately
 			if firstParen := strings.Index(sigStr, "("); firstParen != -1 {
 				if secondParen := strings.Index(sigStr[firstParen+1:], ")"); secondParen != -1 {
 					// Construct signature without receiver: "func" + params + results
@@ -180,7 +175,7 @@ func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo,
 		if info.EnclosingFuncNode.Name != nil {
 			name = info.EnclosingFuncNode.Name.Name
 		}
-		// Show only basic signature from AST (params/results omitted for brevity/simplicity)
+		// Show only basic signature from AST
 		funcHeader = fmt.Sprintf("// Enclosing %s (AST only): %s%s(...)\n", funcOrMethod, receiverStr, name)
 	} else {
 		return true // No enclosing function found, successful no-op
@@ -206,7 +201,7 @@ func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo, add 
 			logger.Debug("Truncated comments list in preamble", "max_comments", maxComments)
 			return true // Stop processing comments, section added successfully up to here
 		}
-		// Basic cleaning: remove comment markers, trim space
+		// Basic cleaning
 		cleanComment := strings.TrimSpace(strings.TrimPrefix(c, "//"))
 		cleanComment = strings.TrimSpace(strings.TrimPrefix(cleanComment, "/*"))
 		cleanComment = strings.TrimSpace(strings.TrimSuffix(cleanComment, "*/"))
@@ -224,7 +219,6 @@ func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo, add 
 
 // formatCursorContextSection formats specific context like calls, selectors, etc.
 // Returns false if the internal preamble limit was reached.
-// ** MODIFIED: Cycle 3 - Improve handling of unknown types/members and logging **
 func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, logger *slog.Logger) bool {
 	if logger == nil {
 		logger = slog.Default() // Ensure logger is not nil
@@ -233,9 +227,8 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 
 	// --- Function Call Context ---
 	if info.CallExpr != nil {
-		contextAdded = true
+		contextAdded = true // Mark that context was added
 		funcName := "[unknown function]"
-		// Attempt to get function name from AST
 		switch fun := info.CallExpr.Fun.(type) {
 		case *ast.Ident:
 			funcName = fun.Name
@@ -247,8 +240,8 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Inside function call: %s (Arg %d)\n", funcName, info.CallArgIndex+1)) {
 			return false
 		}
+
 		if sig := info.CallExprFuncType; sig != nil {
-			// Add full signature
 			if !add(fmt.Sprintf("// Function Signature: %s\n", types.TypeString(sig, qualifier))) {
 				return false
 			}
@@ -264,7 +257,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 					}
 					highlight := ""
 					isVariadic := sig.Variadic() && i == params.Len()-1
-					// Highlight the parameter corresponding to the cursor's argument index
 					if i == info.CallArgIndex || (isVariadic && info.CallArgIndex >= i) {
 						highlight = " // <-- cursor here"
 						if isVariadic {
@@ -308,18 +300,17 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 				}
 			}
 		} else {
-			// Indicate if type analysis failed for the call expression
 			logger.Warn("Could not determine function signature for call expression", "function_name", funcName)
 			if !add("// Function Signature: (unknown - type analysis failed for call expression)\n") {
 				return false
 			}
 		}
-		return true // Handled call expression context successfully (within limits)
+		// No return here, allow other contexts to be checked if needed (though unlikely if inside call)
 	}
 
 	// --- Selector Expression Context ---
 	if info.SelectorExpr != nil {
-		contextAdded = true
+		contextAdded = true // Mark that context was added
 		selName := ""
 		if info.SelectorExpr.Sel != nil {
 			selName = info.SelectorExpr.Sel.Name
@@ -328,7 +319,7 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if info.SelectorExprType != nil {
 			typeName = types.TypeString(info.SelectorExprType, qualifier)
 		}
-		// Check if the selected member is known (useful for diagnostics, less so for preamble maybe)
+
 		fieldOrMethod, _, _ := types.LookupFieldOrMethod(info.SelectorExprType, true, nil, selName)
 		isKnownMember := fieldOrMethod != nil
 		unknownMemberMsg := ""
@@ -338,11 +329,10 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Selector context: expr type = %s%s\n", typeName, unknownMemberMsg)) {
 			return false
 		}
-		// List available members if the base type is known
+
 		if info.SelectorExprType != nil {
-			// List members only if the selected member is known OR the selection is incomplete (selName is empty)
-			// Avoid listing members if the user typed an explicitly unknown member.
 			if isKnownMember || selName == "" {
+				// Use interface type Analyzer here
 				members := listTypeMembers(info.SelectorExprType, info.SelectorExpr.X, qualifier, logger) // Assumes helpers_analysis_steps.go exists
 				var fields, methods []MemberInfo
 				if members != nil {
@@ -355,7 +345,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						}
 					}
 				}
-				// Add fields section
 				if len(fields) > 0 {
 					if !add("//   Available Fields:\n") {
 						return false
@@ -367,20 +356,18 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						}
 					}
 				}
-				// Add methods section
 				if len(methods) > 0 {
 					if !add("//   Available Methods:\n") {
 						return false
 					}
 					sort.Slice(methods, func(i, j int) bool { return methods[i].Name < methods[j].Name })
 					for _, method := range methods {
-						methodSig := strings.TrimPrefix(method.TypeString, "func") // Remove leading "func"
+						methodSig := strings.TrimPrefix(method.TypeString, "func")
 						if !add(fmt.Sprintf("//     - %s%s\n", method.Name, methodSig)) {
 							return false
 						}
 					}
 				}
-				// Indicate if no members found or couldn't be determined
 				if len(fields) == 0 && len(methods) == 0 {
 					msg := "//   (No exported fields or methods found)\n"
 					if members == nil {
@@ -397,18 +384,17 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 				}
 			}
 		} else {
-			// Base expression type unknown
 			logger.Warn("Cannot list members for selector because base expression type is unknown")
 			if !add("//   (Cannot list members: type analysis failed for base expression)\n") {
 				return false
 			}
 		}
-		return true // Handled selector expression context successfully (within limits)
+		// No return here, allow other contexts to be checked
 	}
 
 	// --- Composite Literal Context ---
 	if info.CompositeLit != nil {
-		contextAdded = true
+		contextAdded = true // Mark that context was added
 		typeName := "(unknown - type analysis failed for literal)"
 		if info.CompositeLitType != nil {
 			typeName = types.TypeString(info.CompositeLitType, qualifier)
@@ -416,23 +402,21 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Inside composite literal of type: %s\n", typeName)) {
 			return false
 		}
-		// List missing fields if it's a struct literal
+
 		if info.CompositeLitType != nil {
 			var st *types.Struct
-			// Get underlying type, handling pointers
 			currentType := info.CompositeLitType.Underlying()
 			if ptr, ok := currentType.(*types.Pointer); ok {
 				if ptr.Elem() != nil {
 					currentType = ptr.Elem().Underlying()
 				} else {
 					logger.Warn("Composite literal pointer type has nil element", "type", info.CompositeLitType.String())
-					currentType = nil // Invalid pointer type
+					currentType = nil
 				}
 			}
 			st, _ = currentType.(*types.Struct)
 
 			if st != nil {
-				// Find fields already present in the literal
 				presentFields := make(map[string]bool)
 				for _, elt := range info.CompositeLit.Elts {
 					if kv, ok := elt.(*ast.KeyValueExpr); ok {
@@ -441,7 +425,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						}
 					}
 				}
-				// Find exported fields missing from the literal
 				var missingFields []string
 				for i := 0; i < st.NumFields(); i++ {
 					field := st.Field(i)
@@ -449,7 +432,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 						missingFields = append(missingFields, types.ObjectString(field, qualifier))
 					}
 				}
-				// Add missing fields to preamble
 				if len(missingFields) > 0 {
 					if !add("//   Missing Exported Fields (candidates for completion):\n") {
 						return false
@@ -466,24 +448,22 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 					}
 				}
 			} else {
-				// Literal type is known but not a struct
 				if !add("//   (Underlying type is not a struct)\n") {
 					return false
 				}
 			}
 		} else {
-			// Literal type is unknown
 			logger.Warn("Cannot determine missing fields for composite literal: type analysis failed")
 			if !add("//   (Cannot determine missing fields: type analysis failed)\n") {
 				return false
 			}
 		}
-		return true // Handled composite literal context successfully (within limits)
+		// No return here, allow other contexts to be checked
 	}
 
 	// --- Identifier Context ---
 	if info.IdentifierAtCursor != nil {
-		contextAdded = true
+		contextAdded = true // Mark that context was added
 		identName := info.IdentifierAtCursor.Name
 		identTypeStr := "(Type unknown)"
 		if info.IdentifierType != nil {
@@ -494,21 +474,21 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Identifier at cursor: %s %s\n", identName, identTypeStr)) {
 			return false
 		}
-		return true // Handled identifier context successfully (within limits)
+		// No return here
 	}
 
+	// Cycle 3 Fix: Use the contextAdded variable
 	// If no specific context was added, maybe add a generic marker?
 	if !contextAdded {
 		// Optionally add a line indicating no specific context was identified
-		// add("// No specific call, selector, or literal context identified at cursor.\n")
+		add("// No specific call, selector, or literal context identified at cursor.\n")
 	}
 
-	return true // No specific cursor context found or limit reached earlier
+	return true // Return true indicating success (or limit reached)
 }
 
 // formatScopeSection formats variables/constants/types in scope, respecting limits.
 // Returns false if the internal preamble limit was reached.
-// ** MODIFIED: Cycle 3 - Ensure sorting and truncation work correctly **
 func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, addTrunc func(string), logger *slog.Logger) bool {
 	if len(info.VariablesInScope) == 0 {
 		return true // No scope variables, section skipped successfully
@@ -523,7 +503,6 @@ func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifi
 		obj := info.VariablesInScope[name]
 		objStr := types.ObjectString(obj, qualifier)
 		if objStr == "" {
-			// Fallback for objects that don't format well (e.g., unnamed results)
 			objStr = fmt.Sprintf("%s (type: %s)", obj.Name(), types.TypeString(obj.Type(), qualifier))
 		}
 		items = append(items, fmt.Sprintf("//   %s\n", objStr))
