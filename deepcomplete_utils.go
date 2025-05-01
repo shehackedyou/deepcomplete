@@ -371,6 +371,7 @@ func calculateGoModHash(dir string) string {
 // calculateInputHashes calculates hashes for go.mod, go.sum, and Go files.
 // Uses pkg.CompiledGoFiles if available, otherwise scans the directory.
 // Uses slog for logging.
+// ** MODIFIED: Cycle 2 - Improved logging and robustness **
 func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string, error) {
 	hashes := make(map[string]string)
 	filesToHash := make(map[string]struct{})
@@ -474,6 +475,7 @@ func hashFileContent(filePath string) (string, error) {
 
 // compareFileHashes compares current and cached file hashes, logging differences.
 // Uses slog for logging.
+// ** MODIFIED: Cycle 2 - Improved logging detail **
 func compareFileHashes(current, cached map[string]string) bool {
 	logger := slog.Default() // Use default logger
 
@@ -481,14 +483,16 @@ func compareFileHashes(current, cached map[string]string) bool {
 		logger.Debug("Cache invalid: File count mismatch", "current_count", len(current), "cached_count", len(cached))
 		// Log specific differences only if debug is enabled
 		if logger.Enabled(context.Background(), slog.LevelDebug) {
+			// Find added files
 			for relPath := range current {
 				if _, ok := cached[relPath]; !ok {
-					logger.Debug("File exists now but was not in cache", "file", relPath)
+					logger.Debug("File added since cache", "file", relPath)
 				}
 			}
+			// Find removed files
 			for relPath := range cached {
 				if _, ok := current[relPath]; !ok {
-					logger.Debug("File was cached but does not exist now", "file", relPath)
+					logger.Debug("File removed since cache", "file", relPath)
 				}
 			}
 		}
@@ -511,12 +515,13 @@ func compareFileHashes(current, cached map[string]string) bool {
 
 // deleteCacheEntryByKey removes an entry directly using the key.
 // Uses slog for logging.
+// ** MODIFIED: Cycle 2 - Ensure logger is used correctly **
 func deleteCacheEntryByKey(db *bbolt.DB, cacheKey []byte, logger *slog.Logger) error {
 	if db == nil {
 		return errors.New("cannot delete cache entry: db is nil")
 	}
 	if logger == nil {
-		logger = slog.Default()
+		logger = slog.Default() // Ensure logger is not nil
 	}
 	logger = logger.With("cache_key", string(cacheKey))
 
@@ -548,6 +553,7 @@ func deleteCacheEntryByKey(db *bbolt.DB, cacheKey []byte, logger *slog.Logger) e
 
 // retry executes an operation function with backoff and retry logic.
 // Uses slog for logging. Requires logger to be passed.
+// ** MODIFIED: Cycle 2 - Ensure logger is used correctly, clarify retryable conditions **
 func retry(ctx context.Context, operation func() error, maxRetries int, initialDelay time.Duration, logger *slog.Logger) error {
 	var lastErr error
 	if logger == nil {
@@ -582,6 +588,7 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 			(ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests || ollamaErr.Status == http.StatusInternalServerError)
 
 		// Check for general network/connection errors that might be temporary
+		// Also include stream processing errors as potentially retryable
 		isRetryableNetwork := errors.Is(lastErr, ErrOllamaUnavailable) || errors.Is(lastErr, ErrStreamProcessing)
 		// Add more specific network error checks if needed (e.g., net.OpError, syscall errors)
 
@@ -736,6 +743,7 @@ type SnippetContext struct {
 
 // extractSnippetContext extracts code prefix, suffix, and full line around the cursor.
 // Expects filename to be an absolute, validated path. Uses slog.
+// ** MODIFIED: Cycle 2 - Ensure logger is used correctly **
 func extractSnippetContext(filename string, row, col int) (SnippetContext, error) {
 	logger := slog.Default().With("file", filename, "line", row, "col", col) // Use default logger
 	var ctx SnippetContext
@@ -819,6 +827,7 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 // calculateCursorPos converts 1-based line/col to 0-based token.Pos offset.
 // This function is now defined here in utils, accessible within the package.
 // Uses slog for logging warnings about clamping.
+// ** MODIFIED: Cycle 2 - Ensure logger is used correctly **
 func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	logger := slog.Default() // Use default logger
 	if line <= 0 {
@@ -898,6 +907,7 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 
 // streamCompletion reads the Ollama stream response and writes it to w.
 // Uses slog for logging.
+// ** MODIFIED: Cycle 2 - Ensure logger is used correctly **
 func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 	defer r.Close()
 	reader := bufio.NewReader(r)
@@ -943,10 +953,14 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 
 // processLine decodes a single line from the Ollama stream and writes the content.
 // Uses slog for logging.
+// ** MODIFIED: Cycle 2 - Ensure logger is used correctly **
 func processLine(line []byte, w io.Writer, logger *slog.Logger) error {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
 		return nil // Ignore empty lines
+	}
+	if logger == nil {
+		logger = slog.Default() // Ensure logger is not nil
 	}
 
 	var resp OllamaResponse

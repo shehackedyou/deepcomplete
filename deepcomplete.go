@@ -100,6 +100,7 @@ type Config struct {
 
 // Validate checks if configuration values are valid, applying defaults for some fields.
 // It uses the default slog logger to report warnings about applied defaults.
+// ** MODIFIED: Cycle 2 - Ensure logger is used correctly, simplify default application **
 func (c *Config) Validate(logger *stdslog.Logger) error {
 	var validationErrors []error
 	if logger == nil {
@@ -154,7 +155,7 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		copy(c.Stop, tempDefault.Stop)
 	}
 
-	// Ensure internal templates are always set (not validated from file)
+	// Ensure internal templates are always set (they aren't loaded from file)
 	if c.PromptTemplate == "" {
 		c.PromptTemplate = promptTemplate
 	}
@@ -406,6 +407,7 @@ func getDefaultConfig() Config {
 // merges with defaults, validates the result, and attempts to write a default config
 // if none exists or the existing one is invalid.
 // Returns the final validated Config and a non-fatal ErrConfig if warnings occurred during loading.
+// ** MODIFIED: Cycle 2 - Simplify logging and error handling **
 func LoadConfig(logger *stdslog.Logger) (Config, error) {
 	if logger == nil {
 		logger = stdslog.Default() // Use default if nil
@@ -415,71 +417,59 @@ func LoadConfig(logger *stdslog.Logger) (Config, error) {
 	var loadErrors []error
 	var configParseError error
 
-	// Determine primary (XDG) and secondary (~/.config) paths
 	primaryPath, secondaryPath, pathErr := getConfigPaths(logger)
 	if pathErr != nil {
 		loadErrors = append(loadErrors, pathErr)
-		logger.Warn("Could not determine config paths, will use defaults", "error", pathErr)
+		logger.Warn("Could not determine config paths, using defaults", "error", pathErr)
 	}
 
-	// Try loading from primary path
+	// Try primary path
 	if primaryPath != "" {
 		logger.Debug("Attempting to load config", "path", primaryPath)
 		loaded, loadErr := loadAndMergeConfig(primaryPath, &cfg, logger)
 		if loadErr != nil {
-			// Check if it's specifically a JSON parsing error
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				configParseError = loadErr // Store the parsing error
+				configParseError = loadErr
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", primaryPath, loadErr))
 			logger.Warn("Failed to load or merge config", "path", primaryPath, "error", loadErr)
 		} else if loaded {
 			loadedFromFile = true
 			logger.Info("Loaded config", "path", primaryPath)
-		} else {
-			logger.Debug("Config file not found or empty", "path", primaryPath)
 		}
 	}
 
 	// Try secondary path if primary failed or wasn't found
 	primaryNotFoundOrFailed := !loadedFromFile || configParseError != nil
-	if primaryNotFoundOrFailed && secondaryPath != "" {
+	if primaryNotFoundOrFailed && secondaryPath != "" && secondaryPath != primaryPath { // Avoid trying same path twice
 		logger.Debug("Attempting to load config from secondary path", "path", secondaryPath)
 		loaded, loadErr := loadAndMergeConfig(secondaryPath, &cfg, logger)
 		if loadErr != nil {
-			// Store parsing error only if we didn't already have one from the primary path
 			if configParseError == nil && strings.Contains(loadErr.Error(), "parsing config file JSON") {
 				configParseError = loadErr
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", secondaryPath, loadErr))
 			logger.Warn("Failed to load or merge config", "path", secondaryPath, "error", loadErr)
-		} else if loaded {
-			// Only mark as loadedFromFile if we hadn't already loaded from primary
-			if !loadedFromFile {
-				loadedFromFile = true
-				logger.Info("Loaded config", "path", secondaryPath)
-			}
-		} else {
-			logger.Debug("Config file not found or empty", "path", secondaryPath)
+		} else if loaded && !loadedFromFile { // Only mark loaded if primary wasn't
+			loadedFromFile = true
+			logger.Info("Loaded config", "path", secondaryPath)
 		}
 	}
 
 	// Write default config if no valid file was loaded
 	loadSucceeded := loadedFromFile && configParseError == nil
 	if !loadSucceeded {
-		if configParseError != nil {
-			logger.Warn("Existing config file failed to parse. Attempting to write default.", "error", configParseError)
-		} else {
-			logger.Info("No valid config file found. Attempting to write default.")
-		}
-		// Determine path to write default config (prefer primary)
-		writePath := primaryPath
+		writePath := primaryPath // Prefer primary path for writing
 		if writePath == "" {
 			writePath = secondaryPath
 		}
 
 		if writePath != "" {
-			logger.Info("Attempting to write default config", "path", writePath)
+			if configParseError != nil {
+				logger.Warn("Existing config file failed to parse. Attempting to write default.", "path", writePath, "error", configParseError)
+			} else {
+				logger.Info("No valid config file found. Attempting to write default.", "path", writePath)
+			}
 			if err := writeDefaultConfig(writePath, getDefaultConfig(), logger); err != nil {
 				logger.Warn("Failed to write default config", "path", writePath, "error", err)
 				loadErrors = append(loadErrors, fmt.Errorf("writing default config failed: %w", err))
@@ -492,25 +482,15 @@ func LoadConfig(logger *stdslog.Logger) (Config, error) {
 		logger.Info("Using default configuration values.")
 	}
 
-	// Ensure internal templates are set (they aren't loaded from file)
-	if cfg.PromptTemplate == "" {
-		cfg.PromptTemplate = promptTemplate
-	}
-	if cfg.FimTemplate == "" {
-		cfg.FimTemplate = fimPromptTemplate
-	}
-
 	// Final validation of the resulting config (loaded or default)
 	finalCfg := cfg
 	if err := finalCfg.Validate(logger); err != nil {
-		logger.Warn("Config after load/merge failed validation. Falling back to pure defaults.", "error", err)
+		logger.Error("Final configuration is invalid, falling back to pure defaults.", "error", err)
 		loadErrors = append(loadErrors, fmt.Errorf("post-load config validation failed: %w", err))
 		pureDefault := getDefaultConfig()
 		// Validate the pure DefaultConfig as a last resort
 		if valErr := pureDefault.Validate(logger); valErr != nil {
-			// This indicates a bug in the DefaultConfig definition
 			logger.Error("FATAL: Default config definition is invalid", "error", valErr)
-			// Return the invalid default config but with a fatal error
 			return pureDefault, fmt.Errorf("default config definition is invalid: %w", valErr)
 		}
 		finalCfg = pureDefault // Use pure defaults if merged/loaded config is invalid
