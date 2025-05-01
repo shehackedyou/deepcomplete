@@ -26,19 +26,20 @@ func main() {
 
 	flag.Parse()
 
+	// --- Setup Temporary Logger for Initialization ---
+	// Use a basic stderr logger initially until the final level is determined.
+	tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})) // Default to Info for init
+
 	// --- Initialize Completer (Loads Config) ---
 	// Load config implicitly via NewDeepCompleter.
 	// NewDeepCompleter now returns a non-fatal ErrConfig if loading had issues.
-	completer, initErr := deepcomplete.NewDeepCompleter()
+	completer, initErr := deepcomplete.NewDeepCompleter(tempLogger) // Pass temp logger
 	if initErr != nil && !errors.Is(initErr, deepcomplete.ErrConfig) {
-		// Use a temporary basic logger for fatal init errors before final logger setup
-		tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		tempLogger.Error("Fatal error initializing DeepCompleter service", "error", initErr)
 		os.Exit(1) // Exit on fatal errors
 	}
 	if completer == nil {
 		// This should ideally not happen if NewDeepCompleter handles errors correctly
-		tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		tempLogger.Error("DeepCompleter initialization returned nil unexpectedly")
 		os.Exit(1)
 	}
@@ -51,21 +52,20 @@ func main() {
 		}
 	}()
 
-	// --- Setup Logger based on Flag/Config (Cycle 1 Refinement) ---
+	// --- Setup Final Logger based on Flag/Config ---
 	initialConfig := completer.GetCurrentConfig()
 	chosenLogLevelStr := initialConfig.LogLevel // Start with config level
 
 	// Override with flag if provided
 	if *logLevelFlag != "" {
 		chosenLogLevelStr = *logLevelFlag
-		slog.Debug("Log level overridden by command-line flag", "flag_level", chosenLogLevelStr)
+		// Use tempLogger here as default isn't set yet
+		tempLogger.Debug("Log level overridden by command-line flag", "flag_level", chosenLogLevelStr)
 	}
 
 	// Parse the chosen level string
 	logLevel, parseLevelErr := deepcomplete.ParseLogLevel(chosenLogLevelStr)
 	if parseLevelErr != nil {
-		// Use a temporary logger if parsing fails, as default logger isn't set yet
-		tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		tempLogger.Warn("Invalid log level specified, using default 'info'", "specified_level", chosenLogLevelStr, "error", parseLevelErr)
 		logLevel = slog.LevelInfo // Default to Info
 	}
@@ -73,8 +73,8 @@ func main() {
 	// Initialize the default slog logger with the determined level
 	// Send CLI logs to stderr
 	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false} // Source location less useful for CLI
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &handlerOpts))
-	slog.SetDefault(logger) // Set as default for the rest of the execution
+	finalLogger := slog.New(slog.NewTextHandler(os.Stderr, &handlerOpts))
+	slog.SetDefault(finalLogger) // Set as default for the rest of the execution
 
 	// Log initialization confirmation *after* setting the final logger
 	slog.Info("DeepComplete service initialized.", "effective_log_level", logLevel.String())
@@ -107,9 +107,10 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		// Validate file path using helper function
-		absPath, pathErr := deepcomplete.ValidateAndGetFilePath(*filePath, slog.Default())
+		// Validate file path using helper function - REMOVED LOGGER ARGUMENT
+		absPath, pathErr := deepcomplete.ValidateAndGetFilePath(*filePath)
 		if pathErr != nil {
+			// Log the error using the final logger
 			slog.Error("Invalid file path provided via -file flag", "path", *filePath, "error", pathErr)
 			os.Exit(1)
 		}
@@ -123,7 +124,8 @@ func main() {
 	}
 
 	// --- Execute Command ---
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Use a longer timeout for CLI operations as they might involve cold starts
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	if *stdin {

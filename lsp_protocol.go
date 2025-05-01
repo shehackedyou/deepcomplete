@@ -11,10 +11,9 @@ import (
 	"go/token" // Needed for tokenPosToLSPLocation, nodeRangeToLSPRange
 	"go/types" // Needed for mapTypeToCompletionKind
 	"log/slog" // Needed for helpers
-
 	// Needed for tokenPosToLSPLocation
 	// Needed for formatObjectForHover (if moved back here)
-	"unicode/utf8" // Needed for byteOffsetToLSPPosition, bytesToUTF16Offset
+	// "unicode/utf8" // No longer needed here, functions moved to utils
 )
 
 // ============================================================================
@@ -458,13 +457,15 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 	}
 
 	// Convert 0-based byte offset to 0-based LSP line/char (UTF-16)
-	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger) // Use function defined below
+	// Use the version from deepcomplete_utils.go
+	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger)
 	if convErr != nil {
 		return nil, fmt.Errorf("failed converting byte offset %d to LSP position: %w", offset, convErr)
 	}
 
 	// Construct file URI
-	fileURIStr, uriErr := PathToURI(file.Name()) // Use utility function from deepcomplete_utils.go
+	// Use the version from deepcomplete_utils.go
+	fileURIStr, uriErr := PathToURI(file.Name())
 	if uriErr != nil {
 		logger.Warn("Failed to convert definition file path to URI", "path", file.Name(), "error", uriErr)
 		return nil, fmt.Errorf("failed to create URI for definition file %s: %w", file.Name(), uriErr)
@@ -481,65 +482,9 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 	}, nil
 }
 
-// byteOffsetToLSPPosition converts a 0-based byte offset to 0-based LSP line/char (UTF-16).
-// (Moved from lsp_server.go)
-func byteOffsetToLSPPosition(content []byte, targetByteOffset int, logger *slog.Logger) (line, char uint32, err error) {
-	if content == nil {
-		return 0, 0, errors.New("content is nil")
-	}
-	if targetByteOffset < 0 {
-		return 0, 0, fmt.Errorf("invalid targetByteOffset: %d", targetByteOffset)
-	}
-	if targetByteOffset > len(content) {
-		targetByteOffset = len(content)
-		logger.Debug("targetByteOffset exceeds content length, clamping to EOF", "offset", targetByteOffset, "content_len", len(content))
-	}
+// REMOVED byteOffsetToLSPPosition - Use version from deepcomplete_utils.go
 
-	currentLine := uint32(0)
-	currentByteOffset := 0
-	currentLineStartByteOffset := 0
-
-	for currentByteOffset < targetByteOffset {
-		r, size := utf8.DecodeRune(content[currentByteOffset:])
-		if r == utf8.RuneError && size <= 1 {
-			return 0, 0, fmt.Errorf("invalid UTF-8 sequence at byte offset %d", currentByteOffset)
-		}
-		if r == '\n' {
-			currentLine++
-			currentLineStartByteOffset = currentByteOffset + size
-		}
-		currentByteOffset += size
-	}
-
-	lineContentBytes := content[currentLineStartByteOffset:targetByteOffset]
-	utf16CharOffset, convErr := bytesToUTF16Offset(lineContentBytes, logger) // Use function defined below
-	if convErr != nil {
-		logger.Error("Error converting line bytes to UTF16 offset", "error", convErr, "line", currentLine)
-		utf16CharOffset = len(lineContentBytes) // Fallback
-	}
-
-	return currentLine, uint32(utf16CharOffset), nil
-}
-
-// bytesToUTF16Offset calculates the number of UTF-16 code units for a byte slice.
-// (Moved from lsp_server.go)
-func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
-	utf16Offset := 0
-	byteOffset := 0
-	for byteOffset < len(bytes) {
-		r, size := utf8.DecodeRune(bytes[byteOffset:])
-		if r == utf8.RuneError && size <= 1 {
-			return utf16Offset, fmt.Errorf("%w at byte offset %d within slice", ErrInvalidUTF8, byteOffset) // Use exported error
-		}
-		if r > 0xFFFF {
-			utf16Offset += 2 // Surrogate pair
-		} else {
-			utf16Offset += 1
-		}
-		byteOffset += size
-	}
-	return utf16Offset, nil
-}
+// REMOVED bytesToUTF16Offset - Use version from deepcomplete_utils.go
 
 // nodeRangeToLSPRange converts an AST node's position range to an LSP Range.
 // (Moved from lsp_server.go)
@@ -566,8 +511,9 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 		return nil, fmt.Errorf("invalid byte offsets calculated: start=%d, end=%d, content_len=%d", startOffset, endOffset, len(content))
 	}
 
-	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger) // Use function defined above
-	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)         // Use function defined above
+	// Use the version from deepcomplete_utils.go
+	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger)
+	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)
 
 	if startErr != nil || endErr != nil {
 		return nil, fmt.Errorf("failed converting offsets to LSP positions: startErr=%v, endErr=%v", startErr, endErr)

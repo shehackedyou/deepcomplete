@@ -100,33 +100,42 @@ type Config struct {
 
 // Validate checks if configuration values are valid, applying defaults for some fields.
 // It uses the default slog logger to report warnings about applied defaults.
-func (c *Config) Validate() error {
+func (c *Config) Validate(logger *stdslog.Logger) error {
 	var validationErrors []error
-	logger := stdslog.Default() // Use default logger
+	if logger == nil {
+		logger = stdslog.Default() // Use default if nil
+	}
+	// Use a temporary config with defaults for comparison/application
+	tempDefault := getDefaultConfig()
 
 	if strings.TrimSpace(c.OllamaURL) == "" {
 		validationErrors = append(validationErrors, errors.New("ollama_url cannot be empty"))
-	} else if _, err := url.ParseRequestURI(c.OllamaURL); err != nil {
-		validationErrors = append(validationErrors, fmt.Errorf("invalid ollama_url: %w", err))
+	} else {
+		parsedURL, err := url.ParseRequestURI(c.OllamaURL)
+		if err != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("invalid ollama_url format: %w", err))
+		} else if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+			validationErrors = append(validationErrors, fmt.Errorf("invalid ollama_url scheme '%s', must be http or https", parsedURL.Scheme))
+		}
 	}
 	if strings.TrimSpace(c.Model) == "" {
 		validationErrors = append(validationErrors, errors.New("model cannot be empty"))
 	}
 	if c.MaxTokens <= 0 {
-		logger.Warn("Config validation: max_tokens is not positive, applying default.", "configured_value", c.MaxTokens, "default", DefaultConfig.MaxTokens)
-		c.MaxTokens = DefaultConfig.MaxTokens
+		logger.Warn("Config validation: max_tokens is not positive, applying default.", "configured_value", c.MaxTokens, "default", tempDefault.MaxTokens)
+		c.MaxTokens = tempDefault.MaxTokens
 	}
 	if c.Temperature < 0 {
-		logger.Warn("Config validation: temperature is negative, applying default.", "configured_value", c.Temperature, "default", DefaultConfig.Temperature)
-		c.Temperature = DefaultConfig.Temperature
+		logger.Warn("Config validation: temperature is negative, applying default.", "configured_value", c.Temperature, "default", tempDefault.Temperature)
+		c.Temperature = tempDefault.Temperature
 	}
 	if c.MaxPreambleLen <= 0 {
-		logger.Warn("Config validation: max_preamble_len is not positive, applying default.", "configured_value", c.MaxPreambleLen, "default", DefaultConfig.MaxPreambleLen)
-		c.MaxPreambleLen = DefaultConfig.MaxPreambleLen
+		logger.Warn("Config validation: max_preamble_len is not positive, applying default.", "configured_value", c.MaxPreambleLen, "default", tempDefault.MaxPreambleLen)
+		c.MaxPreambleLen = tempDefault.MaxPreambleLen
 	}
 	if c.MaxSnippetLen <= 0 {
-		logger.Warn("Config validation: max_snippet_len is not positive, applying default.", "configured_value", c.MaxSnippetLen, "default", DefaultConfig.MaxSnippetLen)
-		c.MaxSnippetLen = DefaultConfig.MaxSnippetLen
+		logger.Warn("Config validation: max_snippet_len is not positive, applying default.", "configured_value", c.MaxSnippetLen, "default", tempDefault.MaxSnippetLen)
+		c.MaxSnippetLen = tempDefault.MaxSnippetLen
 	}
 	if c.LogLevel == "" {
 		logger.Warn("Config validation: log_level is empty, applying default.", "default", defaultLogLevel)
@@ -140,13 +149,22 @@ func (c *Config) Validate() error {
 	}
 	// Stop sequences: Ensure it's not nil, but allow empty slice.
 	if c.Stop == nil {
-		logger.Warn("Config validation: stop sequences list is nil, applying default.", "default", DefaultConfig.Stop)
-		c.Stop = make([]string, len(DefaultConfig.Stop))
-		copy(c.Stop, DefaultConfig.Stop)
+		logger.Warn("Config validation: stop sequences list is nil, applying default.", "default", tempDefault.Stop)
+		c.Stop = make([]string, len(tempDefault.Stop))
+		copy(c.Stop, tempDefault.Stop)
+	}
+
+	// Ensure internal templates are always set (not validated from file)
+	if c.PromptTemplate == "" {
+		c.PromptTemplate = promptTemplate
+	}
+	if c.FimTemplate == "" {
+		c.FimTemplate = fimPromptTemplate
 	}
 
 	if len(validationErrors) > 0 {
-		return errors.Join(validationErrors...)
+		// Wrap individual errors for better context
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, errors.Join(validationErrors...))
 	}
 	return nil
 }
@@ -358,12 +376,13 @@ type PromptFormatter interface {
 }
 
 // =============================================================================
-// Variables & Default Config
+// Default Config Helper
 // =============================================================================
 
-var (
-	// DefaultConfig provides default settings used when no config file is found or fields are missing.
-	DefaultConfig = Config{
+// getDefaultConfig returns a new instance of the default configuration.
+// This avoids modifying a global variable.
+func getDefaultConfig() Config {
+	return Config{
 		OllamaURL:      defaultOllamaURL,
 		Model:          defaultModel,
 		PromptTemplate: promptTemplate,
@@ -377,7 +396,7 @@ var (
 		MaxPreambleLen: 2048,  // Limit context preamble size
 		MaxSnippetLen:  2048,  // Limit code snippet size
 	}
-)
+}
 
 // =============================================================================
 // Configuration Loading
@@ -387,15 +406,17 @@ var (
 // merges with defaults, validates the result, and attempts to write a default config
 // if none exists or the existing one is invalid.
 // Returns the final validated Config and a non-fatal ErrConfig if warnings occurred during loading.
-func LoadConfig() (Config, error) {
-	logger := stdslog.Default() // Use default logger, assuming it's set up by main
-	cfg := DefaultConfig        // Start with defaults
+func LoadConfig(logger *stdslog.Logger) (Config, error) {
+	if logger == nil {
+		logger = stdslog.Default() // Use default if nil
+	}
+	cfg := getDefaultConfig() // Start with defaults
 	var loadedFromFile bool
 	var loadErrors []error
 	var configParseError error
 
 	// Determine primary (XDG) and secondary (~/.config) paths
-	primaryPath, secondaryPath, pathErr := getConfigPaths()
+	primaryPath, secondaryPath, pathErr := getConfigPaths(logger)
 	if pathErr != nil {
 		loadErrors = append(loadErrors, pathErr)
 		logger.Warn("Could not determine config paths, will use defaults", "error", pathErr)
@@ -459,7 +480,7 @@ func LoadConfig() (Config, error) {
 
 		if writePath != "" {
 			logger.Info("Attempting to write default config", "path", writePath)
-			if err := writeDefaultConfig(writePath, DefaultConfig); err != nil {
+			if err := writeDefaultConfig(writePath, getDefaultConfig(), logger); err != nil {
 				logger.Warn("Failed to write default config", "path", writePath, "error", err)
 				loadErrors = append(loadErrors, fmt.Errorf("writing default config failed: %w", err))
 			}
@@ -467,7 +488,7 @@ func LoadConfig() (Config, error) {
 			logger.Warn("Cannot determine path to write default config.")
 			loadErrors = append(loadErrors, errors.New("cannot determine default config path"))
 		}
-		cfg = DefaultConfig // Reset to defaults if write failed or no path found
+		cfg = getDefaultConfig() // Reset to defaults if write failed or no path found
 		logger.Info("Using default configuration values.")
 	}
 
@@ -481,16 +502,18 @@ func LoadConfig() (Config, error) {
 
 	// Final validation of the resulting config (loaded or default)
 	finalCfg := cfg
-	if err := finalCfg.Validate(); err != nil {
+	if err := finalCfg.Validate(logger); err != nil {
 		logger.Warn("Config after load/merge failed validation. Falling back to pure defaults.", "error", err)
 		loadErrors = append(loadErrors, fmt.Errorf("post-load config validation failed: %w", err))
+		pureDefault := getDefaultConfig()
 		// Validate the pure DefaultConfig as a last resort
-		if valErr := DefaultConfig.Validate(); valErr != nil {
+		if valErr := pureDefault.Validate(logger); valErr != nil {
 			// This indicates a bug in the DefaultConfig definition
-			logger.Error("FATAL: Default config is invalid", "error", valErr)
-			return DefaultConfig, fmt.Errorf("default config is invalid: %w", valErr)
+			logger.Error("FATAL: Default config definition is invalid", "error", valErr)
+			// Return the invalid default config but with a fatal error
+			return pureDefault, fmt.Errorf("default config definition is invalid: %w", valErr)
 		}
-		finalCfg = DefaultConfig // Use pure defaults if merged/loaded config is invalid
+		finalCfg = pureDefault // Use pure defaults if merged/loaded config is invalid
 	}
 
 	// Return final config and wrap any accumulated non-fatal errors
@@ -501,9 +524,8 @@ func LoadConfig() (Config, error) {
 }
 
 // getConfigPaths determines the primary (XDG_CONFIG_HOME) and secondary (~/.config) config paths.
-func getConfigPaths() (primary string, secondary string, err error) {
+func getConfigPaths(logger *stdslog.Logger) (primary string, secondary string, err error) {
 	var cfgErr, homeErr error
-	logger := stdslog.Default() // Use default logger
 
 	// Primary Path: XDG_CONFIG_HOME
 	userConfigDir, cfgErr := os.UserConfigDir()
@@ -516,23 +538,21 @@ func getConfigPaths() (primary string, secondary string, err error) {
 	// Secondary Path: ~/.config
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
-		secondary = filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
+		secondaryCandidate := filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
 		// If primary path failed, use secondary as primary
 		if primary == "" && cfgErr != nil {
-			primary = secondary
+			primary = secondaryCandidate
 			logger.Debug("Using fallback primary config path", "path", primary)
-			secondary = "" // Avoid duplication
-		}
-		// If paths ended up the same, clear secondary
-		if primary == secondary {
-			secondary = ""
+		} else if primary != secondaryCandidate {
+			// Only set secondary if it's different from primary
+			secondary = secondaryCandidate
 		}
 	} else {
 		logger.Warn("Could not determine user home directory", "error", homeErr)
 	}
 
 	// If neither path could be determined, return an error
-	if primary == "" && secondary == "" {
+	if primary == "" {
 		err = fmt.Errorf("cannot determine config/home directories: config error: %v; home error: %v", cfgErr, homeErr)
 	}
 	return primary, secondary, err
@@ -560,7 +580,10 @@ func loadAndMergeConfig(path string, cfg *Config, logger *stdslog.Logger) (loade
 	}
 
 	var fileCfg FileConfig
-	if err := json.Unmarshal(data, &fileCfg); err != nil {
+	// Use DisallowUnknownFields to catch typos in config file keys
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&fileCfg); err != nil {
 		return loaded, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
 	}
 
@@ -613,8 +636,7 @@ func loadAndMergeConfig(path string, cfg *Config, logger *stdslog.Logger) (loade
 
 // writeDefaultConfig creates the config directory if needed and writes the
 // default configuration values as a JSON file.
-func writeDefaultConfig(path string, defaultConfig Config) error {
-	logger := stdslog.Default() // Use default logger
+func writeDefaultConfig(path string, defaultConfig Config, logger *stdslog.Logger) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil { // Use appropriate permissions
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
@@ -795,8 +817,10 @@ type GoPackagesAnalyzer struct {
 }
 
 // NewGoPackagesAnalyzer initializes the analyzer, including setting up bbolt and ristretto caches.
-func NewGoPackagesAnalyzer() *GoPackagesAnalyzer {
-	logger := stdslog.Default() // Use default logger
+func NewGoPackagesAnalyzer(logger *stdslog.Logger) *GoPackagesAnalyzer {
+	if logger == nil {
+		logger = stdslog.Default() // Use default if nil
+	}
 	dbPath := ""
 
 	// Determine cache directory path
@@ -1314,16 +1338,19 @@ type DeepCompleter struct {
 	formatter PromptFormatter // Interface for formatting the LLM prompt.
 	config    Config          // Current active configuration.
 	configMu  sync.RWMutex    // Mutex to protect concurrent access to config.
+	logger    *stdslog.Logger // Logger instance
 }
 
 // NewDeepCompleter creates a new DeepCompleter service instance.
 // It loads the configuration using LoadConfig and initializes default components.
 // Returns the completer and a potential non-fatal ErrConfig if loading had issues.
-func NewDeepCompleter() (*DeepCompleter, error) {
-	logger := stdslog.Default() // Use default logger
+func NewDeepCompleter(logger *stdslog.Logger) (*DeepCompleter, error) {
+	if logger == nil {
+		logger = stdslog.Default() // Use default if nil
+	}
 
 	// Load configuration (handles defaults, merging, validation, writing defaults)
-	cfg, configErr := LoadConfig()
+	cfg, configErr := LoadConfig(logger)
 	// Only return fatal errors immediately. Config warnings (ErrConfig) are handled later.
 	if configErr != nil && !errors.Is(configErr, ErrConfig) {
 		logger.Error("Fatal error during initial config load", "error", configErr)
@@ -1331,18 +1358,25 @@ func NewDeepCompleter() (*DeepCompleter, error) {
 	}
 	// Even with ErrConfig, LoadConfig should return a valid (possibly default) config.
 	// Validate again just in case LoadConfig logic changes.
-	if err := cfg.Validate(); err != nil {
-		logger.Error("Loaded/default config is invalid", "error", err)
-		return nil, fmt.Errorf("initial config validation failed: %w", err)
+	if err := cfg.Validate(logger); err != nil {
+		// Check if it's the default config that's invalid (indicates a code bug)
+		if errors.Is(err, ErrInvalidConfig) {
+			logger.Error("Loaded/default config is invalid", "error", err)
+			return nil, fmt.Errorf("initial config validation failed: %w", err)
+		}
+		// Otherwise, it might be a non-fatal issue already logged by Validate
+		logger.Warn("Initial config validation reported issues", "error", err)
+		// Proceed, as Validate should have applied defaults
 	}
 
 	// Initialize components
-	analyzer := NewGoPackagesAnalyzer() // Initialize analyzer (handles its own cache setup)
+	analyzer := NewGoPackagesAnalyzer(logger) // Initialize analyzer (handles its own cache setup)
 	dc := &DeepCompleter{
 		client:    newHttpOllamaClient(), // Initialize default HTTP Ollama client
 		analyzer:  analyzer,
 		formatter: newTemplateFormatter(), // Initialize default prompt formatter
 		config:    cfg,                    // Set the loaded/validated config
+		logger:    logger,
 	}
 
 	// Return the completer and the non-fatal config error, if any
@@ -1355,7 +1389,10 @@ func NewDeepCompleter() (*DeepCompleter, error) {
 // NewDeepCompleterWithConfig creates a new DeepCompleter service with a specific,
 // provided configuration, bypassing the standard loading process.
 // Validates the provided config before creating the completer.
-func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
+func NewDeepCompleterWithConfig(config Config, logger *stdslog.Logger) (*DeepCompleter, error) {
+	if logger == nil {
+		logger = stdslog.Default() // Use default if nil
+	}
 	// Ensure internal templates are set if missing in provided config
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
@@ -1364,17 +1401,18 @@ func NewDeepCompleterWithConfig(config Config) (*DeepCompleter, error) {
 		config.FimTemplate = fimPromptTemplate
 	}
 	// Validate the provided configuration
-	if err := config.Validate(); err != nil {
+	if err := config.Validate(logger); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 
 	// Initialize components with the provided config
-	analyzer := NewGoPackagesAnalyzer()
+	analyzer := NewGoPackagesAnalyzer(logger)
 	return &DeepCompleter{
 		client:    newHttpOllamaClient(),
 		analyzer:  analyzer,
 		formatter: newTemplateFormatter(),
 		config:    config,
+		logger:    logger,
 	}, nil
 }
 
@@ -1388,7 +1426,6 @@ func (dc *DeepCompleter) Close() error {
 
 // UpdateConfig atomically updates the completer's configuration after validating the new config.
 func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
-	logger := stdslog.Default() // Use default logger
 	// Ensure internal templates are set
 	if newConfig.PromptTemplate == "" {
 		newConfig.PromptTemplate = promptTemplate
@@ -1397,7 +1434,7 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 		newConfig.FimTemplate = fimPromptTemplate
 	}
 	// Validate the incoming configuration
-	if err := newConfig.Validate(); err != nil {
+	if err := newConfig.Validate(dc.logger); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 
@@ -1407,7 +1444,7 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 	dc.config = newConfig // Update the config atomically
 
 	// Log the updated configuration values
-	logger.Info("DeepCompleter configuration updated",
+	dc.logger.Info("DeepCompleter configuration updated",
 		stdslog.String("ollama_url", newConfig.OllamaURL),
 		stdslog.String("model", newConfig.Model),
 		stdslog.Int("max_tokens", newConfig.MaxTokens),
@@ -1463,7 +1500,7 @@ func (dc *DeepCompleter) GetAnalyzer() Analyzer {
 // GetCompletion provides basic code completion for a given snippet without file context analysis.
 // Primarily useful for the CLI's stdin mode or simple testing.
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
-	logger := stdslog.Default().With("operation", "GetCompletion")
+	logger := dc.logger.With("operation", "GetCompletion")
 	logger.Info("Handling basic completion request")
 	currentConfig := dc.GetCurrentConfig() // Get thread-safe copy of config
 
@@ -1540,7 +1577,7 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 // GetCompletionStreamFromFile provides context-aware code completion by analyzing the
 // specified file and position, then streams the LLM response to the provided writer.
 func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFilename string, version int, line, col int, w io.Writer) error {
-	logger := stdslog.Default().With("operation", "GetCompletionStreamFromFile", "path", absFilename, "version", version, "line", line, "col", col)
+	logger := dc.logger.With("operation", "GetCompletionStreamFromFile", "path", absFilename, "version", version, "line", line, "col", col)
 	currentConfig := dc.GetCurrentConfig()                     // Get thread-safe config copy
 	var contextPreamble string = "// Basic file context only." // Default preamble if analysis fails/disabled
 	var analysisInfo *AstContextInfo
