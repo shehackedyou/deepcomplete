@@ -310,8 +310,9 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 	s.filesMu.RLock()
 	currentFile, exists := s.files[uri]
 	s.filesMu.RUnlock()
+	// Only publish if the file still exists in our map AND the version matches the one we analyzed
 	if !exists || currentFile.Version != version {
-		diagLogger.Warn("Skipping diagnostic publishing; file version changed during analysis", "analysis_version", version, "current_version", currentFile.Version)
+		diagLogger.Warn("Skipping diagnostic publishing; file version changed or file closed during analysis", "analysis_version", version, "current_version", currentFile.Version, "exists", exists)
 		return
 	}
 	// --- End Version Check ---
@@ -345,6 +346,7 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 		diagLogger.Warn("Analysis for diagnostics completed with non-fatal errors", "error", analysisErr)
 	}
 
+	// Publish diagnostics for the correct version
 	s.publishDiagnostics(uri, &version, lspDiagnostics, diagLogger)
 }
 
@@ -546,20 +548,17 @@ func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 		rt.logger.Warn("Attempted to add already tracked request ID", "id", id)
 		return
 	}
-	// Create a new context that can be cancelled independently
 	reqCtx, cancel := context.WithCancel(context.Background())
 	rt.requests[id] = cancel
 	rt.logger.Debug("Added request to tracker", "id", id)
 
-	// Goroutine to automatically cancel and remove if the original context is done
 	go func() {
 		select {
 		case <-ctx.Done():
 			rt.logger.Warn("Original request context done, ensuring tracked request is cancelled", "id", id, "reason", ctx.Err())
-			rt.Cancel(id) // Attempt to cancel via the tracker
-			rt.Remove(id) // Clean up immediately
+			rt.Cancel(id)
+			rt.Remove(id)
 		case <-reqCtx.Done():
-			// This means the derived context was cancelled, likely by rt.Cancel or rt.Remove.
 			rt.logger.Debug("Tracked request context cancelled", "id", id)
 		}
 	}()
@@ -577,7 +576,6 @@ func (rt *RequestTracker) Remove(id jsonrpc2.ID) {
 		cancel() // Ensure cancellation function is called
 		delete(rt.requests, id)
 	} else {
-		// This might happen if cancellation happened concurrently
 		rt.logger.Debug("Attempted to remove request ID not found in tracker", "id", id)
 	}
 }
@@ -590,12 +588,11 @@ func (rt *RequestTracker) Cancel(id jsonrpc2.ID) {
 	}
 	rt.mu.Lock()
 	cancel, found := rt.requests[id]
-	rt.mu.Unlock() // Unlock before calling cancel
+	rt.mu.Unlock()
 
 	if found {
 		rt.logger.Info("Calling cancel function for request via $/cancelRequest", "id", id)
-		cancel() // Trigger cancellation
-		// Removal happens automatically when reqCtx is done, or explicitly via Remove in handle defer
+		cancel()
 	} else {
 		rt.logger.Debug("Cancel function not found for request ID (already removed or never added?)", "id", id)
 	}
