@@ -1,6 +1,5 @@
 // deepcomplete/deepcomplete_utils.go
 // Contains utility functions used across the deepcomplete package.
-// Cycle 2 Fix: Exported config utility functions (GetConfigPaths, LoadAndMergeConfig, WriteDefaultConfig).
 package deepcomplete
 
 import (
@@ -31,7 +30,6 @@ import (
 // ============================================================================
 // Terminal Colors (Optional - For CLI)
 // ============================================================================
-// Cycle 2: Kept for potential CLI use, but consider removing if CLI fully adopts slog.
 var (
 	ColorReset  = "\033[0m"
 	ColorGreen  = "\033[38;5;119m"
@@ -42,7 +40,6 @@ var (
 )
 
 // PrettyPrint prints colored text to stderr.
-// Cycle 2: Kept for potential CLI use.
 func PrettyPrint(color, text string) {
 	// Direct printing to stderr might bypass structured logging.
 	fmt.Fprint(os.Stderr, color, text, ColorReset)
@@ -53,7 +50,6 @@ func PrettyPrint(color, text string) {
 // ============================================================================
 
 // ParseLogLevel converts a log level string to its corresponding slog.Level constant.
-// Cycle 2: Moved from deepcomplete.go
 func ParseLogLevel(levelStr string) (slog.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(levelStr)) {
 	case "debug":
@@ -65,7 +61,6 @@ func ParseLogLevel(levelStr string) (slog.Level, error) {
 	case "error", "err":
 		return slog.LevelError, nil
 	default:
-		// Return default level and an error
 		return slog.LevelInfo, fmt.Errorf("invalid log level string: %q (expected debug, info, warn, or error)", levelStr)
 	}
 }
@@ -75,11 +70,12 @@ func ParseLogLevel(levelStr string) (slog.Level, error) {
 // ============================================================================
 
 // GetConfigPaths determines the primary (XDG_CONFIG_HOME) and secondary (~/.config) config paths.
-// Cycle 2 Fix: Exported (was getConfigPaths).
 func GetConfigPaths(logger *slog.Logger) (primary string, secondary string, err error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	var cfgErr, homeErr error
 
-	// Primary Path: XDG_CONFIG_HOME
 	userConfigDir, cfgErr := os.UserConfigDir()
 	if cfgErr == nil {
 		primary = filepath.Join(userConfigDir, configDirName, defaultConfigFileName)
@@ -87,23 +83,19 @@ func GetConfigPaths(logger *slog.Logger) (primary string, secondary string, err 
 		logger.Warn("Could not determine user config directory (XDG)", "error", cfgErr)
 	}
 
-	// Secondary Path: ~/.config
 	homeDir, homeErr := os.UserHomeDir()
 	if homeErr == nil {
 		secondaryCandidate := filepath.Join(homeDir, ".config", configDirName, defaultConfigFileName)
-		// If primary path failed, use secondary as primary
 		if primary == "" && cfgErr != nil {
 			primary = secondaryCandidate
 			logger.Debug("Using fallback primary config path", "path", primary)
 		} else if primary != secondaryCandidate {
-			// Only set secondary if it's different from primary
 			secondary = secondaryCandidate
 		}
 	} else {
 		logger.Warn("Could not determine user home directory", "error", homeErr)
 	}
 
-	// If neither path could be determined, return an error
 	if primary == "" {
 		err = fmt.Errorf("cannot determine config/home directories: config error: %v; home error: %v", cfgErr, homeErr)
 	}
@@ -111,31 +103,32 @@ func GetConfigPaths(logger *slog.Logger) (primary string, secondary string, err 
 }
 
 // LoadAndMergeConfig attempts to load config from a specific path and merge its
-// fields into the provided cfg object. Uses FileConfig struct from types.go.
-// Cycle 2 Fix: Exported (was loadAndMergeConfig).
+// fields into the provided cfg object.
 func LoadAndMergeConfig(path string, cfg *Config, logger *slog.Logger) (loaded bool, err error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil // File not found is not an error here
+			return false, nil
 		}
 		return false, fmt.Errorf("reading config file %q failed: %w", path, err)
 	}
-	loaded = true // File exists
+	loaded = true
 
 	if len(data) == 0 {
 		logger.Warn("Config file exists but is empty, ignoring.", "path", path)
-		return loaded, nil // Empty file is not a parsing error
+		return loaded, nil
 	}
 
-	var fileCfg FileConfig // Use FileConfig from types.go
+	var fileCfg FileConfig
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&fileCfg); err != nil {
 		return loaded, fmt.Errorf("parsing config file JSON %q failed: %w", path, err)
 	}
 
-	// Merge fields from fileCfg into cfg if they are non-nil
 	mergedFields := 0
 	if fileCfg.OllamaURL != nil {
 		cfg.OllamaURL = *fileCfg.OllamaURL
@@ -184,14 +177,15 @@ func LoadAndMergeConfig(path string, cfg *Config, logger *slog.Logger) (loaded b
 
 // WriteDefaultConfig creates the config directory if needed and writes the
 // default configuration values as a JSON file.
-// Cycle 2 Fix: Exported (was writeDefaultConfig).
 func WriteDefaultConfig(path string, defaultConfig Config, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
 
-	// Create an exportable struct containing only fields meant for the config file
 	type ExportableConfig struct {
 		OllamaURL      string   `json:"ollama_url"`
 		Model          string   `json:"model"`
@@ -222,7 +216,7 @@ func WriteDefaultConfig(path string, defaultConfig Config, logger *slog.Logger) 
 		return fmt.Errorf("failed to marshal default config to JSON: %w", err)
 	}
 
-	if err := os.WriteFile(path, jsonData, 0640); err != nil { // Restricted permissions
+	if err := os.WriteFile(path, jsonData, 0640); err != nil {
 		return fmt.Errorf("failed to write default config file %s: %w", path, err)
 	}
 	logger.Info("Wrote default configuration", "path", path)
@@ -235,10 +229,10 @@ func WriteDefaultConfig(path string, defaultConfig Config, logger *slog.Logger) 
 
 // LspPositionToBytePosition converts 0-based LSP line/character (UTF-16) to
 // 1-based Go line/column (bytes) and 0-based byte offset.
-// Uses slog for logging warnings.
-// Cycle 2: Consolidated here from previous location.
-func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, byteOffset int, err error) {
-	logger := slog.Default() // Use default logger
+func LspPositionToBytePosition(content []byte, lspPos LSPPosition, logger *slog.Logger) (line, col, byteOffset int, err error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	if content == nil {
 		return 0, 0, -1, fmt.Errorf("%w: file content is nil", ErrPositionConversion)
@@ -246,7 +240,6 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 	targetLine := int(int32(lspPos.Line))
 	targetUTF16Char := int(int32(lspPos.Character))
 
-	// Validate input position non-negativity
 	if targetLine < 0 {
 		return 0, 0, -1, fmt.Errorf("%w: line number %d must be >= 0", ErrInvalidPositionInput, targetLine)
 	}
@@ -263,7 +256,7 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 		newlineLengthBytes := 1 // Assume \n
 
 		if currentLine == targetLine {
-			byteOffsetInLine, convErr := Utf16OffsetToBytes(lineTextBytes, targetUTF16Char) // Uses helper below
+			byteOffsetInLine, convErr := Utf16OffsetToBytes(lineTextBytes, targetUTF16Char, logger) // Pass logger
 			if convErr != nil {
 				if errors.Is(convErr, ErrPositionOutOfRange) {
 					logger.Warn("UTF16 offset out of range, clamping to line end",
@@ -271,17 +264,16 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 						"char", targetUTF16Char,
 						"line_length_bytes", lineLengthBytes,
 						"error", convErr)
-					byteOffsetInLine = lineLengthBytes // Clamp to end
+					byteOffsetInLine = lineLengthBytes
 				} else {
 					return 0, 0, -1, fmt.Errorf("failed converting UTF16 to byte offset on line %d: %w", currentLine, convErr)
 				}
 			}
-			line = currentLine + 1                            // Convert 0-based line to 1-based
-			col = byteOffsetInLine + 1                        // Convert 0-based byte offset in line to 1-based col
-			byteOffset = currentByteOffset + byteOffsetInLine // Calculate 0-based byte offset from file start
-			return line, col, byteOffset, nil                 // Success.
+			line = currentLine + 1
+			col = byteOffsetInLine + 1
+			byteOffset = currentByteOffset + byteOffsetInLine
+			return line, col, byteOffset, nil
 		}
-		// Move to the start of the next line
 		currentByteOffset += lineLengthBytes + newlineLengthBytes
 		currentLine++
 	}
@@ -289,27 +281,24 @@ func LspPositionToBytePosition(content []byte, lspPos LSPPosition) (line, col, b
 		return 0, 0, -1, fmt.Errorf("%w: error scanning file content: %w", ErrPositionConversion, err)
 	}
 
-	// Handle cursor on the line immediately after the last line.
 	if currentLine == targetLine {
-		if targetUTF16Char == 0 { // Only valid position is character 0
+		if targetUTF16Char == 0 {
 			line = currentLine + 1
 			col = 1
-			byteOffset = currentByteOffset // Offset at the end of the last line's content
+			byteOffset = currentByteOffset
 			return line, col, byteOffset, nil
 		}
 		return 0, 0, -1, fmt.Errorf("%w: invalid character offset %d on line %d (after last line with content)", ErrPositionOutOfRange, targetUTF16Char, targetLine)
 	}
 
-	// Target line not found.
 	return 0, 0, -1, fmt.Errorf("%w: LSP line %d not found in file (total lines scanned %d)", ErrPositionOutOfRange, targetLine, currentLine)
 }
 
 // Utf16OffsetToBytes converts a 0-based UTF-16 offset within a line to a 0-based byte offset.
-// Uses slog for logging warnings.
-// Cycle 2: Consolidated here from previous location.
-func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
-	// logger := slog.Default() // Use default logger
-
+func Utf16OffsetToBytes(line []byte, utf16Offset int, logger *slog.Logger) (int, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if utf16Offset < 0 {
 		return 0, fmt.Errorf("%w: invalid utf16Offset: %d (must be >= 0)", ErrInvalidPositionInput, utf16Offset)
 	}
@@ -331,24 +320,22 @@ func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
 		}
 
 		utf16Units := 1
-		if r > 0xFFFF { // Check if rune needs surrogate pair
+		if r > 0xFFFF {
 			utf16Units = 2
 		}
 
-		// Check if adding this rune *would* exceed the target offset
 		if currentUTF16Offset+utf16Units > utf16Offset {
-			break // Target offset falls within this rune
+			break
 		}
 
 		currentUTF16Offset += utf16Units
 		byteOffset += size
 
 		if currentUTF16Offset == utf16Offset {
-			break // Landed exactly on target
+			break
 		}
 	}
 
-	// Check if the requested offset was reachable
 	if currentUTF16Offset < utf16Offset {
 		return lineLenBytes, fmt.Errorf("%w: utf16Offset %d is beyond the line length in UTF-16 units (%d)", ErrPositionOutOfRange, utf16Offset, currentUTF16Offset)
 	}
@@ -357,7 +344,6 @@ func Utf16OffsetToBytes(line []byte, utf16Offset int) (int, error) {
 }
 
 // byteOffsetToLSPPosition converts a 0-based byte offset to 0-based LSP line/char (UTF-16).
-// Cycle 2: Consolidated here from lsp_server.go.
 func byteOffsetToLSPPosition(content []byte, targetByteOffset int, logger *slog.Logger) (line, char uint32, err error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -389,20 +375,17 @@ func byteOffsetToLSPPosition(content []byte, targetByteOffset int, logger *slog.
 		currentByteOffset += size
 	}
 
-	// Calculate the UTF-16 offset within the target line
 	lineContentBytes := content[currentLineStartByteOffset:targetByteOffset]
-	utf16CharOffset, convErr := bytesToUTF16Offset(lineContentBytes, logger) // Uses helper below
+	utf16CharOffset, convErr := bytesToUTF16Offset(lineContentBytes, logger) // Pass logger
 	if convErr != nil {
 		logger.Error("Error converting line bytes to UTF16 offset", "error", convErr, "line", currentLine)
-		// Fallback: Use byte length (less accurate)
-		utf16CharOffset = len(lineContentBytes)
+		utf16CharOffset = len(lineContentBytes) // Fallback
 	}
 
 	return currentLine, uint32(utf16CharOffset), nil
 }
 
 // bytesToUTF16Offset calculates the number of UTF-16 code units for a byte slice.
-// Cycle 2: Consolidated here from lsp_server.go.
 func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -415,7 +398,7 @@ func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
 			return utf16Offset, fmt.Errorf("%w at byte offset %d within slice", ErrInvalidUTF8, byteOffset)
 		}
 		if r > 0xFFFF {
-			utf16Offset += 2 // Surrogate pair
+			utf16Offset += 2
 		} else {
 			utf16Offset += 1
 		}
@@ -429,10 +412,10 @@ func bytesToUTF16Offset(bytes []byte, logger *slog.Logger) (int, error) {
 // ============================================================================
 
 // ValidateAndGetFilePath converts a file:// DocumentURI string to a clean, absolute local path.
-// Returns an error if the URI scheme is not 'file' or parsing/cleaning fails.
-// Cycle 2: Consolidated here from previous location.
-func ValidateAndGetFilePath(uri string) (string, error) {
-	logger := slog.Default() // Use default logger directly
+func ValidateAndGetFilePath(uri string, logger *slog.Logger) (string, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	if uri == "" {
 		logger.Warn("ValidateAndGetFilePath called with empty URI")
@@ -446,22 +429,17 @@ func ValidateAndGetFilePath(uri string) (string, error) {
 		return "", fmt.Errorf("%w: invalid document URI '%s': %w", ErrInvalidURI, uri, err)
 	}
 
-	// Ensure scheme is 'file'
 	if parsedURL.Scheme != "file" {
 		logger.Warn("Received non-file document URI", "uri", uri, "scheme", parsedURL.Scheme)
 		return "", fmt.Errorf("%w: unsupported URI scheme: '%s' (only 'file://' is supported)", ErrInvalidURI, parsedURL.Scheme)
 	}
 
-	// Get path from URL (handles URL decoding)
 	filePath := parsedURL.Path
-
-	// Host should be empty or 'localhost' for local files
 	if parsedURL.Host != "" && strings.ToLower(parsedURL.Host) != "localhost" {
 		logger.Warn("File URI includes unexpected host component", "uri", uri, "host", parsedURL.Host)
 		return "", fmt.Errorf("%w: file URI should not contain host component for local files (host: %s)", ErrInvalidURI, parsedURL.Host)
 	}
 
-	// Ensure absolute and clean path
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		logger.Warn("Failed to get absolute path", "uri_path", filePath, "error", err)
@@ -473,15 +451,12 @@ func ValidateAndGetFilePath(uri string) (string, error) {
 }
 
 // PathToURI converts an absolute file path to a file:// URI.
-// Cycle 2: Consolidated here from lsp_protocol.go.
 func PathToURI(absPath string) (string, error) {
 	if !filepath.IsAbs(absPath) {
 		return "", fmt.Errorf("path must be absolute: %s", absPath)
 	}
-	// Ensure consistent forward slashes for URI
-	absPath = filepath.ToSlash(absPath)
+	absPath = filepath.ToSlash(absPath) // Ensure forward slashes for URI
 
-	// Construct the URL
 	uri := url.URL{
 		Scheme: "file",
 		Path:   absPath,
@@ -494,9 +469,11 @@ func PathToURI(absPath string) (string, error) {
 // ============================================================================
 
 // calculateGoModHash calculates the SHA256 hash of the go.mod file.
-// Cycle 2: Consolidated here from previous location.
-func calculateGoModHash(dir string) string {
-	logger := slog.Default().With("dir", dir)
+func calculateGoModHash(dir string, logger *slog.Logger) string {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger = logger.With("dir", dir)
 
 	goModPath := filepath.Join(dir, "go.mod")
 	f, err := os.Open(goModPath)
@@ -519,14 +496,14 @@ func calculateGoModHash(dir string) string {
 }
 
 // calculateInputHashes calculates hashes for go.mod, go.sum, and Go files.
-// Uses pkg.CompiledGoFiles if available, otherwise scans the directory.
-// Cycle 2: Consolidated here from previous location.
-func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string, error) {
+func calculateInputHashes(dir string, pkg *packages.Package, logger *slog.Logger) (map[string]string, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	hashes := make(map[string]string)
 	filesToHash := make(map[string]struct{})
-	logger := slog.Default().With("dir", dir)
+	logger = logger.With("dir", dir)
 
-	// Always check for go.mod/go.sum relative to the directory.
 	for _, fname := range []string{"go.mod", "go.sum"} {
 		fpath := filepath.Join(dir, fname)
 		if _, err := os.Stat(fpath); err == nil {
@@ -540,10 +517,9 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		}
 	}
 
-	// Use compiled files from package info if available and valid.
 	filesFromPkg := false
 	if pkg != nil && len(pkg.CompiledGoFiles) > 0 {
-		if len(pkg.CompiledGoFiles[0]) > 0 { // Check if first path is non-empty
+		if len(pkg.CompiledGoFiles[0]) > 0 {
 			firstFileAbs, _ := filepath.Abs(pkg.CompiledGoFiles[0])
 			dirAbs, _ := filepath.Abs(dir)
 			if filepath.IsAbs(firstFileAbs) && strings.HasPrefix(firstFileAbs, dirAbs) {
@@ -565,7 +541,6 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		}
 	}
 
-	// Fallback: Scan directory for .go files.
 	if !filesFromPkg {
 		logger.Debug("Calculating input hashes by scanning directory")
 		entries, err := os.ReadDir(dir)
@@ -580,16 +555,15 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 		}
 	}
 
-	// Calculate hash for each unique absolute file path.
 	for absPath := range filesToHash {
 		relPath, err := filepath.Rel(dir, absPath)
 		if err != nil {
 			logger.Warn("Could not get relative path for hashing, using base name", "absPath", absPath, "error", err)
 			relPath = filepath.Base(absPath)
 		}
-		relPath = filepath.ToSlash(relPath) // Ensure forward slashes
+		relPath = filepath.ToSlash(relPath)
 
-		hash, err := hashFileContent(absPath) // Uses helper below
+		hash, err := hashFileContent(absPath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				logger.Warn("File disappeared during hashing, skipping.", "path", absPath)
@@ -604,29 +578,28 @@ func calculateInputHashes(dir string, pkg *packages.Package) (map[string]string,
 }
 
 // hashFileContent calculates the SHA256 hash of a single file.
-// Cycle 2: Consolidated here from previous location.
 func hashFileContent(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return "", err // Propagate error
+		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", err // Propagate hashing error
+		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // compareFileHashes compares current and cached file hashes, logging differences.
-// Cycle 2: Consolidated here from previous location.
-func compareFileHashes(current, cached map[string]string) bool {
-	logger := slog.Default()
+func compareFileHashes(current, cached map[string]string, logger *slog.Logger) bool {
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	if len(current) != len(cached) {
 		logger.Debug("Cache invalid: File count mismatch", "current_count", len(current), "cached_count", len(cached))
 		if logger.Enabled(context.Background(), slog.LevelDebug) {
-			// Find added/removed files for debug logging
 			for relPath := range current {
 				if _, ok := cached[relPath]; !ok {
 					logger.Debug("File added since cache", "file", relPath)
@@ -651,11 +624,10 @@ func compareFileHashes(current, cached map[string]string) bool {
 			return false
 		}
 	}
-	return true // Counts match and all hashes match.
+	return true
 }
 
 // deleteCacheEntryByKey removes an entry directly using the key.
-// Cycle 2: Consolidated here from previous location.
 func deleteCacheEntryByKey(db *bbolt.DB, cacheKey []byte, logger *slog.Logger) error {
 	if db == nil {
 		return errors.New("cannot delete cache entry: db is nil")
@@ -669,7 +641,7 @@ func deleteCacheEntryByKey(db *bbolt.DB, cacheKey []byte, logger *slog.Logger) e
 		b := tx.Bucket(cacheBucketName)
 		if b == nil {
 			logger.Warn("Cache bucket not found during delete attempt.")
-			return nil // Bucket not existing isn't an error
+			return nil
 		}
 		if b.Get(cacheKey) == nil {
 			logger.Debug("Cache key not found during delete attempt, nothing to delete.")
@@ -690,7 +662,6 @@ func deleteCacheEntryByKey(db *bbolt.DB, cacheKey []byte, logger *slog.Logger) e
 // ============================================================================
 
 // retry executes an operation function with backoff and retry logic.
-// Cycle 2: Consolidated here from previous location.
 func retry(ctx context.Context, operation func() error, maxRetries int, initialDelay time.Duration, logger *slog.Logger) error {
 	var lastErr error
 	if logger == nil {
@@ -709,23 +680,18 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 
 		lastErr = operation()
 		if lastErr == nil {
-			return nil // Success
+			return nil
 		}
 
-		// --- Error Classification ---
 		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
 			attemptLogger.Warn("Attempt failed due to context error. Not retrying.", "error", lastErr)
 			return lastErr
 		}
 
-		// Check for specific retryable Ollama errors
-		var ollamaErr *OllamaError // Use type from types.go
+		var ollamaErr *OllamaError
 		isRetryableOllama := errors.As(lastErr, &ollamaErr) &&
 			(ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests || ollamaErr.Status == http.StatusInternalServerError)
-
-		// Check for general network/connection errors
 		isRetryableNetwork := errors.Is(lastErr, ErrOllamaUnavailable) || errors.Is(lastErr, ErrStreamProcessing)
-
 		isRetryable := isRetryableOllama || isRetryableNetwork
 
 		if !isRetryable {
@@ -734,7 +700,7 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 		}
 
 		if i == maxRetries-1 {
-			break // Last attempt failed
+			break
 		}
 
 		waitDuration := currentDelay
@@ -745,7 +711,7 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 			attemptLogger.Warn("Context cancelled during retry wait", "error", ctx.Err())
 			return ctx.Err()
 		case <-time.After(waitDuration):
-			// Optional: currentDelay *= 2 // Exponential backoff
+			// currentDelay *= 2 // Optional: Exponential backoff
 		}
 	}
 	logger.Error("Operation failed after all retries.", "retries", maxRetries, "final_error", lastErr)
@@ -755,9 +721,6 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 // ============================================================================
 // Spinner (CLI Helper)
 // ============================================================================
-// Cycle 2: Kept for potential CLI use.
-
-// Spinner provides simple terminal spinner feedback.
 type Spinner struct {
 	chars    []string
 	message  string
@@ -766,13 +729,20 @@ type Spinner struct {
 	stopChan chan struct{}
 	doneChan chan struct{}
 	running  bool
+	logger   *slog.Logger // Add logger to spinner
 }
 
-func NewSpinner() *Spinner {
-	return &Spinner{chars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}, index: 0}
+func NewSpinner(logger *slog.Logger) *Spinner {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Spinner{
+		chars:  []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
+		index:  0,
+		logger: logger.With("component", "Spinner"), // Add component context
+	}
 }
 
-// Start begins the spinner animation in a separate goroutine.
 func (s *Spinner) Start(initialMessage string) {
 	s.mu.Lock()
 	if s.running {
@@ -794,7 +764,7 @@ func (s *Spinner) Start(initialMessage string) {
 			s.running = false
 			s.mu.Unlock()
 			if isRunning {
-				fmt.Fprintf(os.Stderr, "\r\033[K") // Clear line
+				fmt.Fprintf(os.Stderr, "\r\033[K")
 			}
 			close(s.doneChan)
 		}()
@@ -804,7 +774,7 @@ func (s *Spinner) Start(initialMessage string) {
 				return
 			case <-ticker.C:
 				s.mu.Lock()
-				if !s.running { // Check running flag again
+				if !s.running {
 					s.mu.Unlock()
 					return
 				}
@@ -818,7 +788,6 @@ func (s *Spinner) Start(initialMessage string) {
 	}()
 }
 
-// UpdateMessage changes the text displayed next to the spinner.
 func (s *Spinner) UpdateMessage(newMessage string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -827,7 +796,6 @@ func (s *Spinner) UpdateMessage(newMessage string) {
 	}
 }
 
-// Stop halts the spinner animation and cleans up.
 func (s *Spinner) Stop() {
 	s.mu.Lock()
 	if !s.running {
@@ -835,40 +803,38 @@ func (s *Spinner) Stop() {
 		return
 	}
 	select {
-	case <-s.stopChan: // Already closed
+	case <-s.stopChan:
 	default:
 		close(s.stopChan)
 	}
-	doneChan := s.doneChan // Read doneChan while holding lock
+	doneChan := s.doneChan
 	s.mu.Unlock()
 
 	if doneChan != nil {
 		select {
-		case <-doneChan: // Goroutine finished
+		case <-doneChan:
 		case <-time.After(500 * time.Millisecond):
-			slog.Warn("Timeout waiting for spinner goroutine cleanup")
+			s.logger.Warn("Timeout waiting for spinner goroutine cleanup")
 		}
 	}
-	fmt.Fprintf(os.Stderr, "\r\033[K") // Ensure line is cleared
+	fmt.Fprintf(os.Stderr, "\r\033[K")
 }
 
 // ============================================================================
 // Snippet Extraction Helper
 // ============================================================================
 
-// SnippetContext holds the code prefix and suffix relative to the cursor.
-// Cycle 2: Moved from deepcomplete.go (implicitly via extractSnippetContext)
 type SnippetContext struct {
-	Prefix   string // Code before cursor.
-	Suffix   string // Code after cursor.
-	FullLine string // Full line where cursor is located.
+	Prefix   string
+	Suffix   string
+	FullLine string
 }
 
-// extractSnippetContext extracts code prefix, suffix, and full line around the cursor.
-// Expects filename to be an absolute, validated path. Uses slog.
-// Cycle 2: Consolidated here from previous location.
-func extractSnippetContext(filename string, row, col int) (SnippetContext, error) {
-	logger := slog.Default().With("file", filename, "line", row, "col", col)
+func extractSnippetContext(filename string, row, col int, logger *slog.Logger) (SnippetContext, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger = logger.With("file", filename, "line", row, "col", col)
 	var ctx SnippetContext
 
 	contentBytes, err := os.ReadFile(filename)
@@ -878,12 +844,12 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 	content := string(contentBytes)
 
 	fset := token.NewFileSet()
-	file := fset.AddFile(filename, 1, len(contentBytes)) // Base 1
+	file := fset.AddFile(filename, 1, len(contentBytes))
 	if file == nil {
 		return ctx, fmt.Errorf("failed to add file '%s' to fileset", filename)
 	}
 
-	cursorPos, posErr := calculateCursorPos(file, row, col) // Uses helper below
+	cursorPos, posErr := calculateCursorPos(file, row, col, logger) // Pass logger
 	if posErr != nil {
 		return ctx, fmt.Errorf("cannot determine valid cursor position: %w", posErr)
 	}
@@ -892,7 +858,6 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 	}
 
 	offset := file.Offset(cursorPos)
-	// Clamp offset
 	if offset < 0 {
 		logger.Warn("Calculated negative offset from position, clamping to 0", "pos", cursorPos, "offset", offset)
 		offset = 0
@@ -905,16 +870,14 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 	ctx.Prefix = content[:offset]
 	ctx.Suffix = content[offset:]
 
-	// --- Extract Full Line ---
 	lineStartPos := file.LineStart(row)
 	if !lineStartPos.IsValid() {
 		logger.Warn("Could not get start position for line, cannot extract full line", "line", row)
-		return ctx, nil // Return prefix/suffix anyway
+		return ctx, nil
 	}
 	startOffset := file.Offset(lineStartPos)
 
-	// Find end of line
-	lineEndOffset := file.Size() // Default to EOF
+	lineEndOffset := file.Size()
 	fileLineCount := file.LineCount()
 	if row < fileLineCount {
 		nextLineStartPos := file.LineStart(row + 1)
@@ -925,10 +888,8 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 		}
 	}
 
-	// Ensure offsets are valid before slicing
 	if startOffset >= 0 && lineEndOffset >= startOffset && lineEndOffset <= len(content) {
 		lineContent := content[startOffset:lineEndOffset]
-		// Trim trailing newline characters
 		lineContent = strings.TrimRight(lineContent, "\n")
 		lineContent = strings.TrimRight(lineContent, "\r")
 		ctx.FullLine = lineContent
@@ -942,10 +903,10 @@ func extractSnippetContext(filename string, row, col int) (SnippetContext, error
 }
 
 // calculateCursorPos converts 1-based line/col to 0-based token.Pos offset.
-// Uses slog for logging warnings about clamping.
-// Cycle 2: Consolidated here from previous location.
-func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
-	logger := slog.Default()
+func calculateCursorPos(file *token.File, line, col int, logger *slog.Logger) (token.Pos, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if line <= 0 {
 		return token.NoPos, fmt.Errorf("%w: line number %d must be >= 1", ErrInvalidPositionInput, line)
 	}
@@ -957,30 +918,25 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 	}
 
 	fileLineCount := file.LineCount()
-	// Allow cursor on the line immediately after the last line
 	if line > fileLineCount+1 || (line == fileLineCount+1 && col > 1) {
 		return token.NoPos, fmt.Errorf("%w: line number %d / column %d exceeds file bounds (%d lines)", ErrPositionOutOfRange, line, col, fileLineCount)
 	}
 
-	// Handle cursor on the virtual line after the last line
 	if line == fileLineCount+1 {
 		if col == 1 {
-			return file.Pos(file.Size()), nil // Position at EOF
+			return file.Pos(file.Size()), nil
 		}
 		return token.NoPos, fmt.Errorf("%w: column %d invalid on virtual line %d (only col 1 allowed)", ErrPositionOutOfRange, col, line)
 	}
 
-	// Cursor is within the actual lines of the file
 	lineStartPos := file.LineStart(line)
 	if !lineStartPos.IsValid() {
 		return token.NoPos, fmt.Errorf("%w: cannot get start offset for line %d in file '%s'", ErrPositionConversion, line, file.Name())
 	}
 
-	// Calculate the target offset based on 1-based column
 	lineStartOffset := file.Offset(lineStartPos)
 	targetOffset := lineStartOffset + col - 1
 
-	// Find the end offset of the current line
 	lineEndOffset := file.Size()
 	if line < fileLineCount {
 		nextLineStartPos := file.LineStart(line + 1)
@@ -989,7 +945,6 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 		}
 	}
 
-	// Clamp the target offset to the valid range [lineStartOffset, lineEndOffset]
 	finalOffset := targetOffset
 	clamped := false
 	if targetOffset < lineStartOffset {
@@ -1003,7 +958,6 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 		logger.Warn("Column resulted in offset beyond line end. Clamping.", "line", line, "col", col, "targetOffset", targetOffset, "lineEndOffset", lineEndOffset)
 	}
 
-	// Convert final offset to token.Pos
 	pos := file.Pos(finalOffset)
 	if !pos.IsValid() {
 		logger.Error("Clamped offset resulted in invalid token.Pos. Falling back to line start.", "offset", finalOffset, "line_start_pos", lineStartPos)
@@ -1017,13 +971,13 @@ func calculateCursorPos(file *token.File, line, col int) (token.Pos, error) {
 // ============================================================================
 
 // streamCompletion reads the Ollama stream response and writes it to w.
-// Uses slog for logging.
-// Cycle 2: Consolidated here from previous location.
-func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
+func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer, logger *slog.Logger) error {
 	defer r.Close()
 	reader := bufio.NewReader(r)
 	lineCount := 0
-	logger := slog.Default()
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	for {
 		select {
@@ -1035,21 +989,18 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 
 		line, err := reader.ReadBytes('\n')
 
-		// Process line content before checking EOF
 		if len(line) > 0 {
-			if procErr := processLine(line, w, logger); procErr != nil { // Uses helper below
+			if procErr := processLine(line, w, logger); procErr != nil { // Pass logger
 				return procErr
 			}
 			lineCount++
 		}
 
-		// Check for errors after processing
 		if err != nil {
 			if err == io.EOF {
 				logger.Debug("Stream processing finished (EOF)", "lines_processed", lineCount)
-				return nil // Clean EOF
+				return nil
 			}
-			// Check context cancellation again after read error
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -1061,35 +1012,31 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer) error {
 }
 
 // processLine decodes a single line from the Ollama stream and writes the content.
-// Uses slog for logging.
-// Cycle 2: Consolidated here from previous location.
 func processLine(line []byte, w io.Writer, logger *slog.Logger) error {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
-		return nil // Ignore empty lines
+		return nil
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	var resp OllamaResponse // Use type from types.go
+	var resp OllamaResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		logger.Debug("Ignoring non-JSON line from Ollama stream", "line", string(line))
-		return nil // Don't treat as fatal
+		return nil
 	}
 
-	// Check for errors reported within the JSON payload
 	if resp.Error != "" {
 		logger.Error("Ollama stream reported an error", "error", resp.Error)
 		return fmt.Errorf("ollama stream error: %s", resp.Error)
 	}
 
-	// Write the actual response chunk
 	if _, err := fmt.Fprint(w, resp.Response); err != nil {
 		logger.Error("Error writing stream chunk to output", "error", err)
 		return fmt.Errorf("error writing to output: %w", err)
 	}
-	return nil // Success
+	return nil
 }
 
 // ============================================================================
@@ -1097,23 +1044,21 @@ func processLine(line []byte, w io.Writer, logger *slog.Logger) error {
 // ============================================================================
 
 // firstN truncates a string to the first N runes and adds "...".
-// Cycle 2: Consolidated here from lsp_server.go.
 func firstN(s string, n int) string {
 	if n < 0 {
 		n = 0
 	}
 	count := 0
-	for i := range s { // Iterates over runes
+	for i := range s {
 		if count == n {
-			return s[:i] + "..." // Add ellipsis if truncated
+			return s[:i] + "..."
 		}
 		count++
 	}
-	return s // Return original string if length <= n
+	return s
 }
 
 // getPosString safely gets a position string or returns a placeholder.
-// Cycle 2: Added as consolidation target from helpers_diagnostics.go.
 func getPosString(fset *token.FileSet, pos token.Pos) string {
 	if fset != nil && pos.IsValid() {
 		return fset.Position(pos).String()

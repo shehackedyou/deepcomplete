@@ -1,6 +1,5 @@
 // deepcomplete/helpers_loader.go
 // Contains helper functions specifically for loading packages using go/packages.
-// Cycle 3: Added context propagation, explicit logger passing, refined error handling.
 package deepcomplete
 
 import (
@@ -33,15 +32,14 @@ func loadPackageAndFile(
 	}
 	logger = logger.With("loadDir", dir)
 
-	// Configuration for loading packages.
 	loadCfg := &packages.Config{
-		Context: ctx, // Use passed context
+		Context: ctx,
 		Dir:     dir,
 		Fset:    fset,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
 			packages.NeedSyntax | packages.NeedTypesInfo,
-		Tests: false, // Don't load test files initially
+		Tests: false,
 		// Pass logger to packages.Load for its internal logging
 		Logf: func(format string, args ...interface{}) { logger.Debug(fmt.Sprintf(format, args...)) },
 	}
@@ -49,16 +47,10 @@ func loadPackageAndFile(
 	logger.Debug("Calling packages.Load")
 	pkgs, err := packages.Load(loadCfg, fmt.Sprintf("file=%s", absFilename))
 	if err != nil {
-		// Critical error during packages.Load itself
 		loadErr := fmt.Errorf("packages.Load failed critically: %w", err)
 		loadErrors = append(loadErrors, loadErr)
 		logger.Error("packages.Load failed critically", "error", err)
-		// Check for context cancellation specifically
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			// Don't add a generic diagnostic if it was a context error
-		} else {
-			// Add a general diagnostic for critical load failure
-			// Use a placeholder range at the start of the file
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			diag := Diagnostic{
 				Range:    Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 1}},
 				Severity: SeverityError,
@@ -67,18 +59,16 @@ func loadPackageAndFile(
 			}
 			diagnostics = append(diagnostics, diag)
 		}
-		return nil, nil, nil, diagnostics, loadErrors // Return collected diagnostics even on critical failure
+		return nil, nil, nil, diagnostics, loadErrors
 	}
 
 	if len(pkgs) == 0 {
-		// packages.Load succeeded but returned no packages
 		loadErr := errors.New("packages.Load returned no packages")
 		loadErrors = append(loadErrors, loadErr)
 		logger.Warn(loadErr.Error())
-		// Add a diagnostic indicating no package was found
 		diag := Diagnostic{
 			Range:    Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 1}},
-			Severity: SeverityWarning, // Warning, as it might not be a fatal error for all operations
+			Severity: SeverityWarning,
 			Source:   "deepcomplete-loader",
 			Message:  fmt.Sprintf("Could not load package information for file: %s", absFilename),
 		}
@@ -90,24 +80,22 @@ func loadPackageAndFile(
 	var targetFileAST *ast.File
 	var targetFile *token.File
 
-	// Collect all package-level errors first and convert to diagnostics
 	for _, p := range pkgs {
 		if p == nil {
 			continue
-		} // Defensive check
+		}
 		for i := range p.Errors {
-			pkgErr := p.Errors[i] // Make a copy
+			pkgErr := p.Errors[i]
 			loadErrors = append(loadErrors, &pkgErr)
 			logger.Warn("Package loading error encountered", "package", p.PkgPath, "error", pkgErr.Error())
-			// Convert packages.Error to our internal Diagnostic format
-			diag := packagesErrorToDiagnostic(pkgErr, fset, logger) // Assumes helpers_diagnostics.go exists
+			// Pass logger to packagesErrorToDiagnostic
+			diag := packagesErrorToDiagnostic(pkgErr, fset, logger)
 			if diag != nil {
 				diagnostics = append(diagnostics, *diag)
 			}
 		}
 	}
 
-	// Find the specific package and AST file corresponding to absFilename
 	for _, p := range pkgs {
 		if p == nil {
 			continue
@@ -118,25 +106,21 @@ func loadPackageAndFile(
 				logger.Warn("Nil AST file encountered in package syntax", "package", p.PkgPath, "index", i)
 				continue
 			}
-			// Get the position of the AST file's start
 			filePos := fset.Position(astFile.Pos())
 			if !filePos.IsValid() {
 				logger.Warn("AST file has invalid position", "package", p.PkgPath, "index", i)
 				continue
 			}
-			// Compare absolute paths for robustness
 			astFilePath, _ := filepath.Abs(filePos.Filename)
 			logger.Debug("Comparing file paths", "ast_file_path", astFilePath, "target_file_path", absFilename)
 			if astFilePath == absFilename {
 				targetPkg = p
 				targetFileAST = astFile
-				// Get the token.File using the valid position from the FileSet
 				targetFile = fset.File(astFile.Pos())
 				if targetFile == nil {
 					fileNotFoundErr := fmt.Errorf("failed to get token.File for AST file %s from FileSet", absFilename)
 					loadErrors = append(loadErrors, fileNotFoundErr)
 					logger.Error("Could not get token.File from FileSet even with valid AST position", "filename", absFilename)
-					// Add diagnostic for this internal error
 					diag := Diagnostic{
 						Range:    Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 1}},
 						Severity: SeverityError,
@@ -146,18 +130,16 @@ func loadPackageAndFile(
 					diagnostics = append(diagnostics, diag)
 				}
 				logger.Debug("Found target file in package", "package", p.PkgPath)
-				goto foundTarget // Exit loops once target is found
+				goto foundTarget
 			}
 		}
 	}
 
 foundTarget:
-	// Handle case where the specific file wasn't found in the loaded packages' syntax trees
 	if targetPkg == nil {
 		err := fmt.Errorf("target file %s not found in loaded packages syntax trees", absFilename)
 		loadErrors = append(loadErrors, err)
 		logger.Warn(err.Error())
-		// Add a diagnostic if the target file AST couldn't be found
 		diag := Diagnostic{
 			Range:    Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 1}},
 			Severity: SeverityError,
@@ -165,20 +147,16 @@ foundTarget:
 			Message:  fmt.Sprintf("Internal error: Could not locate AST for file '%s' in loaded packages.", absFilename),
 		}
 		diagnostics = append(diagnostics, diag)
-		// Attempt to return any diagnostics found even if the target wasn't located
 		return nil, nil, nil, diagnostics, loadErrors
 	}
 
-	// Final checks on the found package (if any)
-	// Check if critical type information is missing, which indicates deeper issues
 	if targetPkg.TypesInfo == nil {
 		err := fmt.Errorf("type info (TypesInfo) is nil for target package %s", targetPkg.PkgPath)
 		loadErrors = append(loadErrors, err)
 		logger.Warn(err.Error())
-		// Add diagnostic for missing type info
 		diag := Diagnostic{
 			Range:    Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 1}},
-			Severity: SeverityWarning, // Warning, as some functionality might still work
+			Severity: SeverityWarning,
 			Source:   "deepcomplete-loader",
 			Message:  fmt.Sprintf("Type checking information unavailable for package '%s'. Analysis may be incomplete.", targetPkg.PkgPath),
 		}
@@ -188,7 +166,6 @@ foundTarget:
 		err := fmt.Errorf("types (Types) is nil for target package %s", targetPkg.PkgPath)
 		loadErrors = append(loadErrors, err)
 		logger.Warn(err.Error())
-		// Add diagnostic for missing types scope
 		diag := Diagnostic{
 			Range:    Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 1}},
 			Severity: SeverityWarning,

@@ -116,14 +116,11 @@ func getDefaultConfig() Config {
 
 // Validate checks if configuration values are valid, applying defaults for some fields.
 // It uses the provided logger to report warnings about applied defaults.
-// Cycle 1: Moved from deepcomplete.go
-// Cycle 2: Modified to ensure logger is used correctly, simplify default application
 func (c *Config) Validate(logger *stdslog.Logger) error {
 	var validationErrors []error
 	if logger == nil {
 		logger = stdslog.Default() // Use default if nil
 	}
-	// Use a temporary config with defaults for comparison/application
 	tempDefault := getDefaultConfig()
 
 	if strings.TrimSpace(c.OllamaURL) == "" {
@@ -159,20 +156,19 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		logger.Warn("Config validation: log_level is empty, applying default.", "default", defaultLogLevel)
 		c.LogLevel = defaultLogLevel
 	} else {
-		_, err := ParseLogLevel(c.LogLevel) // Use helper to validate
+		// Pass logger to ParseLogLevel (although it doesn't use it currently)
+		_, err := ParseLogLevel(c.LogLevel)
 		if err != nil {
 			logger.Warn("Config validation: Invalid log_level found, applying default.", "configured_value", c.LogLevel, "default", defaultLogLevel, "error", err)
 			c.LogLevel = defaultLogLevel
 		}
 	}
-	// Stop sequences: Ensure it's not nil, but allow empty slice.
 	if c.Stop == nil {
 		logger.Warn("Config validation: stop sequences list is nil, applying default.", "default", tempDefault.Stop)
 		c.Stop = make([]string, len(tempDefault.Stop))
 		copy(c.Stop, tempDefault.Stop)
 	}
 
-	// Ensure internal templates are always set (they aren't loaded from file)
 	if c.PromptTemplate == "" {
 		c.PromptTemplate = promptTemplate
 	}
@@ -181,7 +177,6 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 	}
 
 	if len(validationErrors) > 0 {
-		// Wrap individual errors for better context
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, errors.Join(validationErrors...))
 	}
 	return nil
@@ -191,8 +186,6 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 // Analysis & Context Types
 // =============================================================================
 
-// Diagnostic Structures (Internal representation used by analysis)
-// Cycle 1: Moved from deepcomplete.go
 type DiagnosticSeverity int
 
 const (
@@ -202,22 +195,16 @@ const (
 	SeverityHint    DiagnosticSeverity = 4
 )
 
-// Position represents a 0-based line and byte offset within that line.
-// Cycle 1: Moved from deepcomplete.go
 type Position struct {
 	Line      int // 0-based
 	Character int // 0-based, byte offset within the line
 }
 
-// Range represents a span in the source code using internal Positions.
-// Cycle 1: Moved from deepcomplete.go
 type Range struct {
 	Start Position
 	End   Position
 }
 
-// Diagnostic represents an issue found during analysis.
-// Cycle 1: Moved from deepcomplete.go
 type Diagnostic struct {
 	Range    Range
 	Severity DiagnosticSeverity
@@ -227,8 +214,6 @@ type Diagnostic struct {
 }
 
 // AstContextInfo holds structured information extracted from code analysis.
-// This structure is populated by the Analyzer and used by the PreambleFormatter and LSP handlers.
-// Cycle 1: Moved from deepcomplete.go
 type AstContextInfo struct {
 	FilePath           string                  // Absolute path to the analyzed file.
 	Version            int                     // Document version (for LSP).
@@ -265,15 +250,11 @@ type AstContextInfo struct {
 // Ollama & Cache Types
 // =============================================================================
 
-// OllamaError defines a custom error for Ollama API issues, including HTTP status.
-// Cycle 1: Moved from deepcomplete.go
 type OllamaError struct {
 	Message string
 	Status  int // HTTP status code, if available
 }
 
-// Error implements the error interface for OllamaError.
-// Cycle 1: Moved from deepcomplete.go
 func (e *OllamaError) Error() string {
 	if e.Status != 0 {
 		return fmt.Sprintf("Ollama error: %s (Status: %d)", e.Message, e.Status)
@@ -281,26 +262,17 @@ func (e *OllamaError) Error() string {
 	return fmt.Sprintf("Ollama error: %s", e.Message)
 }
 
-// OllamaResponse represents the streaming response structure from Ollama's /api/generate.
-// Cycle 1: Moved from deepcomplete.go
 type OllamaResponse struct {
 	Response string `json:"response"`        // The generated text chunk.
 	Done     bool   `json:"done"`            // Indicates if the stream is complete.
 	Error    string `json:"error,omitempty"` // Error message from Ollama, if any.
 }
 
-// CachedAnalysisData holds derived information stored in the bbolt cache (gob-encoded).
-// This contains data that is expensive to compute but can be reused if inputs haven't changed.
-// Cycle 1: Moved from deepcomplete.go
 type CachedAnalysisData struct {
 	PackageName    string // Cached package name.
 	PromptPreamble string // Cached generated preamble.
-	// Add other derived data here if needed (e.g., serialized scope info)
 }
 
-// CachedAnalysisEntry represents the full structure stored in bbolt.
-// It includes metadata to validate the cache entry against current file states.
-// Cycle 1: Moved from deepcomplete.go
 type CachedAnalysisEntry struct {
 	SchemaVersion   int               // Version of the cache structure itself.
 	GoModHash       string            // Hash of the go.mod file when cached.
@@ -312,8 +284,6 @@ type CachedAnalysisEntry struct {
 // Type Member Analysis Types
 // =============================================================================
 
-// MemberKind defines the type of member (field or method) for type analysis.
-// Cycle 1: Moved from deepcomplete.go
 type MemberKind string
 
 const (
@@ -322,8 +292,6 @@ const (
 	OtherMember  MemberKind = "other" // Fallback
 )
 
-// MemberInfo holds structured information about a type member (field or method).
-// Cycle 1: Moved from deepcomplete.go
 type MemberInfo struct {
 	Name       string
 	Kind       MemberKind

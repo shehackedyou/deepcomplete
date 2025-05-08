@@ -26,11 +26,9 @@ func main() {
 	flag.Parse()
 
 	// --- Setup Temporary Logger for Initialization ---
-	// Use a basic stderr logger initially until the final level is determined.
-	tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})) // Default to Info for init
+	tempLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	// --- Initialize Completer (Loads Config) ---
-	// NewDeepCompleter now returns a non-fatal ErrConfig if loading had issues.
 	completer, initErr := deepcomplete.NewDeepCompleter(tempLogger) // Pass temp logger
 	if initErr != nil && !errors.Is(initErr, deepcomplete.ErrConfig) {
 		tempLogger.Error("Fatal error initializing DeepCompleter service", "error", initErr)
@@ -41,7 +39,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
-		slog.Info("Closing DeepCompleter service...") // Use final logger
+		slog.Info("Closing DeepCompleter service...") // Use final logger (set below)
 		if err := completer.Close(); err != nil {
 			slog.Error("Error closing completer", "error", err)
 		}
@@ -56,19 +54,16 @@ func main() {
 		tempLogger.Debug("Log level overridden by command-line flag", "flag_level", chosenLogLevelStr)
 	}
 
-	// Parse the chosen level string using the utility function
 	logLevel, parseLevelErr := deepcomplete.ParseLogLevel(chosenLogLevelStr) // Util func
 	if parseLevelErr != nil {
 		tempLogger.Warn("Invalid log level specified, using default 'info'", "specified_level", chosenLogLevelStr, "error", parseLevelErr)
 		logLevel = slog.LevelInfo // Default to Info
 	}
 
-	// Initialize the default slog logger
-	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false} // Source less useful for CLI
+	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false}
 	finalLogger := slog.New(slog.NewTextHandler(os.Stderr, &handlerOpts))
 	slog.SetDefault(finalLogger) // Set as default
 
-	// Log initialization confirmation *after* setting the final logger
 	slog.Info("DeepComplete service initialized.", "effective_log_level", logLevel.String())
 	if initErr != nil && errors.Is(initErr, deepcomplete.ErrConfig) {
 		slog.Warn("DeepCompleter initialized with configuration warnings", "error", initErr)
@@ -97,13 +92,12 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		// Validate file path using utility function
-		absPath, pathErr := deepcomplete.ValidateAndGetFilePath(*filePath) // Util func
+		// Validate file path using utility function, pass the final logger
+		absPath, pathErr := deepcomplete.ValidateAndGetFilePath(*filePath, finalLogger) // Util func
 		if pathErr != nil {
 			slog.Error("Invalid file path provided via -file flag", "path", *filePath, "error", pathErr)
 			os.Exit(1)
 		}
-		// Check if file exists
 		if _, statErr := os.Stat(absPath); statErr != nil {
 			slog.Error("Cannot access file provided via -file flag", "path", absPath, "error", statErr)
 			os.Exit(1)
@@ -112,7 +106,7 @@ func main() {
 	}
 
 	// --- Execute Command ---
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // Longer timeout for CLI
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	if *stdin {
@@ -125,7 +119,7 @@ func main() {
 		snippet := string(snippetBytes)
 		slog.Debug("Read snippet", "length", len(snippet))
 
-		// Use basic completion (no file context/analysis)
+		// GetCompletion uses the logger configured in the completer
 		completion, completionErr := completer.GetCompletion(ctx, snippet)
 		if completionErr != nil {
 			slog.Error("Failed to get completion from stdin", "error", completionErr)
@@ -136,11 +130,10 @@ func main() {
 	} else {
 		slog.Info("Getting completion from file", "path", *filePath, "line", *line, "col", *col)
 
-		// Use streaming completion, write result directly to stdout
 		dummyVersion := 0 // CLI doesn't track versions
+		// GetCompletionStreamFromFile uses the logger configured in the completer
 		completionErr := completer.GetCompletionStreamFromFile(ctx, *filePath, dummyVersion, *line, *col, os.Stdout)
 		if completionErr != nil {
-			// Check for specific, potentially user-actionable errors
 			if errors.Is(completionErr, context.DeadlineExceeded) {
 				slog.Error("Completion request timed out", "file", *filePath, "line", *line, "col", *col)
 			} else if errors.Is(completionErr, context.Canceled) {
