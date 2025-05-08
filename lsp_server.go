@@ -56,7 +56,7 @@ func NewServer(completer *DeepCompleter, logger *slog.Logger, version string) *S
 			Name:    "DeepComplete LSP",
 			Version: version,
 		},
-		requestTracker: NewRequestTracker(logger),
+		requestTracker: NewRequestTracker(logger), // Initialize tracker with the server's logger
 	}
 	publishExpvarMetrics(s) // Publish metrics on startup
 	return s
@@ -122,9 +122,12 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 
 	// Request Cancellation Handling
 	if isRequest {
+		// Add request to tracker *before* potentially blocking/long operations
 		s.requestTracker.Add(req.ID, ctx)
+		// Ensure removal happens even if the handler panics (hence the defer)
 		defer s.requestTracker.Remove(req.ID)
 
+		// Check for cancellation *before* starting work
 		select {
 		case <-ctx.Done():
 			methodLogger.Warn("Request context cancelled before processing started", "error", ctx.Err())
@@ -213,7 +216,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		}
 		return s.handleDefinition(ctx, conn, req, params, methodLogger)
 
-	case "textDocument/codeAction": // Added routing for CodeAction (Cycle N+2)
+	case "textDocument/codeAction": // Added routing for CodeAction
 		var params CodeActionParams
 		if err := unmarshalParams(&params); err != nil {
 			methodLogger.Error("Failed to unmarshal codeAction params", "error", err)
@@ -246,7 +249,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			return nil, nil
 		}
 
-		s.requestTracker.Cancel(cancelID)
+		s.requestTracker.Cancel(cancelID) // Use tracker to cancel
 		methodLogger.Info("Cancellation request processed", "cancelled_id", cancelID)
 		return nil, nil
 
@@ -317,8 +320,13 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 	s.filesMu.RLock()
 	currentFile, exists := s.files[uri]
 	s.filesMu.RUnlock()
-	if !exists || currentFile.Version != version {
-		diagLogger.Warn("Skipping diagnostic publishing; file version changed or file closed during analysis", "analysis_version", version, "current_version", currentFile.Version, "exists", exists)
+	// Only publish if the file still exists in our map AND the version matches the one we analyzed
+	if !exists {
+		diagLogger.Warn("Skipping diagnostic publishing; file closed during analysis", "analysis_version", version)
+		return
+	}
+	if currentFile.Version != version {
+		diagLogger.Warn("Skipping diagnostic publishing; file version changed during analysis", "analysis_version", version, "current_version", currentFile.Version)
 		return
 	}
 	// --- End Version Check ---
@@ -352,6 +360,7 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 		diagLogger.Warn("Analysis for diagnostics completed with non-fatal errors", "error", analysisErr)
 	}
 
+	// Publish diagnostics for the correct version
 	s.publishDiagnostics(uri, &version, lspDiagnostics, diagLogger)
 }
 

@@ -174,6 +174,8 @@ func LoadAndMergeConfig(path string, cfg *Config, logger *slog.Logger) (loaded b
 	// Merge MemoryCacheTTLSeconds if present
 	if fileCfg.MemoryCacheTTLSeconds != nil {
 		cfg.MemoryCacheTTLSeconds = *fileCfg.MemoryCacheTTLSeconds
+		// Update the derived duration field as well
+		cfg.MemoryCacheTTL = time.Duration(cfg.MemoryCacheTTLSeconds) * time.Second
 		mergedFields++
 	}
 
@@ -193,11 +195,15 @@ func WriteDefaultConfig(path string, defaultConfig Config, logger *slog.Logger) 
 	}
 
 	// Use FileConfig structure for writing to ensure only configurable fields are included
+	// Ensure pointers are correctly assigned
+	stopCopy := make([]string, len(defaultConfig.Stop))
+	copy(stopCopy, defaultConfig.Stop)
+
 	expCfg := FileConfig{
 		OllamaURL:             &defaultConfig.OllamaURL,
 		Model:                 &defaultConfig.Model,
 		MaxTokens:             &defaultConfig.MaxTokens,
-		Stop:                  &defaultConfig.Stop, // Note: Stop is a slice, assign pointer to the slice
+		Stop:                  &stopCopy, // Assign pointer to the copy
 		Temperature:           &defaultConfig.Temperature,
 		LogLevel:              &defaultConfig.LogLevel,
 		UseAst:                &defaultConfig.UseAst,
@@ -1163,13 +1169,10 @@ func findEnclosingFuncBody(content []byte, offset int) (string, bool) {
 foundEnd:
 
 	if funcBodyEndOffset != -1 && funcBodyEndOffset >= funcBodyStartOffset {
-		// Ensure the cursor offset is actually within this found function body
-		// We check >= funcBodyStartOffset because the cursor could be right after '{'
-		// We check <= funcBodyEndOffset because the cursor could be right before '}'
 		if offset >= funcBodyStartOffset && offset <= funcBodyEndOffset {
 			return string(content[funcBodyStartOffset:funcBodyEndOffset]), true
 		}
 	}
 
-	return "", false // Matching brace not found or cursor not inside
+	return "", false
 }

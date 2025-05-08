@@ -209,11 +209,12 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	if currentConfig.UseAst {
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second)
 		defer cancelAnalysis()
+		// Use GetIdentifierInfo for potentially faster kind determination
 		identInfo, kindAnalysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
 		if kindAnalysisErr != nil {
 			completionLogger.Warn("Analysis for completion kind failed, using default kind", "error", kindAnalysisErr)
-		} else if identInfo != nil && identInfo.Object != nil {
-			completionKind = mapTypeToCompletionKind(identInfo.Object)
+		} else if identInfo != nil && identInfo.Object != nil { // Check if identifier was found
+			completionKind = mapTypeToCompletionKind(identInfo.Object) // Use refined mapping
 			completionLogger.Debug("Determined completion kind from analysis", "kind", completionKind, "identifier", identInfo.Name)
 		} else {
 			completionLogger.Debug("No specific identifier found at cursor for kind mapping, using default.")

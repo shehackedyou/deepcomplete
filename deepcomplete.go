@@ -47,6 +47,8 @@ var (
 type LLMClient interface {
 	// GenerateStream sends a prompt to the LLM and returns a stream of generated text.
 	GenerateStream(ctx context.Context, prompt string, config Config, logger *stdslog.Logger) (io.ReadCloser, error)
+	// CheckAvailability checks if the LLM backend is reachable.
+	CheckAvailability(ctx context.Context, config Config, logger *stdslog.Logger) error
 }
 
 // Analyzer defines the interface for code analysis.
@@ -206,11 +208,57 @@ func newHttpOllamaClient() *httpOllamaClient {
 	}
 }
 
+// CheckAvailability sends a simple request to the Ollama base URL to check reachability.
+func (c *httpOllamaClient) CheckAvailability(ctx context.Context, config Config, logger *stdslog.Logger) error {
+	if logger == nil {
+		logger = stdslog.Default()
+	}
+	checkLogger := logger.With("operation", "CheckAvailability", "url", config.OllamaURL)
+	checkLogger.Debug("Checking Ollama availability")
+
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second) // Short timeout for check
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, config.OllamaURL, nil)
+	if err != nil {
+		checkLogger.Error("Failed to create availability check request", "error", err)
+		return fmt.Errorf("%w: failed to create check request: %w", ErrOllamaUnavailable, err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			checkLogger.Error("Timeout checking Ollama availability", "error", err)
+		} else {
+			checkLogger.Error("Failed to connect to Ollama for availability check", "error", err)
+		}
+		return fmt.Errorf("%w: availability check failed: %w", ErrOllamaUnavailable, err)
+	}
+	defer resp.Body.Close()
+
+	// We don't strictly need a 200 OK, just that we could connect.
+	// Any status code means the server is reachable at the HTTP level.
+	checkLogger.Debug("Ollama availability check successful", "status", resp.StatusCode)
+	return nil
+}
+
 // GenerateStream sends a request to Ollama's /api/generate endpoint and returns the streaming response body.
 func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, config Config, logger *stdslog.Logger) (io.ReadCloser, error) {
 	if logger == nil {
 		logger = stdslog.Default()
 	}
+	opLogger := logger.With("operation", "GenerateStream", "model", config.Model)
+
+	// Optional: Perform a quick availability check before the main request
+	// availabilityCtx, cancelAvail := context.WithTimeout(ctx, 5*time.Second)
+	// if err := c.CheckAvailability(availabilityCtx, config, opLogger); err != nil {
+	//  cancelAvail()
+	// 	return nil, err // Return the wrapped ErrOllamaUnavailable
+	// }
+	// cancelAvail()
+	// Note: Skipping explicit pre-check for now to avoid extra request latency.
+	// The main request's error handling should cover unavailability.
+
 	base := strings.TrimSuffix(config.OllamaURL, "/")
 	endpointURL := base + "/api/generate"
 	u, err := url.Parse(endpointURL)
@@ -242,31 +290,31 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/x-ndjson")
 
-	logger.Debug("Sending request to Ollama", "url", endpointURL, "model", config.Model)
+	opLogger.Debug("Sending generate request to Ollama", "url", endpointURL)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			logger.Warn("Ollama request context cancelled", "url", endpointURL)
+			opLogger.Warn("Ollama generate request context cancelled", "url", endpointURL)
 			return nil, context.Canceled
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			logger.Error("Ollama request context deadline exceeded", "url", endpointURL, "timeout", c.httpClient.Timeout)
+			opLogger.Error("Ollama generate request context deadline exceeded", "url", endpointURL, "timeout", c.httpClient.Timeout)
 			return nil, fmt.Errorf("%w: context deadline exceeded: %w", ErrOllamaUnavailable, context.DeadlineExceeded)
 		}
 
 		var netErr net.Error
 		if errors.As(err, &netErr) {
 			if netErr.Timeout() {
-				logger.Error("Network timeout connecting to Ollama", "host", u.Host, "error", netErr)
+				opLogger.Error("Network timeout during Ollama generate request", "host", u.Host, "error", netErr)
 				return nil, fmt.Errorf("%w: network timeout: %w", ErrOllamaUnavailable, netErr)
 			}
 			if opErr, ok := netErr.(*net.OpError); ok && opErr.Op == "dial" {
-				logger.Error("Connection refused or network error connecting to Ollama", "host", u.Host, "error", opErr)
+				opLogger.Error("Connection refused or network error during Ollama generate request", "host", u.Host, "error", opErr)
 				return nil, fmt.Errorf("%w: connection failed: %w", ErrOllamaUnavailable, opErr)
 			}
 		}
 
-		logger.Error("HTTP request to Ollama failed", "url", endpointURL, "error", err)
+		opLogger.Error("HTTP request to Ollama generate failed", "url", endpointURL, "error", err)
 		return nil, fmt.Errorf("%w: http request failed: %w", ErrOllamaUnavailable, err)
 	}
 
@@ -284,7 +332,7 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 			}
 		}
 		apiErr := &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
-		logger.Error("Ollama API returned non-OK status", "status", resp.Status, "response_body", bodyString)
+		opLogger.Error("Ollama API returned non-OK status", "status", resp.Status, "response_body", bodyString)
 		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, apiErr)
 	}
 
@@ -711,7 +759,7 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	}
 
 	opLogger.Info("Identifier info retrieved successfully", "identifier", identInfo.Name)
-	return identInfo, nil // Return found info, ignore non-fatal analysis errors
+	return identInfo, nil
 }
 
 // GetMemoryCache implements the Analyzer interface method.
@@ -720,9 +768,16 @@ func (a *GoPackagesAnalyzer) GetMemoryCache(key string) (any, bool) {
 	cache := a.memoryCache
 	a.mu.Unlock()
 	if cache == nil {
+		a.logger.Debug("GetMemoryCache skipped: Cache is nil.", "key", key)
 		return nil, false
 	}
-	return cache.Get(key)
+	val, found := cache.Get(key)
+	if found {
+		a.logger.Debug("GetMemoryCache hit.", "key", key)
+	} else {
+		a.logger.Debug("GetMemoryCache miss.", "key", key)
+	}
+	return val, found
 }
 
 // SetMemoryCache implements the Analyzer interface method.
@@ -731,9 +786,16 @@ func (a *GoPackagesAnalyzer) SetMemoryCache(key string, value any, cost int64, t
 	cache := a.memoryCache
 	a.mu.Unlock()
 	if cache == nil {
+		a.logger.Debug("SetMemoryCache skipped: Cache is nil.", "key", key)
 		return false
 	}
-	return cache.SetWithTTL(key, value, cost, ttl)
+	set := cache.SetWithTTL(key, value, cost, ttl)
+	if set {
+		a.logger.Debug("SetMemoryCache success.", "key", key, "cost", cost, "ttl", ttl)
+	} else {
+		a.logger.Warn("SetMemoryCache failed.", "key", key, "cost", cost, "ttl", ttl)
+	}
+	return set
 }
 
 // InvalidateCache removes the bbolt cached entry for a given directory.
@@ -1008,6 +1070,7 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 			stdslog.Bool("use_fim", newConfig.UseFim),
 			stdslog.Int("max_preamble_len", newConfig.MaxPreambleLen),
 			stdslog.Int("max_snippet_len", newConfig.MaxSnippetLen),
+			stdslog.Int("memory_cache_ttl_seconds", newConfig.MemoryCacheTTLSeconds), // Log TTL
 		),
 	)
 	return nil

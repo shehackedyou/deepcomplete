@@ -56,7 +56,7 @@ func withMemoryCache[T any](
 	// --- Cache Interaction via Analyzer Interface ---
 
 	// 1. Check cache using the interface method
-	cachedResult, found := analyzer.GetMemoryCache(cacheKey)
+	cachedResult, found := analyzer.GetMemoryCache(cacheKey) // Use interface method
 	if found {
 		// Attempt type assertion on the cached result
 		if typedResult, ok := cachedResult.(T); ok {
@@ -82,7 +82,7 @@ func withMemoryCache[T any](
 	if cost <= 0 {
 		cost = 1 // Ristretto cost must be positive
 	}
-	setOk := analyzer.SetMemoryCache(cacheKey, computedResult, cost, ttl)
+	setOk := analyzer.SetMemoryCache(cacheKey, computedResult, cost, ttl) // Use interface method
 	if !setOk {
 		// Set can fail if the item is too large or other constraints aren't met
 		cacheLogger.Warn("Memory cache Set failed, item not cached", "cost", cost, "ttl", ttl)
