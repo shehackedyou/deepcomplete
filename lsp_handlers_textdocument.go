@@ -127,6 +127,18 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	uri := params.TextDocument.URI
 	lspPos := params.Position
 	completionLogger := logger.With("uri", uri, "lsp_line", lspPos.Line, "lsp_char", lspPos.Character, "req_id", req.ID)
+
+	// Log trigger kind if available
+	triggerKind := CompletionTriggerKindInvoked // Default
+	triggerChar := ""
+	if params.Context != nil {
+		triggerKind = params.Context.TriggerKind
+		triggerChar = params.Context.TriggerCharacter
+		completionLogger = completionLogger.With("trigger_kind", triggerKind)
+		if triggerChar != "" {
+			completionLogger = completionLogger.With("trigger_char", triggerChar)
+		}
+	}
 	completionLogger.Info("Handling textDocument/completion")
 
 	s.filesMu.RLock()
@@ -178,7 +190,6 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		}
 		if errors.Is(completionErr, ErrAnalysisFailed) {
 			completionLogger.Warn("Code analysis failed during completion, proceeding without specific kind", "error", completionErr)
-			// Proceed without specific kind, but log the analysis failure
 		} else {
 			completionLogger.Error("Failed to get completion stream", "error", completionErr)
 			return nil, fmt.Errorf("completion failed: %w", completionErr)
@@ -195,13 +206,10 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	// --- Determine Completion Kind (Best Effort) ---
 	completionKind := CompletionItemKindSnippet // Default to Snippet
-	// Only run analysis if AST is enabled in config
 	currentConfig := s.completer.GetCurrentConfig()
 	if currentConfig.UseAst {
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second) // Shorter timeout for kind analysis
 		defer cancelAnalysis()
-		// Analyze to find identifier at cursor for kind mapping
-		// Note: This re-analyzes, could be optimized if analysis info was cached from LLM call
 		analysisInfo, kindAnalysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, file.Version, line, col)
 		if kindAnalysisErr != nil {
 			completionLogger.Warn("Analysis for completion kind failed, using default kind", "error", kindAnalysisErr)
@@ -223,7 +231,6 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		s.clientCaps.TextDocument.Completion.CompletionItem != nil &&
 		s.clientCaps.TextDocument.Completion.CompletionItem.SnippetSupport {
 		insertTextFormat = SnippetFormat
-		// TODO: Potentially convert completionText to a proper LSP snippet
 		insertText = completionText
 		completionLogger.Debug("Using Snippet format for completion item")
 	} else {
@@ -232,16 +239,15 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	// --- Create Completion Item ---
 	item := CompletionItem{
-		Label:            strings.Split(completionText, "\n")[0], // Use first line as label
+		Label:            strings.Split(completionText, "\n")[0],
 		InsertText:       insertText,
 		InsertTextFormat: insertTextFormat,
-		Kind:             completionKind,            // Use determined or default kind
-		Detail:           "DeepComplete Suggestion", // Basic detail
-		// TODO: Add Documentation or more Detail based on analysis if available
+		Kind:             completionKind,
+		Detail:           "DeepComplete Suggestion",
 	}
 
 	return CompletionList{
-		IsIncomplete: false, // Mark as complete
+		IsIncomplete: false,
 		Items:        []CompletionItem{item},
 	}, nil
 }
@@ -262,7 +268,6 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	// Convert LSP position to Go position, pass logger
 	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, hoverLogger) // Util func
 	if posErr != nil {
 		hoverLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
@@ -270,7 +275,6 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	}
 	hoverLogger = hoverLogger.With("go_line", line, "go_col", col)
 
-	// Validate URI and get absolute path, pass logger
 	absPath, pathErr := ValidateAndGetFilePath(string(uri), hoverLogger) // Util func
 	if pathErr != nil {
 		hoverLogger.Error("Invalid file URI", "error", pathErr)
@@ -280,7 +284,6 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	analysisCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	// Analyze uses the logger configured in the completer instance
 	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, file.Version, line, col)
 
 	select {
@@ -309,7 +312,6 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 		return nil, nil
 	}
 
-	// Format hover content, passing the request-specific logger
 	hoverContent := formatObjectForHover(analysisInfo.IdentifierObject, analysisInfo, hoverLogger) // From helpers_hover.go
 	if hoverContent == "" {
 		hoverLogger.Debug("No hover content generated for identifier", "identifier", analysisInfo.IdentifierObject.Name())
@@ -318,7 +320,6 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 
 	var hoverRange *LSPRange
 	if analysisInfo.TargetFileSet != nil {
-		// Pass request-specific logger
 		lspRange, rangeErr := nodeRangeToLSPRange(analysisInfo.TargetFileSet, analysisInfo.IdentifierAtCursor, file.Content, hoverLogger) // From lsp_protocol.go
 		if rangeErr == nil {
 			hoverRange = lspRange
@@ -360,7 +361,6 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	// Convert LSP position to Go position, pass logger
 	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, defLogger) // Util func
 	if posErr != nil {
 		defLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
@@ -368,7 +368,6 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	}
 	defLogger = defLogger.With("go_line", line, "go_col", col)
 
-	// Validate URI and get absolute path, pass logger
 	absPath, pathErr := ValidateAndGetFilePath(string(uri), defLogger) // Util func
 	if pathErr != nil {
 		defLogger.Error("Invalid file URI", "error", pathErr)
@@ -378,7 +377,6 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	analysisCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	// Analyze uses the logger configured in the completer instance
 	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, file.Version, line, col)
 
 	select {
@@ -433,7 +431,6 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, nil
 	}
 
-	// Convert the definition position to an LSP Location, passing the request-specific logger
 	location, locErr := tokenPosToLSPLocation(defFile, defPos, defFileContent, defLogger) // From lsp_protocol.go
 	if locErr != nil {
 		defLogger.Error("Failed to convert definition position to LSP Location", "identifier", obj.Name(), "error", locErr)

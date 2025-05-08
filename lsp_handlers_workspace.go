@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os" // Needed for logger recreation
 
 	"github.com/sourcegraph/jsonrpc2"
 )
@@ -37,68 +38,93 @@ func (s *Server) handleDidChangeConfiguration(ctx context.Context, conn *jsonrpc
 		}
 	}
 
-	newConfig := s.completer.GetCurrentConfig()
+	// Get current config as a base for merging
+	currentConfig := s.completer.GetCurrentConfig()
+	newConfig := currentConfig // Start with current config
 	fileCfg := changedSettings.DeepComplete
-	mergedFields := 0
+	changedKeys := []string{} // Track which keys were actually changed
 
-	if fileCfg.OllamaURL != nil {
+	// Merge fields only if they were present in the received settings (non-nil pointers in FileConfig)
+	if fileCfg.OllamaURL != nil && *fileCfg.OllamaURL != newConfig.OllamaURL {
 		newConfig.OllamaURL = *fileCfg.OllamaURL
-		mergedFields++
+		changedKeys = append(changedKeys, "OllamaURL")
 	}
-	if fileCfg.Model != nil {
+	if fileCfg.Model != nil && *fileCfg.Model != newConfig.Model {
 		newConfig.Model = *fileCfg.Model
-		mergedFields++
+		changedKeys = append(changedKeys, "Model")
 	}
-	if fileCfg.MaxTokens != nil {
+	if fileCfg.MaxTokens != nil && *fileCfg.MaxTokens != newConfig.MaxTokens {
 		newConfig.MaxTokens = *fileCfg.MaxTokens
-		mergedFields++
+		changedKeys = append(changedKeys, "MaxTokens")
 	}
+	// Note: Comparing slices requires more complex logic, assuming any non-nil means change for now
 	if fileCfg.Stop != nil {
 		newConfig.Stop = *fileCfg.Stop
-		mergedFields++
+		changedKeys = append(changedKeys, "Stop")
 	}
-	if fileCfg.Temperature != nil {
+	if fileCfg.Temperature != nil && *fileCfg.Temperature != newConfig.Temperature {
 		newConfig.Temperature = *fileCfg.Temperature
-		mergedFields++
+		changedKeys = append(changedKeys, "Temperature")
 	}
-	if fileCfg.LogLevel != nil {
+	logLevelChanged := false
+	if fileCfg.LogLevel != nil && *fileCfg.LogLevel != newConfig.LogLevel {
 		newConfig.LogLevel = *fileCfg.LogLevel
-		mergedFields++
+		changedKeys = append(changedKeys, "LogLevel")
+		logLevelChanged = true // Mark that the log level specifically changed
 		configLogger.Info("Log level configuration change received", "new_level_setting", newConfig.LogLevel)
 	}
-	if fileCfg.UseAst != nil {
+	if fileCfg.UseAst != nil && *fileCfg.UseAst != newConfig.UseAst {
 		newConfig.UseAst = *fileCfg.UseAst
-		mergedFields++
+		changedKeys = append(changedKeys, "UseAst")
 	}
-	if fileCfg.UseFim != nil {
+	if fileCfg.UseFim != nil && *fileCfg.UseFim != newConfig.UseFim {
 		newConfig.UseFim = *fileCfg.UseFim
-		mergedFields++
+		changedKeys = append(changedKeys, "UseFim")
 	}
-	if fileCfg.MaxPreambleLen != nil {
+	if fileCfg.MaxPreambleLen != nil && *fileCfg.MaxPreambleLen != newConfig.MaxPreambleLen {
 		newConfig.MaxPreambleLen = *fileCfg.MaxPreambleLen
-		mergedFields++
+		changedKeys = append(changedKeys, "MaxPreambleLen")
 	}
-	if fileCfg.MaxSnippetLen != nil {
+	if fileCfg.MaxSnippetLen != nil && *fileCfg.MaxSnippetLen != newConfig.MaxSnippetLen {
 		newConfig.MaxSnippetLen = *fileCfg.MaxSnippetLen
-		mergedFields++
+		changedKeys = append(changedKeys, "MaxSnippetLen")
 	}
 
-	if mergedFields > 0 {
-		configLogger.Info("Applying configuration changes from client", "fields_merged", mergedFields)
+	if len(changedKeys) > 0 {
+		configLogger.Info("Applying configuration changes from client", "changed_keys", changedKeys)
+		// UpdateConfig performs validation internally and updates the completer's config
 		if err := s.completer.UpdateConfig(newConfig); err != nil {
 			configLogger.Error("Failed to apply updated configuration", "error", err)
 			s.sendShowMessage(MessageTypeError, fmt.Sprintf("Failed to apply configuration update: %v", err))
 		} else {
-			s.config = s.completer.GetCurrentConfig() // Update server's local copy
+			// Update the server's local copy after successful update in completer
+			s.config = s.completer.GetCurrentConfig()
 			configLogger.Info("Server configuration updated successfully via workspace/didChangeConfiguration")
 
-			// Pass configLogger to ParseLogLevel (although it doesn't use it)
-			newLevel, parseErr := ParseLogLevel(s.config.LogLevel)
-			if parseErr == nil {
-				configLogger.Info("Attempting to update server logger level (implementation specific)", "new_level", newLevel)
-				// Actual logger update logic would go here if the logger handler supports dynamic levels.
-			} else {
-				configLogger.Warn("Cannot update logger level due to parse error", "level_string", s.config.LogLevel, "error", parseErr)
+			// If log level changed, update the server's logger instance
+			if logLevelChanged {
+				newLevel, parseErr := ParseLogLevel(s.config.LogLevel)
+				if parseErr == nil {
+					configLogger.Info("Updating server logger level", "new_level", newLevel)
+					// Recreate the logger with the new level
+					// Assuming TextHandler and output to Stderr for simplicity
+					// In a real app, might need more sophisticated handler management
+					// TODO: Persist log file handle if logging to file is needed
+					newLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+						Level:     newLevel,
+						AddSource: true, // Keep source consistent
+					}))
+					s.logger = newLogger // Replace server's logger instance
+					// Update the completer's logger as well if it needs the same level
+					// This requires the completer to expose a SetLogger method or similar
+					// For now, we assume the completer uses the logger passed at creation
+					// or slog.Default(), which might not reflect this change immediately
+					// if not managed carefully.
+					// Consider adding: s.completer.SetLogger(newLogger) if method exists.
+					configLogger.Info("Server logger instance updated with new level.")
+				} else {
+					configLogger.Warn("Cannot update logger level due to parse error", "level_string", s.config.LogLevel, "error", parseErr)
+				}
 			}
 		}
 	} else {
