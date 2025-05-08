@@ -89,7 +89,7 @@ func loadPackageAndFile(
 			loadErrors = append(loadErrors, &pkgErr)
 			logger.Warn("Package loading error encountered", "package", p.PkgPath, "error", pkgErr.Error())
 			// Pass logger to packagesErrorToDiagnostic
-			diag := packagesErrorToDiagnostic(pkgErr, fset, logger)
+			diag := packagesErrorToDiagnostic(pkgErr, fset, logger) // Pass logger here
 			if diag != nil {
 				diagnostics = append(diagnostics, *diag)
 			}

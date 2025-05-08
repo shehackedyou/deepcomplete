@@ -1,6 +1,5 @@
 // deepcomplete/lsp_protocol.go
 // Contains LSP specific data structures and utility functions.
-// Cycle 2: Updated utility function calls and cleaned comments.
 package deepcomplete
 
 import (
@@ -225,9 +224,9 @@ const (
 	CompletionItemKindConstructor   CompletionItemKind = 4
 	CompletionItemKindField         CompletionItemKind = 5
 	CompletionItemKindVariable      CompletionItemKind = 6
-	CompletionItemKindClass         CompletionItemKind = 7
+	CompletionItemKindClass         CompletionItemKind = 7 // Often used for Type specs
 	CompletionItemKindInterface     CompletionItemKind = 8
-	CompletionItemKindModule        CompletionItemKind = 9
+	CompletionItemKindModule        CompletionItemKind = 9 // Often used for Packages
 	CompletionItemKindProperty      CompletionItemKind = 10
 	CompletionItemKindUnit          CompletionItemKind = 11
 	CompletionItemKindValue         CompletionItemKind = 12
@@ -385,9 +384,10 @@ type ErrorObject struct {
 // ============================================================================
 
 // mapTypeToCompletionKind maps a Go types.Object to an LSP CompletionItemKind.
+// Provides more specific kinds than the previous version.
 func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	if obj == nil {
-		return CompletionItemKindSnippet // Default for LLM suggestions
+		return CompletionItemKindSnippet // Default for LLM suggestions without type info
 	}
 
 	switch o := obj.(type) {
@@ -396,39 +396,80 @@ func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 		if ok && sig.Recv() != nil {
 			return CompletionItemKindMethod
 		}
+		// Could potentially check if it's a constructor-like function
 		return CompletionItemKindFunction
 	case *types.Var:
 		if o.IsField() {
 			return CompletionItemKindField
 		}
+		// Check if it's a package-level variable
+		if o.Parent() != nil && o.Parent() == o.Pkg().Scope() {
+			// Could potentially treat as Constant if it looks like one, but Variable is safer
+			return CompletionItemKindVariable
+		}
 		return CompletionItemKindVariable
 	case *types.Const:
-		return CompletionItemKindConstant
+		// Check underlying type if possible
+		if t := o.Type(); t != nil {
+			if basic, ok := t.Underlying().(*types.Basic); ok {
+				// Check if it's boolean or numeric-like constant
+				if basic.Info()&(types.IsBoolean|types.IsNumeric) != 0 {
+					return CompletionItemKindConstant
+				}
+				// Could check for string constants etc.
+			}
+		}
+		return CompletionItemKindConstant // Default for const
 	case *types.TypeName:
-		switch o.Type().Underlying().(type) {
+		// Get the underlying type to determine the specific kind
+		underlying := o.Type().Underlying()
+		if underlying == nil {
+			return CompletionItemKindClass // Fallback for type names
+		}
+		switch underlying.(type) {
 		case *types.Struct:
 			return CompletionItemKindStruct
 		case *types.Interface:
 			return CompletionItemKindInterface
 		case *types.Basic:
-			return CompletionItemKindKeyword
-		default:
+			// Could differentiate basic types (int, string) further if needed
+			return CompletionItemKindKeyword // Often used for basic type keywords
+		case *types.Signature: // Type alias for a function type
+			return CompletionItemKindFunction
+		case *types.Map:
+			return CompletionItemKindClass // Or Struct/Keyword depending on preference
+		case *types.Slice, *types.Array:
+			return CompletionItemKindClass // Or Struct/Keyword
+		case *types.Pointer:
+			// Look at the element type of the pointer
+			if elem := underlying.(*types.Pointer).Elem(); elem != nil {
+				// Recursively map the element type (avoid infinite recursion for self-referential types)
+				// For simplicity, just return Class for pointers for now.
+				return CompletionItemKindClass
+			}
 			return CompletionItemKindClass
+		default:
+			return CompletionItemKindClass // General fallback for other type kinds
 		}
 	case *types.PkgName:
 		return CompletionItemKindModule
 	case *types.Builtin:
-		return CompletionItemKindFunction
+		return CompletionItemKindFunction // Built-in functions like make, append
 	case *types.Nil:
-		return CompletionItemKindValue
+		return CompletionItemKindValue // `nil` is a value
+	case *types.Label:
+		return CompletionItemKindReference // Labels are like references
 	default:
-		return CompletionItemKindText
+		return CompletionItemKindText // Safest generic fallback
 	}
 }
 
 // tokenPosToLSPLocation converts a token.Pos to an LSP Location.
 // Requires the token.File containing the position and the file content.
 func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logger *slog.Logger) (*Location, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if file == nil {
 		return nil, errors.New("cannot convert position: token.File is nil")
 	}
@@ -444,13 +485,11 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 		return nil, fmt.Errorf("invalid offset %d calculated from pos %d in file %s (size %d, content len %d)", offset, pos, file.Name(), file.Size(), len(content))
 	}
 
-	// Use utility function from deepcomplete_utils.go
-	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger)
+	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger) // Pass logger
 	if convErr != nil {
 		return nil, fmt.Errorf("failed converting byte offset %d to LSP position: %w", offset, convErr)
 	}
 
-	// Construct file URI using utility function from deepcomplete_utils.go
 	fileURIStr, uriErr := PathToURI(file.Name())
 	if uriErr != nil {
 		logger.Warn("Failed to convert definition file path to URI", "path", file.Name(), "error", uriErr)
@@ -469,6 +508,9 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 
 // nodeRangeToLSPRange converts an AST node's position range to an LSP Range.
 func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, logger *slog.Logger) (*LSPRange, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if fset == nil || node == nil {
 		return nil, errors.New("fset or node is nil")
 	}
@@ -499,9 +541,8 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 		return nil, fmt.Errorf("invalid byte offsets calculated: start=%d, end=%d, file_size=%d, content_len=%d", startOffset, endOffset, fileSize, contentLen)
 	}
 
-	// Use utility functions from deepcomplete_utils.go
-	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger)
-	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)
+	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger) // Pass logger
+	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)         // Pass logger
 
 	if startErr != nil || endErr != nil {
 		return nil, fmt.Errorf("failed converting offsets to LSP positions: startErr=%v, endErr=%v", startErr, endErr)

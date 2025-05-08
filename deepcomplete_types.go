@@ -140,9 +140,11 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		logger.Warn("Config validation: max_tokens is not positive, applying default.", "configured_value", c.MaxTokens, "default", tempDefault.MaxTokens)
 		c.MaxTokens = tempDefault.MaxTokens
 	}
-	if c.Temperature < 0 {
-		logger.Warn("Config validation: temperature is negative, applying default.", "configured_value", c.Temperature, "default", tempDefault.Temperature)
-		c.Temperature = tempDefault.Temperature
+	// Validate Temperature range
+	if c.Temperature < 0.0 || c.Temperature > 2.0 {
+		logger.Warn("Config validation: temperature is outside reasonable range [0.0, 2.0], applying default.", "configured_value", c.Temperature, "default", tempDefault.Temperature)
+		validationErrors = append(validationErrors, fmt.Errorf("temperature %f is outside valid range [0.0, 2.0]", c.Temperature))
+		c.Temperature = tempDefault.Temperature // Apply default if out of range
 	}
 	if c.MaxPreambleLen <= 0 {
 		logger.Warn("Config validation: max_preamble_len is not positive, applying default.", "configured_value", c.MaxPreambleLen, "default", tempDefault.MaxPreambleLen)
@@ -156,11 +158,11 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		logger.Warn("Config validation: log_level is empty, applying default.", "default", defaultLogLevel)
 		c.LogLevel = defaultLogLevel
 	} else {
-		// Pass logger to ParseLogLevel (although it doesn't use it currently)
 		_, err := ParseLogLevel(c.LogLevel)
 		if err != nil {
 			logger.Warn("Config validation: Invalid log_level found, applying default.", "configured_value", c.LogLevel, "default", defaultLogLevel, "error", err)
-			c.LogLevel = defaultLogLevel
+			validationErrors = append(validationErrors, fmt.Errorf("invalid log_level '%s': %w", c.LogLevel, err))
+			c.LogLevel = defaultLogLevel // Apply default if invalid
 		}
 	}
 	if c.Stop == nil {

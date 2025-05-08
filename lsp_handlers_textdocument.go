@@ -153,16 +153,16 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("invalid file URI: %w", pathErr)
 	}
 
-	completionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+	// --- Get Completion Text ---
+	completionCtx, cancelCompletion := context.WithTimeout(ctx, 10*time.Second) // Timeout for LLM call
+	defer cancelCompletion()
 
 	var completionBuffer bytes.Buffer
-	// GetCompletionStreamFromFile uses the logger configured in the completer instance
 	completionErr := s.completer.GetCompletionStreamFromFile(completionCtx, absPath, file.Version, line, col, &completionBuffer)
 
 	select {
 	case <-completionCtx.Done():
-		completionLogger.Info("Completion request cancelled or timed out", "error", completionCtx.Err())
+		completionLogger.Info("Completion request cancelled or timed out during LLM call", "error", completionCtx.Err())
 		if errors.Is(completionCtx.Err(), context.DeadlineExceeded) {
 			return CompletionList{IsIncomplete: false, Items: []CompletionItem{}}, nil
 		}
@@ -177,11 +177,12 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 			return CompletionList{IsIncomplete: false, Items: []CompletionItem{}}, nil
 		}
 		if errors.Is(completionErr, ErrAnalysisFailed) {
-			completionLogger.Warn("Code analysis failed during completion", "error", completionErr)
-			return CompletionList{IsIncomplete: false, Items: []CompletionItem{}}, nil
+			completionLogger.Warn("Code analysis failed during completion, proceeding without specific kind", "error", completionErr)
+			// Proceed without specific kind, but log the analysis failure
+		} else {
+			completionLogger.Error("Failed to get completion stream", "error", completionErr)
+			return nil, fmt.Errorf("completion failed: %w", completionErr)
 		}
-		completionLogger.Error("Failed to get completion stream", "error", completionErr)
-		return nil, fmt.Errorf("completion failed: %w", completionErr)
 	}
 
 	completionText := strings.TrimSpace(completionBuffer.String())
@@ -192,6 +193,29 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	completionLogger.Info("Completion successful", "completion_length", len(completionText))
 
+	// --- Determine Completion Kind (Best Effort) ---
+	completionKind := CompletionItemKindSnippet // Default to Snippet
+	// Only run analysis if AST is enabled in config
+	currentConfig := s.completer.GetCurrentConfig()
+	if currentConfig.UseAst {
+		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second) // Shorter timeout for kind analysis
+		defer cancelAnalysis()
+		// Analyze to find identifier at cursor for kind mapping
+		// Note: This re-analyzes, could be optimized if analysis info was cached from LLM call
+		analysisInfo, kindAnalysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, file.Version, line, col)
+		if kindAnalysisErr != nil {
+			completionLogger.Warn("Analysis for completion kind failed, using default kind", "error", kindAnalysisErr)
+		} else if analysisInfo != nil && analysisInfo.IdentifierObject != nil {
+			completionKind = mapTypeToCompletionKind(analysisInfo.IdentifierObject) // Use refined mapping
+			completionLogger.Debug("Determined completion kind from analysis", "kind", completionKind, "identifier", analysisInfo.IdentifierObject.Name())
+		} else {
+			completionLogger.Debug("No specific identifier found at cursor for kind mapping, using default.")
+		}
+	} else {
+		completionLogger.Debug("AST analysis disabled, using default completion kind.")
+	}
+
+	// --- Determine Insert Text Format ---
 	insertTextFormat := PlainTextFormat
 	insertText := completionText
 	if s.clientCaps.TextDocument != nil &&
@@ -199,22 +223,25 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		s.clientCaps.TextDocument.Completion.CompletionItem != nil &&
 		s.clientCaps.TextDocument.Completion.CompletionItem.SnippetSupport {
 		insertTextFormat = SnippetFormat
+		// TODO: Potentially convert completionText to a proper LSP snippet
 		insertText = completionText
 		completionLogger.Debug("Using Snippet format for completion item")
 	} else {
 		completionLogger.Debug("Using PlainText format for completion item")
 	}
 
+	// --- Create Completion Item ---
 	item := CompletionItem{
-		Label:            strings.Split(completionText, "\n")[0],
+		Label:            strings.Split(completionText, "\n")[0], // Use first line as label
 		InsertText:       insertText,
 		InsertTextFormat: insertTextFormat,
-		Kind:             CompletionItemKindSnippet,
-		Detail:           "DeepComplete Suggestion",
+		Kind:             completionKind,            // Use determined or default kind
+		Detail:           "DeepComplete Suggestion", // Basic detail
+		// TODO: Add Documentation or more Detail based on analysis if available
 	}
 
 	return CompletionList{
-		IsIncomplete: false,
+		IsIncomplete: false, // Mark as complete
 		Items:        []CompletionItem{item},
 	}, nil
 }

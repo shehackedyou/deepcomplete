@@ -1,8 +1,5 @@
 // deepcomplete/lsp_server.go
 // Implements the main LSP server structure and request routing.
-// Cycle 3: Added context propagation, explicit logger passing, refined error handling.
-// Cycle 4: Added metrics publishing and request cancellation handling.
-// Cycle 5: Moved specific LSP method handler implementations to separate files (lsp_handlers_*.go).
 package deepcomplete
 
 import (
@@ -72,7 +69,6 @@ func (s *Server) Run(r io.Reader, w io.Writer) {
 
 	stream := &stdrwc{r: r, w: w}
 	objectStream := jsonrpc2.NewPlainObjectStream(stream)
-	// The main handler routes requests to methods on the Server struct
 	handler := jsonrpc2.HandlerWithError(s.handle)
 
 	s.conn = jsonrpc2.NewConn(context.Background(), objectStream, handler)
@@ -155,20 +151,22 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		}
 		s.clientCaps = params.Capabilities
 		s.initParams = &params
-		return s.handleInitialize(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_lifecycle.go
+		// Pass the method-specific logger to the handler
+		return s.handleInitialize(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_lifecycle.go
 
 	case "initialized":
 		methodLogger.Info("Client initialized notification received")
-		// No specific action needed here for now
 		return nil, nil
 
 	case "shutdown":
 		methodLogger.Info("Shutdown request received")
-		return s.handleShutdown(ctx, conn, req, s.logger) // Implemented in lsp_handlers_lifecycle.go
+		// Pass the method-specific logger to the handler
+		return s.handleShutdown(ctx, conn, req, methodLogger) // Implemented in lsp_handlers_lifecycle.go
 
 	case "exit":
 		methodLogger.Info("Exit notification received")
-		return s.handleExit(ctx, conn, req, s.logger) // Implemented in lsp_handlers_lifecycle.go
+		// Pass the method-specific logger to the handler
+		return s.handleExit(ctx, conn, req, methodLogger) // Implemented in lsp_handlers_lifecycle.go
 
 	case "textDocument/didOpen":
 		var params DidOpenTextDocumentParams
@@ -176,7 +174,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didOpen params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		return s.handleDidOpen(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_textdocument.go
+		// Pass the method-specific logger to the handler
+		return s.handleDidOpen(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
 
 	case "textDocument/didChange":
 		var params DidChangeTextDocumentParams
@@ -184,7 +183,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didChange params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		return s.handleDidChange(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_textdocument.go
+		// Pass the method-specific logger to the handler
+		return s.handleDidChange(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
 
 	case "textDocument/didClose":
 		var params DidCloseTextDocumentParams
@@ -192,7 +192,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didClose params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		return s.handleDidClose(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_textdocument.go
+		// Pass the method-specific logger to the handler
+		return s.handleDidClose(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
 
 	case "textDocument/completion":
 		var params CompletionParams
@@ -200,7 +201,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal completion params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid completion params: %v", err)}
 		}
-		return s.handleCompletion(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_textdocument.go
+		// Pass the method-specific logger to the handler
+		return s.handleCompletion(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
 
 	case "textDocument/hover":
 		var params HoverParams
@@ -208,7 +210,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal hover params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid hover params: %v", err)}
 		}
-		return s.handleHover(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_textdocument.go
+		// Pass the method-specific logger to the handler
+		return s.handleHover(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
 
 	case "textDocument/definition":
 		var params DefinitionParams
@@ -216,7 +219,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal definition params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid definition params: %v", err)}
 		}
-		return s.handleDefinition(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_textdocument.go
+		// Pass the method-specific logger to the handler
+		return s.handleDefinition(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
 
 	case "workspace/didChangeConfiguration":
 		var params DidChangeConfigurationParams
@@ -224,7 +228,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didChangeConfiguration params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		return s.handleDidChangeConfiguration(ctx, conn, req, params, s.logger) // Implemented in lsp_handlers_workspace.go
+		// Pass the method-specific logger to the handler
+		return s.handleDidChangeConfiguration(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_workspace.go
 
 	case "$/cancelRequest":
 		var params CancelParams
@@ -275,8 +280,8 @@ func (s *Server) sendShowMessage(msgType MessageType, message string) {
 // publishDiagnostics sends a textDocument/publishDiagnostics notification.
 func (s *Server) publishDiagnostics(uri DocumentURI, version *int, diagnostics []LspDiagnostic, logger *slog.Logger) {
 	if logger == nil {
-		logger = s.logger
-	} // Use server logger if none provided
+		logger = s.logger // Use server logger if none provided
+	}
 	if s.conn == nil {
 		logger.Warn("Cannot publish diagnostics: connection is nil", "uri", uri)
 		return
@@ -298,21 +303,23 @@ func (s *Server) publishDiagnostics(uri DocumentURI, version *int, diagnostics [
 // Accepts a logger instance.
 func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte, absPath string, logger *slog.Logger) {
 	if logger == nil {
-		logger = s.logger
-	} // Use server logger if none provided
+		logger = s.logger // Use server logger if none provided
+	}
 	diagLogger := logger.With("uri", uri, "version", version, "absPath", absPath, "operation", "triggerDiagnostics")
 	diagLogger.Info("Triggering background analysis for diagnostics")
 
 	analysisCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Analyzer uses its own internal logger
 	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, version, 1, 1) // Use placeholder line/col
 
 	lspDiagnostics := []LspDiagnostic{}
 	if analysisInfo != nil && len(analysisInfo.Diagnostics) > 0 {
 		diagLogger.Debug("Converting internal diagnostics to LSP format", "count", len(analysisInfo.Diagnostics))
 		for _, diag := range analysisInfo.Diagnostics {
-			lspRange, err := internalRangeToLSPRange(content, diag.Range, diagLogger) // Pass logger
+			// Pass diagLogger to internalRangeToLSPRange
+			lspRange, err := internalRangeToLSPRange(content, diag.Range, diagLogger)
 			if err != nil {
 				diagLogger.Warn("Failed to convert diagnostic range, skipping diagnostic", "internal_range", diag.Range, "error", err, "message", diag.Message)
 				continue
@@ -331,7 +338,6 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 		diagLogger.Debug("No internal diagnostics found during analysis")
 	}
 
-	// Log analysis errors
 	if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) {
 		diagLogger.Error("Fatal error during diagnostic analysis", "error", analysisErr)
 	} else if analysisErr != nil {
@@ -343,6 +349,9 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 
 // internalRangeToLSPRange converts internal byte-offset range to LSP UTF-16 range.
 func internalRangeToLSPRange(content []byte, internalRange Range, logger *slog.Logger) (*LSPRange, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if content == nil {
 		return nil, errors.New("cannot convert range: content is nil")
 	}
@@ -354,10 +363,12 @@ func internalRangeToLSPRange(content []byte, internalRange Range, logger *slog.L
 		return nil, fmt.Errorf("invalid internal byte offset range: start=%d, end=%d, content_len=%d", startByteOffset, endByteOffset, contentLen)
 	}
 
+	// Pass logger to utility function
 	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startByteOffset, logger) // Util func
 	if startErr != nil {
 		return nil, fmt.Errorf("failed converting start offset %d: %w", startByteOffset, startErr)
 	}
+	// Pass logger to utility function
 	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endByteOffset, logger) // Util func
 	if endErr != nil {
 		return nil, fmt.Errorf("failed converting end offset %d: %w", endByteOffset, endErr)
@@ -387,6 +398,7 @@ func mapInternalSeverityToLSP(internalSeverity DiagnosticSeverity) LspDiagnostic
 	case SeverityHint:
 		return LspSeverityHint
 	default:
+		// Use the default logger for this package-level function
 		slog.Warn("Unknown internal diagnostic severity, defaulting to Error", "internal_severity", internalSeverity)
 		return LspSeverityError
 	}
@@ -399,12 +411,10 @@ func mapInternalSeverityToLSP(internalSeverity DiagnosticSeverity) LspDiagnostic
 // publishExpvarMetrics publishes server metrics using the expvar package.
 func publishExpvarMetrics(s *Server) {
 	startTime := time.Now()
-	// Basic server info
 	expvar.NewString("serverInfo.name").Set(s.serverInfo.Name)
 	expvar.NewString("serverInfo.version").Set(s.serverInfo.Version)
 	expvar.NewString("serverStartTime").Set(startTime.Format(time.RFC3339))
 
-	// Runtime stats
 	expvar.Publish("goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
 	expvar.Publish("memory.allocBytes", expvar.Func(func() any {
 		var m runtime.MemStats
@@ -427,7 +437,6 @@ func publishExpvarMetrics(s *Server) {
 		return m.NumGC
 	}))
 
-	// LSP-specific stats
 	expvar.Publish("lsp.openFiles", expvar.Func(func() any {
 		s.filesMu.RLock()
 		defer s.filesMu.RUnlock()
@@ -435,7 +444,6 @@ func publishExpvarMetrics(s *Server) {
 	}))
 	expvar.Publish("lsp.pendingRequests", expvar.Func(func() any { return s.requestTracker.Count() }))
 
-	// Cache metrics (if available)
 	if s.completer != nil && s.completer.analyzer != nil && s.completer.analyzer.MemoryCacheEnabled() {
 		expvar.Publish("cache.memory.hits", expvar.Func(func() any {
 			m := s.completer.analyzer.GetMemoryCacheMetrics()
@@ -494,7 +502,6 @@ func publishExpvarMetrics(s *Server) {
 			return 0
 		}))
 	} else {
-		// Publish zero values if cache is not enabled
 		expvar.Publish("cache.memory.hits", expvar.Func(func() any { return 0 }))
 		expvar.Publish("cache.memory.misses", expvar.Func(func() any { return 0 }))
 		expvar.Publish("cache.memory.ratio", expvar.Func(func() any { return "0.0000" }))
@@ -515,12 +522,16 @@ func publishExpvarMetrics(s *Server) {
 type RequestTracker struct {
 	mu       sync.Mutex
 	requests map[jsonrpc2.ID]context.CancelFunc
+	logger   *slog.Logger // Add logger to tracker
 }
 
 // NewRequestTracker creates a new tracker.
 func NewRequestTracker() *RequestTracker {
+	// Use a default logger initially, can be replaced if needed
+	logger := slog.Default().With("component", "RequestTracker")
 	return &RequestTracker{
 		requests: make(map[jsonrpc2.ID]context.CancelFunc),
+		logger:   logger,
 	}
 }
 
@@ -528,40 +539,52 @@ func NewRequestTracker() *RequestTracker {
 func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 	if id == (jsonrpc2.ID{}) {
 		return
-	} // Ignore notifications
+	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	reqCtx, cancel := context.WithCancel(context.Background())
+	// Check if already tracking to avoid overwriting
+	if _, exists := rt.requests[id]; exists {
+		rt.logger.Warn("Attempted to add already tracked request ID", "id", id)
+		return
+	}
+	reqCtx, cancel := context.WithCancel(context.Background()) // Create derived context
 	rt.requests[id] = cancel
+	rt.logger.Debug("Added request to tracker", "id", id)
+	// Goroutine to automatically cancel and remove if the original context is done
 	go func() {
 		select {
 		case <-ctx.Done():
-			cancel()
-			rt.Remove(id) // Clean up immediately on original context cancellation
+			rt.logger.Debug("Original context done, cancelling tracked request", "id", id, "reason", ctx.Err())
+			cancel()      // Cancel the derived context
+			rt.Remove(id) // Clean up tracker entry
 		case <-reqCtx.Done():
-			// No action needed if derived context was cancelled
+			// Derived context was cancelled (likely via rt.Cancel or rt.Remove)
+			rt.logger.Debug("Tracked request context cancelled", "id", id)
+			// No need to call Remove again here, it happens in Cancel or explicit Remove
 		}
 	}()
-	_ = reqCtx
 }
 
 // Remove deregisters a request ID. Should be called when a request handler finishes.
 func (rt *RequestTracker) Remove(id jsonrpc2.ID) {
 	if id == (jsonrpc2.ID{}) {
 		return
-	} // Ignore notifications
+	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if cancel, ok := rt.requests[id]; ok {
+		rt.logger.Debug("Removing request from tracker", "id", id)
 		cancel() // Ensure cancellation is called on removal
 		delete(rt.requests, id)
+	} else {
+		rt.logger.Debug("Attempted to remove untracked request ID", "id", id)
 	}
 }
 
 // Cancel finds the cancel function for a request ID and calls it.
 func (rt *RequestTracker) Cancel(id jsonrpc2.ID) {
-	if id == (jsonrpc2.ID{}) { // Ignore notifications
-		slog.Debug("Cancel request ignored for unset ID")
+	if id == (jsonrpc2.ID{}) {
+		rt.logger.Debug("Cancel request ignored for unset ID")
 		return
 	}
 	rt.mu.Lock()
@@ -569,11 +592,11 @@ func (rt *RequestTracker) Cancel(id jsonrpc2.ID) {
 	rt.mu.Unlock() // Unlock before calling cancel
 
 	if found {
-		slog.Debug("Calling cancel function for request", "id", id)
+		rt.logger.Info("Calling cancel function for request", "id", id)
 		cancel()
-		// Removal happens either when original ctx is done or handler finishes
+		// Removal happens automatically when reqCtx is done, or explicitly via Remove
 	} else {
-		slog.Debug("Cancel function not found for request ID", "id", id)
+		rt.logger.Debug("Cancel function not found for request ID", "id", id)
 	}
 }
 
