@@ -24,12 +24,12 @@ import (
 
 // Server represents the LSP server instance.
 type Server struct {
-	conn           *jsonrpc2.Conn
-	logger         *slog.Logger
-	completer      *DeepCompleter // The core completion service
-	files          map[DocumentURI]*OpenFile
-	filesMu        sync.RWMutex
-	config         Config // Current effective configuration
+	conn      *jsonrpc2.Conn
+	logger    *slog.Logger
+	completer *DeepCompleter // The core completion service
+	files     map[DocumentURI]*OpenFile
+	filesMu   sync.RWMutex
+	// config Config // Removed: Get config directly from completer
 	clientCaps     ClientCapabilities
 	serverInfo     *ServerInfo
 	initParams     *InitializeParams
@@ -50,14 +50,13 @@ func NewServer(completer *DeepCompleter, logger *slog.Logger, version string) *S
 	}
 	s := &Server{
 		logger:    logger,
-		completer: completer,
+		completer: completer, // Completer holds the canonical config now
 		files:     make(map[DocumentURI]*OpenFile),
-		config:    completer.GetCurrentConfig(),
+		// config:    completer.GetCurrentConfig(), // Removed
 		serverInfo: &ServerInfo{
 			Name:    "DeepComplete LSP",
 			Version: version,
 		},
-		// Initialize tracker with the server's logger
 		requestTracker: NewRequestTracker(logger),
 	}
 	publishExpvarMetrics(s) // Publish metrics on startup
@@ -124,12 +123,9 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 
 	// Request Cancellation Handling
 	if isRequest {
-		// Add request to tracker *before* potentially blocking/long operations
 		s.requestTracker.Add(req.ID, ctx)
-		// Ensure removal happens even if the handler panics (hence the defer)
 		defer s.requestTracker.Remove(req.ID)
 
-		// Check for cancellation *before* starting work
 		select {
 		case <-ctx.Done():
 			methodLogger.Warn("Request context cancelled before processing started", "error", ctx.Err())
@@ -243,7 +239,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			return nil, nil
 		}
 
-		s.requestTracker.Cancel(cancelID) // Use tracker to cancel
+		s.requestTracker.Cancel(cancelID)
 		methodLogger.Info("Cancellation request processed", "cancelled_id", cancelID)
 		return nil, nil
 
@@ -264,7 +260,7 @@ func (s *Server) sendShowMessage(msgType MessageType, message string) {
 		return
 	}
 	params := ShowMessageParams{Type: msgType, Message: message}
-	ctx := context.Background() // Use background context for notifications
+	ctx := context.Background()
 	if err := s.conn.Notify(ctx, "window/showMessage", params); err != nil {
 		s.logger.Error("Failed to send window/showMessage notification", "error", err, "message_type", msgType)
 	} else {
@@ -275,7 +271,7 @@ func (s *Server) sendShowMessage(msgType MessageType, message string) {
 // publishDiagnostics sends a textDocument/publishDiagnostics notification.
 func (s *Server) publishDiagnostics(uri DocumentURI, version *int, diagnostics []LspDiagnostic, logger *slog.Logger) {
 	if logger == nil {
-		logger = s.logger // Use server logger if none provided
+		logger = s.logger
 	}
 	if s.conn == nil {
 		logger.Warn("Cannot publish diagnostics: connection is nil", "uri", uri)
@@ -298,7 +294,7 @@ func (s *Server) publishDiagnostics(uri DocumentURI, version *int, diagnostics [
 // Accepts a logger instance.
 func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte, absPath string, logger *slog.Logger) {
 	if logger == nil {
-		logger = s.logger // Use server logger if none provided
+		logger = s.logger
 	}
 	diagLogger := logger.With("uri", uri, "version", version, "absPath", absPath, "operation", "triggerDiagnostics")
 	diagLogger.Info("Triggering background analysis for diagnostics")
@@ -307,8 +303,7 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 	analysisCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Analyzer uses its own internal logger
-	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, version, 1, 1) // Use placeholder line/col
+	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, version, 1, 1)
 	diagLogger.Info("Analysis for diagnostics completed", "duration", time.Since(analysisStart))
 
 	// --- Check if file version changed during analysis ---
@@ -325,15 +320,14 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 	if analysisInfo != nil && len(analysisInfo.Diagnostics) > 0 {
 		diagLogger.Debug("Converting internal diagnostics to LSP format", "count", len(analysisInfo.Diagnostics))
 		for _, diag := range analysisInfo.Diagnostics {
-			// Pass diagLogger to internalRangeToLSPRange
-			lspRange, err := internalRangeToLSPRange(content, diag.Range, diagLogger) // Pass logger here
+			lspRange, err := internalRangeToLSPRange(content, diag.Range, diagLogger)
 			if err != nil {
 				diagLogger.Warn("Failed to convert diagnostic range, skipping diagnostic", "internal_range", diag.Range, "error", err, "message", diag.Message)
 				continue
 			}
 			lspDiagnostics = append(lspDiagnostics, LspDiagnostic{
 				Range:    *lspRange,
-				Severity: mapInternalSeverityToLSP(diag.Severity), // Helper below
+				Severity: mapInternalSeverityToLSP(diag.Severity),
 				Code:     diag.Code,
 				Source:   diag.Source,
 				Message:  diag.Message,
@@ -351,8 +345,7 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 		diagLogger.Warn("Analysis for diagnostics completed with non-fatal errors", "error", analysisErr)
 	}
 
-	// Publish diagnostics for the correct version
-	s.publishDiagnostics(uri, &version, lspDiagnostics, diagLogger) // Pass logger
+	s.publishDiagnostics(uri, &version, lspDiagnostics, diagLogger)
 }
 
 // internalRangeToLSPRange converts internal byte-offset range to LSP UTF-16 range.
@@ -371,13 +364,11 @@ func internalRangeToLSPRange(content []byte, internalRange Range, logger *slog.L
 		return nil, fmt.Errorf("invalid internal byte offset range: start=%d, end=%d, content_len=%d", startByteOffset, endByteOffset, contentLen)
 	}
 
-	// Pass logger to utility function
-	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startByteOffset, logger) // Util func
+	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startByteOffset, logger)
 	if startErr != nil {
 		return nil, fmt.Errorf("failed converting start offset %d: %w", startByteOffset, startErr)
 	}
-	// Pass logger to utility function
-	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endByteOffset, logger) // Util func
+	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endByteOffset, logger)
 	if endErr != nil {
 		return nil, fmt.Errorf("failed converting end offset %d: %w", endByteOffset, endErr)
 	}
@@ -556,15 +547,11 @@ func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 		return
 	}
 	// Create a new context that can be cancelled independently
-	// Note: We don't link it to the parent `ctx` here because cancellation
-	// should primarily be triggered by the $/cancelRequest notification.
-	// The parent `ctx` cancellation is checked *before* calling the handler.
 	reqCtx, cancel := context.WithCancel(context.Background())
 	rt.requests[id] = cancel
 	rt.logger.Debug("Added request to tracker", "id", id)
 
-	// Optional: Monitor the original context in case the client disconnects
-	// or the parent context gets cancelled for other reasons.
+	// Goroutine to automatically cancel and remove if the original context is done
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -573,7 +560,6 @@ func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 			rt.Remove(id) // Clean up immediately
 		case <-reqCtx.Done():
 			// This means the derived context was cancelled, likely by rt.Cancel or rt.Remove.
-			// No action needed here, just log for debugging.
 			rt.logger.Debug("Tracked request context cancelled", "id", id)
 		}
 	}()
@@ -604,13 +590,12 @@ func (rt *RequestTracker) Cancel(id jsonrpc2.ID) {
 	}
 	rt.mu.Lock()
 	cancel, found := rt.requests[id]
-	// It's okay to leave the entry in the map here;
-	// the goroutine in Add or the defer in handle will eventually call Remove.
-	rt.mu.Unlock()
+	rt.mu.Unlock() // Unlock before calling cancel
 
 	if found {
 		rt.logger.Info("Calling cancel function for request via $/cancelRequest", "id", id)
 		cancel() // Trigger cancellation
+		// Removal happens automatically when reqCtx is done, or explicitly via Remove in handle defer
 	} else {
 		rt.logger.Debug("Cancel function not found for request ID (already removed or never added?)", "id", id)
 	}

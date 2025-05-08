@@ -53,6 +53,7 @@ func (s *Server) handleDidOpen(ctx context.Context, conn *jsonrpc2.Conn, req *js
 
 // handleDidChange handles the 'textDocument/didChange' notification.
 // It updates the file content in the server's state (only Full sync supported) and triggers diagnostics.
+// It invalidates memory cache for the changed file and disk cache only if go.mod/go.sum changed.
 func (s *Server) handleDidChange(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params DidChangeTextDocumentParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	version := params.TextDocument.Version
@@ -75,28 +76,41 @@ func (s *Server) handleDidChange(ctx context.Context, conn *jsonrpc2.Conn, req *
 
 	s.filesMu.Lock()
 	currentFile, exists := s.files[uri]
-	if !exists || version > currentFile.Version {
+	shouldUpdate := !exists || version > currentFile.Version
+	if shouldUpdate {
 		s.files[uri] = &OpenFile{
 			URI:     uri,
 			Content: newContent,
 			Version: version,
 		}
 		changeLogger.Debug("Updated file cache")
-		if s.completer.analyzer != nil {
-			dir := filepath.Dir(absPath)
-			if err := s.completer.InvalidateMemoryCacheForURI(string(uri), version); err != nil {
-				changeLogger.Warn("Failed to invalidate memory cache on didChange", "error", err)
-			}
-			if err := s.completer.InvalidateAnalyzerCache(dir); err != nil {
-				changeLogger.Warn("Failed to invalidate disk cache on didChange", "dir", dir, "error", err)
-			}
-		}
 	} else {
 		changeLogger.Warn("Ignoring out-of-order didChange notification", "received_version", version, "current_version", currentFile.Version)
 	}
-	s.filesMu.Unlock()
+	s.filesMu.Unlock() // Unlock before potentially long cache operations
 
-	// Trigger diagnostics even if the update was ignored, pass logger
+	// Invalidate caches only if the file content was actually updated
+	if shouldUpdate && s.completer.analyzer != nil {
+		// Always invalidate memory cache for the specific changed file URI
+		if err := s.completer.InvalidateMemoryCacheForURI(string(uri), version); err != nil {
+			changeLogger.Warn("Failed to invalidate memory cache on didChange", "error", err)
+		}
+
+		// Invalidate disk cache (bbolt) only if go.mod or go.sum changed
+		baseName := filepath.Base(absPath)
+		if baseName == "go.mod" || baseName == "go.sum" {
+			dir := filepath.Dir(absPath)
+			changeLogger.Info("Detected change in go.mod/go.sum, invalidating disk cache", "file", baseName, "dir", dir)
+			if err := s.completer.InvalidateAnalyzerCache(dir); err != nil {
+				changeLogger.Warn("Failed to invalidate disk cache on didChange", "dir", dir, "error", err)
+			}
+		} else {
+			changeLogger.Debug("Skipping disk cache invalidation for non-go.mod/go.sum file change", "file", baseName)
+		}
+	}
+
+	// Trigger diagnostics even if the update was ignored (client state might need update)
+	// Pass the specific logger
 	go s.triggerDiagnostics(uri, version, newContent, absPath, changeLogger)
 	return nil, nil
 }
@@ -205,8 +219,8 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	completionLogger.Info("Completion successful", "completion_length", len(completionText))
 
 	// --- Determine Completion Kind (Best Effort) ---
-	completionKind := CompletionItemKindSnippet // Default to Snippet
-	currentConfig := s.completer.GetCurrentConfig()
+	completionKind := CompletionItemKindSnippet     // Default to Snippet
+	currentConfig := s.completer.GetCurrentConfig() // Get current config
 	if currentConfig.UseAst {
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second) // Shorter timeout for kind analysis
 		defer cancelAnalysis()

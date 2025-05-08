@@ -38,7 +38,7 @@ func (s *Server) handleDidChangeConfiguration(ctx context.Context, conn *jsonrpc
 		}
 	}
 
-	// Get current config as a base for merging
+	// Get current config directly from the completer
 	currentConfig := s.completer.GetCurrentConfig()
 	newConfig := currentConfig // Start with current config
 	fileCfg := changedSettings.DeepComplete
@@ -57,7 +57,6 @@ func (s *Server) handleDidChangeConfiguration(ctx context.Context, conn *jsonrpc
 		newConfig.MaxTokens = *fileCfg.MaxTokens
 		changedKeys = append(changedKeys, "MaxTokens")
 	}
-	// Note: Comparing slices requires more complex logic, assuming any non-nil means change for now
 	if fileCfg.Stop != nil {
 		newConfig.Stop = *fileCfg.Stop
 		changedKeys = append(changedKeys, "Stop")
@@ -97,33 +96,27 @@ func (s *Server) handleDidChangeConfiguration(ctx context.Context, conn *jsonrpc
 			configLogger.Error("Failed to apply updated configuration", "error", err)
 			s.sendShowMessage(MessageTypeError, fmt.Sprintf("Failed to apply configuration update: %v", err))
 		} else {
-			// Update the server's local copy after successful update in completer
-			s.config = s.completer.GetCurrentConfig()
+			// No need to update s.config as it was removed. Get fresh config if needed.
 			configLogger.Info("Server configuration updated successfully via workspace/didChangeConfiguration")
 
 			// If log level changed, update the server's logger instance
 			if logLevelChanged {
-				newLevel, parseErr := ParseLogLevel(s.config.LogLevel)
+				// Get the *actually applied* config from the completer after update
+				appliedConfig := s.completer.GetCurrentConfig()
+				newLevel, parseErr := ParseLogLevel(appliedConfig.LogLevel)
 				if parseErr == nil {
 					configLogger.Info("Updating server logger level", "new_level", newLevel)
 					// Recreate the logger with the new level
-					// Assuming TextHandler and output to Stderr for simplicity
-					// In a real app, might need more sophisticated handler management
-					// TODO: Persist log file handle if logging to file is needed
 					newLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 						Level:     newLevel,
 						AddSource: true, // Keep source consistent
 					}))
 					s.logger = newLogger // Replace server's logger instance
-					// Update the completer's logger as well if it needs the same level
-					// This requires the completer to expose a SetLogger method or similar
-					// For now, we assume the completer uses the logger passed at creation
-					// or slog.Default(), which might not reflect this change immediately
-					// if not managed carefully.
-					// Consider adding: s.completer.SetLogger(newLogger) if method exists.
+					// Update the request tracker's logger as well
+					s.requestTracker.logger = newLogger.With("component", "RequestTracker")
 					configLogger.Info("Server logger instance updated with new level.")
 				} else {
-					configLogger.Warn("Cannot update logger level due to parse error", "level_string", s.config.LogLevel, "error", parseErr)
+					configLogger.Warn("Cannot update logger level due to parse error", "level_string", appliedConfig.LogLevel, "error", parseErr)
 				}
 			}
 		}
