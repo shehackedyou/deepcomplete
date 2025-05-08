@@ -3,6 +3,7 @@
 package deepcomplete
 
 import (
+	"context" // Added context
 	"fmt"
 	"go/ast"
 	"go/types"
@@ -16,30 +17,27 @@ import (
 // Preamble Construction Helpers
 // ============================================================================
 
-// constructPromptPreamble builds the final preamble string from analyzed info.
+// constructPromptPreamble builds the final preamble string by calling specific Analyzer methods.
+// This is the primary function called by the completer service.
 func constructPromptPreamble(
 	analyzer Analyzer, // Use interface type
-	info *AstContextInfo,
-	qualifier types.Qualifier,
-	logger *slog.Logger,
-) string {
-	return buildPreamble(analyzer, info, qualifier, logger)
-}
-
-// buildPreamble constructs the context string sent to the LLM from analysis info.
-func buildPreamble(
-	analyzer Analyzer, // Use interface type
-	info *AstContextInfo,
-	qualifier types.Qualifier,
+	info *AstContextInfo, // Still used for file path, version, cursor pos, and specific context nodes
+	qualifier types.Qualifier, // Qualifier might still be useful here or derived inside
 	logger *slog.Logger,
 ) string {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	preambleLogger := logger.With("op", "constructPromptPreamble")
+
 	var preamble strings.Builder
 	const internalPreambleLimit = 8192 // Limit overall preamble construction size
 	currentLen := 0
 	limitReached := false
+
+	// --- Context for Analyzer calls ---
+	// Use a background context for now, or propagate from the original request if available
+	ctx := context.Background() // TODO: Propagate original context if possible
 
 	// Helper to add string to preamble if within limit
 	addToPreamble := func(s string) bool {
@@ -52,11 +50,11 @@ func buildPreamble(
 			return true
 		}
 		limitReached = true
-		logger.Debug("Internal preamble construction limit reached", "limit", internalPreambleLimit, "current_len", currentLen)
+		preambleLogger.Debug("Internal preamble construction limit reached", "limit", internalPreambleLimit, "current_len", currentLen)
 		return false
 	}
 
-	// Helper to add truncation marker if limit wasn't already hit
+	// Helper to add truncation marker
 	addTruncMarker := func(section string) {
 		if limitReached {
 			return
@@ -66,11 +64,11 @@ func buildPreamble(
 			preamble.WriteString(msg)
 			currentLen += len(msg)
 		}
-		limitReached = true // Mark limit reached even if marker couldn't fit
+		limitReached = true
 	}
 
-	// --- Build Preamble Sections ---
-	pkgName := info.PackageName
+	// --- Build Preamble Sections using Analyzer methods ---
+	pkgName := info.PackageName // Get initial package name if available
 	if pkgName == "" && info.TargetPackage != nil && info.TargetPackage.Types != nil {
 		pkgName = info.TargetPackage.Types.Name()
 	}
@@ -79,29 +77,79 @@ func buildPreamble(
 	}
 	addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(info.FilePath), pkgName))
 
-	// Add sections sequentially, checking the limit after each potentially large section
+	// Add Imports (still relies on info struct for now)
 	if !limitReached {
-		formatImportsSection(&preamble, info, addToPreamble, addTruncMarker, logger)
+		formatImportsSection(&preamble, info, addToPreamble, addTruncMarker, preambleLogger)
 	}
-	if !limitReached {
-		formatEnclosingFuncSection(&preamble, info, qualifier, addToPreamble, logger)
+
+	// Need FileSet to convert Pos to Line/Column
+	fset := info.TargetFileSet
+	var cursorLine, cursorCol int = 1, 1 // Default if invalid
+	if fset != nil && info.CursorPos.IsValid() {
+		posInfo := fset.Position(info.CursorPos)
+		cursorLine = posInfo.Line
+		cursorCol = posInfo.Column
+	} else {
+		preambleLogger.Warn("Cannot get accurate line/col for preamble getters: FileSet or CursorPos invalid")
 	}
+
+	// Get Enclosing Context Info
+	var enclosingCtx *EnclosingContextInfo
 	if !limitReached {
-		formatCommentsSection(&preamble, info, addToPreamble, addTruncMarker, logger)
+		var encErr error
+		// Use line/col 0,0 as it doesn't matter for this specific info getter
+		enclosingCtx, encErr = analyzer.GetEnclosingContext(ctx, info.FilePath, info.Version, 0, 0)
+		if encErr != nil {
+			preambleLogger.Warn("Failed to get enclosing context for preamble", "error", encErr)
+			addToPreamble("// Error getting enclosing function context.\n")
+		} else if enclosingCtx != nil {
+			// Pass the retrieved *EnclosingContextInfo
+			formatEnclosingFuncSection(&preamble, enclosingCtx, qualifier, addToPreamble, preambleLogger)
+		}
 	}
+
+	// Get Relevant Comments
+	var comments []string
 	if !limitReached {
-		formatCursorContextSection(&preamble, info, qualifier, addToPreamble, logger)
+		var commentErr error
+		// Pass actual cursor line/col derived from Pos
+		comments, commentErr = analyzer.GetRelevantComments(ctx, info.FilePath, info.Version, cursorLine, cursorCol)
+		if commentErr != nil {
+			preambleLogger.Warn("Failed to get relevant comments for preamble", "error", commentErr)
+			addToPreamble("// Error getting relevant comments.\n")
+		} else if len(comments) > 0 {
+			// Pass the retrieved []string
+			formatCommentsSection(&preamble, comments, addToPreamble, addTruncMarker, preambleLogger)
+		}
 	}
+
+	// Get Scope Info
+	var scopeInfo *ScopeInfo
 	if !limitReached {
-		formatScopeSection(&preamble, info, qualifier, addToPreamble, addTruncMarker, logger)
+		var scopeErr error
+		// Pass actual cursor line/col derived from Pos
+		scopeInfo, scopeErr = analyzer.GetScopeInfo(ctx, info.FilePath, info.Version, cursorLine, cursorCol)
+		if scopeErr != nil {
+			preambleLogger.Warn("Failed to get scope info for preamble", "error", scopeErr)
+			addToPreamble("// Error getting scope information.\n")
+		} else if scopeInfo != nil && len(scopeInfo.Variables) > 0 {
+			// Pass the retrieved *ScopeInfo
+			formatScopeSection(&preamble, scopeInfo, qualifier, addToPreamble, addTruncMarker, preambleLogger)
+		}
+	}
+
+	// Format specific cursor context (still uses info struct)
+	if !limitReached {
+		formatCursorContextSection(&preamble, info, qualifier, addToPreamble, preambleLogger)
 	}
 
 	return preamble.String()
 }
 
 // formatImportsSection formats the import list, respecting limits.
+// Note: This still relies on AstContextInfo containing Imports.
 func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add func(string) bool, addTrunc func(string), logger *slog.Logger) {
-	if len(info.Imports) == 0 {
+	if info == nil || len(info.Imports) == 0 {
 		return
 	}
 	if !add("// Imports:\n") {
@@ -133,13 +181,18 @@ func formatImportsSection(preamble *strings.Builder, info *AstContextInfo, add f
 	}
 }
 
-// formatEnclosingFuncSection formats the enclosing function/method info.
-func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, logger *slog.Logger) {
+// formatEnclosingFuncSection formats the enclosing function/method info from EnclosingContextInfo.
+// Accepts *EnclosingContextInfo.
+func formatEnclosingFuncSection(preamble *strings.Builder, encInfo *EnclosingContextInfo, qualifier types.Qualifier, add func(string) bool, logger *slog.Logger) {
+	if encInfo == nil {
+		return
+	} // Nothing to format
+
 	funcOrMethod := "Function"
 	receiverStr := ""
-	if info.ReceiverType != "" {
+	if encInfo.Receiver != "" {
 		funcOrMethod = "Method"
-		receiverBase := info.ReceiverType
+		receiverBase := encInfo.Receiver
 		if strings.HasPrefix(receiverBase, "*") {
 			receiverBase = receiverBase[1:]
 		}
@@ -147,10 +200,10 @@ func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo,
 	}
 
 	var funcHeader string
-	if info.EnclosingFunc != nil { // Prefer type information
-		name := info.EnclosingFunc.Name()
-		sigStr := types.TypeString(info.EnclosingFunc.Type(), qualifier)
-		if info.ReceiverType != "" && strings.HasPrefix(sigStr, "func(") {
+	if encInfo.Func != nil { // Prefer type information
+		name := encInfo.Func.Name()
+		sigStr := types.TypeString(encInfo.Func.Type(), qualifier)
+		if encInfo.Receiver != "" && strings.HasPrefix(sigStr, "func(") {
 			if firstParen := strings.Index(sigStr, "("); firstParen != -1 {
 				if secondParen := strings.Index(sigStr[firstParen+1:], ")"); secondParen != -1 {
 					sigStr = "func" + sigStr[firstParen+1+secondParen+1:]
@@ -158,19 +211,19 @@ func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo,
 			}
 		}
 		funcHeader = fmt.Sprintf("// Enclosing %s: %s%s%s\n", funcOrMethod, receiverStr, name, sigStr)
-	} else if info.EnclosingFuncNode != nil { // Fallback to AST
+	} else if encInfo.FuncNode != nil { // Fallback to AST
 		name := "[anonymous]"
-		if info.EnclosingFuncNode.Name != nil {
-			name = info.EnclosingFuncNode.Name.Name
+		if encInfo.FuncNode.Name != nil {
+			name = encInfo.FuncNode.Name.Name
 		}
 		paramsStr := "..."
 		resultsStr := ""
-		if info.EnclosingFuncNode.Type != nil {
-			if info.EnclosingFuncNode.Type.Params != nil {
-				paramsStr = fmt.Sprintf("(%d params)", len(info.EnclosingFuncNode.Type.Params.List))
+		if encInfo.FuncNode.Type != nil {
+			if encInfo.FuncNode.Type.Params != nil {
+				paramsStr = fmt.Sprintf("(%d params)", len(encInfo.FuncNode.Type.Params.List))
 			}
-			if info.EnclosingFuncNode.Type.Results != nil {
-				resultsStr = fmt.Sprintf(" (%d results)", len(info.EnclosingFuncNode.Type.Results.List))
+			if encInfo.FuncNode.Type.Results != nil {
+				resultsStr = fmt.Sprintf(" (%d results)", len(encInfo.FuncNode.Type.Results.List))
 			}
 		}
 		funcHeader = fmt.Sprintf("// Enclosing %s (AST only): %s%s%s%s\n", funcOrMethod, receiverStr, name, paramsStr, resultsStr)
@@ -181,8 +234,9 @@ func formatEnclosingFuncSection(preamble *strings.Builder, info *AstContextInfo,
 }
 
 // formatCommentsSection formats relevant comments, respecting limits.
-func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo, add func(string) bool, addTrunc func(string), logger *slog.Logger) {
-	if len(info.CommentsNearCursor) == 0 {
+// Accepts comments directly now ( []string ).
+func formatCommentsSection(preamble *strings.Builder, comments []string, add func(string) bool, addTrunc func(string), logger *slog.Logger) {
+	if len(comments) == 0 {
 		return
 	}
 	if !add("// Relevant Comments:\n") {
@@ -191,7 +245,7 @@ func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo, add 
 
 	count := 0
 	const maxComments = 7
-	for _, c := range info.CommentsNearCursor {
+	for _, c := range comments {
 		if count >= maxComments {
 			addTrunc("comments")
 			logger.Debug("Truncated comments list in preamble", "max_comments", maxComments)
@@ -221,7 +275,11 @@ func formatCommentsSection(preamble *strings.Builder, info *AstContextInfo, add 
 }
 
 // formatCursorContextSection formats specific context like calls, selectors, etc.
+// Note: This still relies on AstContextInfo.
 func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, logger *slog.Logger) {
+	if info == nil {
+		return
+	} // Need info for this section
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -231,27 +289,31 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 	if info.CallExpr != nil {
 		contextAdded = true
 		funcName := "[unknown function]"
-		// var funcObj types.Object // Removed unused variable
-
-		// Correctly get the identifier for lookup
-		var funcIdent *ast.Ident
-		switch fun := info.CallExpr.Fun.(type) {
-		case *ast.Ident:
-			funcIdent = fun
-			funcName = fun.Name // Use AST name as fallback
-		case *ast.SelectorExpr:
-			funcIdent = fun.Sel
-			funcName = fun.Sel.Name // Use AST name as fallback
-		}
-
-		// Look up the object in TypesInfo to get the accurate name if possible
-		if funcIdent != nil && info.TargetPackage != nil && info.TargetPackage.TypesInfo != nil {
-			if obj, ok := info.TargetPackage.TypesInfo.Uses[funcIdent]; ok && obj != nil {
-				// funcObj = obj // Removed unused assignment
-				funcName = obj.Name() // Use name from types.Object if found
-			} else if obj, ok := info.TargetPackage.TypesInfo.Defs[funcIdent]; ok && obj != nil {
-				// funcObj = obj // Removed unused assignment
-				funcName = obj.Name()
+		if info.TargetPackage != nil && info.TargetPackage.TypesInfo != nil { // Check if type info is available
+			var funcIdent *ast.Ident
+			switch fun := info.CallExpr.Fun.(type) {
+			case *ast.Ident:
+				funcIdent = fun
+				funcName = fun.Name
+			case *ast.SelectorExpr:
+				funcIdent = fun.Sel
+				funcName = fun.Sel.Name
+			}
+			if funcIdent != nil {
+				if obj, ok := info.TargetPackage.TypesInfo.Uses[funcIdent]; ok && obj != nil {
+					funcName = obj.Name()
+				} else if obj, ok := info.TargetPackage.TypesInfo.Defs[funcIdent]; ok && obj != nil {
+					funcName = obj.Name()
+				}
+			}
+		} else { // Fallback to AST name if no type info
+			switch fun := info.CallExpr.Fun.(type) {
+			case *ast.Ident:
+				funcName = fun.Name
+			case *ast.SelectorExpr:
+				if fun.Sel != nil {
+					funcName = fun.Sel.Name
+				}
 			}
 		}
 
@@ -259,7 +321,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 			return
 		}
 
-		// Use the function signature stored in info (if analysis succeeded)
 		if sig := info.CallExprFuncType; sig != nil {
 			if !add(fmt.Sprintf("//   Signature: %s\n", types.TypeString(sig, qualifier))) {
 				return
@@ -314,7 +375,6 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		} else if selName != "" {
 			status = fmt.Sprintf(" (selecting '%s')", selName)
 		}
-
 		if !add(fmt.Sprintf("// Selector context: Base Type = %s%s\n", typeName, status)) {
 			return
 		}
@@ -360,18 +420,14 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 		if !add(fmt.Sprintf("// Inside composite literal: %s\n", typeName)) {
 			return
 		}
-
-		// Check if it's a struct literal (underlying might be pointer)
 		var isStruct bool
 		if info.CompositeLitType != nil {
 			currentType := info.CompositeLitType.Underlying()
 			if ptr, ok := currentType.(*types.Pointer); ok && ptr.Elem() != nil {
 				currentType = ptr.Elem().Underlying()
 			}
-			// Removed unused 'st' variable here
 			_, isStruct = currentType.(*types.Struct)
 		}
-
 		if isStruct {
 			if !add("//   (Completing struct fields...)\n") {
 				return
@@ -398,8 +454,9 @@ func formatCursorContextSection(preamble *strings.Builder, info *AstContextInfo,
 }
 
 // formatScopeSection formats variables/constants/types in scope, respecting limits.
-func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifier types.Qualifier, add func(string) bool, addTrunc func(string), logger *slog.Logger) {
-	if len(info.VariablesInScope) == 0 {
+// Accepts *ScopeInfo.
+func formatScopeSection(preamble *strings.Builder, scopeInfo *ScopeInfo, qualifier types.Qualifier, add func(string) bool, addTrunc func(string), logger *slog.Logger) {
+	if scopeInfo == nil || len(scopeInfo.Variables) == 0 {
 		return
 	}
 	if !add("// In Scope:\n") {
@@ -407,14 +464,8 @@ func formatScopeSection(preamble *strings.Builder, info *AstContextInfo, qualifi
 	}
 
 	var items []string
-	for _, obj := range info.VariablesInScope { // Iterate directly over objects
-		// Skip receiver if present
-		if info.EnclosingFunc != nil && info.EnclosingFunc.Type() != nil {
-			if sig, ok := info.EnclosingFunc.Type().(*types.Signature); ok && sig.Recv() != nil && sig.Recv() == obj {
-				continue
-			}
-		}
-
+	for _, obj := range scopeInfo.Variables {
+		// TODO: Add logic to skip receiver if needed, potentially requires EnclosingContextInfo here too
 		objStr := types.ObjectString(obj, qualifier)
 		if objStr == "" {
 			objStr = fmt.Sprintf("%s (type: %s)", obj.Name(), types.TypeString(obj.Type(), qualifier))

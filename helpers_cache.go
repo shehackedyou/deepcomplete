@@ -82,6 +82,7 @@ func withMemoryCache[T any](
 	if cost <= 0 {
 		cost = 1 // Ristretto cost must be positive
 	}
+	// Use the TTL passed as an argument (potentially from config)
 	setOk := analyzer.SetMemoryCache(cacheKey, computedResult, cost, ttl) // Use interface method
 	if !setOk {
 		// Set can fail if the item is too large or other constraints aren't met

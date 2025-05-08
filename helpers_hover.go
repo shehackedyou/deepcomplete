@@ -17,7 +17,6 @@ import (
 
 // formatObjectForHover creates a Markdown string for hover info based on IdentifierInfo.
 // It includes the object's definition signature and its associated documentation comment, if found.
-// Changed signature to accept *IdentifierInfo instead of types.Object and *AstContextInfo shell.
 func formatObjectForHover(identInfo *IdentifierInfo, logger *slog.Logger) string {
 	if identInfo == nil || identInfo.Object == nil {
 		logger.Debug("formatObjectForHover called with nil identInfo or object")

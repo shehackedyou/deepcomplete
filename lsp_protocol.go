@@ -88,11 +88,12 @@ type DidChangeConfigurationCapabilities struct {
 
 // TextDocumentClientCapabilities text document specific client capabilities.
 type TextDocumentClientCapabilities struct {
-	Completion *CompletionClientCapabilities `json:"completion,omitempty"`
-	Hover      *HoverClientCapabilities      `json:"hover,omitempty"`
-	Definition *DefinitionClientCapabilities `json:"definition,omitempty"`
-	CodeAction *CodeActionClientCapabilities `json:"codeAction,omitempty"` // Added (Cycle N+2)
-	// Add other text document capabilities like signatureHelp, references etc. if needed
+	Completion    *CompletionClientCapabilities    `json:"completion,omitempty"`
+	Hover         *HoverClientCapabilities         `json:"hover,omitempty"`
+	Definition    *DefinitionClientCapabilities    `json:"definition,omitempty"`
+	SignatureHelp *SignatureHelpClientCapabilities `json:"signatureHelp,omitempty"` // Added (Cycle N+9)
+	CodeAction    *CodeActionClientCapabilities    `json:"codeAction,omitempty"`
+	// Add other text document capabilities like references etc. if needed
 }
 
 // CompletionClientCapabilities client capabilities for completion.
@@ -117,7 +118,26 @@ type DefinitionClientCapabilities struct {
 	LinkSupport bool `json:"linkSupport,omitempty"`
 }
 
-// CodeActionClientCapabilities client capabilities for code actions. (Cycle N+2)
+// SignatureHelpClientCapabilities client capabilities for signature help. (Cycle N+9)
+type SignatureHelpClientCapabilities struct {
+	DynamicRegistration  bool                            `json:"dynamicRegistration,omitempty"`
+	SignatureInformation *SignatureInformationClientCaps `json:"signatureInformation,omitempty"`
+	ContextSupport       bool                            `json:"contextSupport,omitempty"`
+}
+
+// SignatureInformationClientCaps capabilities specific to SignatureInformation. (Cycle N+9)
+type SignatureInformationClientCaps struct {
+	DocumentationFormat    []MarkupKind                    `json:"documentationFormat,omitempty"`
+	ParameterInformation   *ParameterInformationClientCaps `json:"parameterInformation,omitempty"`
+	ActiveParameterSupport bool                            `json:"activeParameterSupport,omitempty"`
+}
+
+// ParameterInformationClientCaps capabilities specific to ParameterInformation. (Cycle N+9)
+type ParameterInformationClientCaps struct {
+	LabelOffsetSupport bool `json:"labelOffsetSupport,omitempty"`
+}
+
+// CodeActionClientCapabilities client capabilities for code actions.
 type CodeActionClientCapabilities struct {
 	DynamicRegistration      bool                            `json:"dynamicRegistration,omitempty"`
 	CodeActionLiteralSupport *CodeActionLiteralSupportClient `json:"codeActionLiteralSupport,omitempty"`
@@ -125,12 +145,12 @@ type CodeActionClientCapabilities struct {
 	// Add resolveSupport etc. if needed
 }
 
-// CodeActionLiteralSupportClient capabilities specific to CodeActionLiterals. (Cycle N+2)
+// CodeActionLiteralSupportClient capabilities specific to CodeActionLiterals.
 type CodeActionLiteralSupportClient struct {
 	CodeActionKind CodeActionKindClientCapabilities `json:"codeActionKind"`
 }
 
-// CodeActionKindClientCapabilities defines capabilities for code action kinds. (Cycle N+2)
+// CodeActionKindClientCapabilities defines capabilities for code action kinds.
 type CodeActionKindClientCapabilities struct {
 	ValueSet []CodeActionKind `json:"valueSet"` // The code action kinds the client supports
 }
@@ -149,12 +169,13 @@ type InitializeResult struct {
 
 // ServerCapabilities capabilities provided by the server.
 type ServerCapabilities struct {
-	TextDocumentSync   *TextDocumentSyncOptions `json:"textDocumentSync,omitempty"`
-	CompletionProvider *CompletionOptions       `json:"completionProvider,omitempty"`
-	HoverProvider      bool                     `json:"hoverProvider,omitempty"`      // Simple boolean for now
-	DefinitionProvider bool                     `json:"definitionProvider,omitempty"` // Simple boolean for now
-	CodeActionProvider any                      `json:"codeActionProvider,omitempty"` // bool | CodeActionOptions (Cycle N+2)
-	// Add other capabilities like signatureHelpProvider, referencesProvider etc. if needed
+	TextDocumentSync      *TextDocumentSyncOptions `json:"textDocumentSync,omitempty"`
+	CompletionProvider    *CompletionOptions       `json:"completionProvider,omitempty"`
+	HoverProvider         bool                     `json:"hoverProvider,omitempty"`         // Simple boolean for now
+	DefinitionProvider    bool                     `json:"definitionProvider,omitempty"`    // Simple boolean for now
+	SignatureHelpProvider *SignatureHelpOptions    `json:"signatureHelpProvider,omitempty"` // Added (Cycle N+9)
+	CodeActionProvider    any                      `json:"codeActionProvider,omitempty"`    // bool | CodeActionOptions
+	// Add other capabilities like referencesProvider etc. if needed
 }
 
 // TextDocumentSyncOptions options for text document synchronization.
@@ -175,19 +196,26 @@ const (
 
 // CompletionOptions server completion capabilities.
 type CompletionOptions struct {
-	ResolveProvider   bool     `json:"resolveProvider,omitempty"`   // Server provides additional info on resolve request
-	TriggerCharacters []string `json:"triggerCharacters,omitempty"` // Characters that trigger completion automatically
+	ResolveProvider   bool     `json:"resolveProvider,omitempty"`
+	TriggerCharacters []string `json:"triggerCharacters,omitempty"`
 	// Add allCommitCharacters, workDoneProgress if needed
 }
 
-// CodeActionOptions server capabilities for code actions. (Cycle N+2)
+// SignatureHelpOptions server capabilities for signature help. (Cycle N+9)
+type SignatureHelpOptions struct {
+	TriggerCharacters   []string `json:"triggerCharacters,omitempty"`
+	RetriggerCharacters []string `json:"retriggerCharacters,omitempty"`
+	// Add workDoneProgress if needed
+}
+
+// CodeActionOptions server capabilities for code actions.
 type CodeActionOptions struct {
-	CodeActionKinds []CodeActionKind `json:"codeActionKinds,omitempty"` // Kinds of code actions supported
+	CodeActionKinds []CodeActionKind `json:"codeActionKinds,omitempty"`
 	ResolveProvider bool             `json:"resolveProvider,omitempty"`
 	// Add workDoneProgress if needed
 }
 
-// CodeActionKind defines the kind of code action (string). (Cycle N+2)
+// CodeActionKind defines the kind of code action (string).
 type CodeActionKind string
 
 const (
@@ -232,9 +260,6 @@ type VersionedTextDocumentIdentifier struct {
 // TextDocumentContentChangeEvent an event describing a change to a text document.
 type TextDocumentContentChangeEvent struct {
 	// For Full sync: Range and RangeLength are omitted. Text contains the full content.
-	// For Incremental sync: Range, RangeLength, and Text are provided.
-	// Range       *LSPRange `json:"range,omitempty"`
-	// RangeLength *uint32   `json:"rangeLength,omitempty"`
 	Text string `json:"text"`
 }
 
@@ -361,6 +386,51 @@ type DefinitionParams struct {
 // DefinitionResult can be Location, []Location, or LocationLink[]
 type DefinitionResult = []Location // Using []Location for simplicity
 
+// SignatureHelpParams parameters for textDocument/signatureHelp (Cycle N+9)
+type SignatureHelpParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     LSPPosition            `json:"position"`
+	Context      *SignatureHelpContext  `json:"context,omitempty"`
+}
+
+// SignatureHelpContext additional information about the context of the signature help request (Cycle N+9)
+type SignatureHelpContext struct {
+	TriggerKind         SignatureHelpTriggerKind `json:"triggerKind"`                   // How the signature help was triggered.
+	TriggerCharacter    string                   `json:"triggerCharacter,omitempty"`    // Character that triggered signature help.
+	IsRetrigger         bool                     `json:"isRetrigger"`                   // `true` if signature help was already showing.
+	ActiveSignatureHelp *SignatureHelp           `json:"activeSignatureHelp,omitempty"` // Active help if `isRetrigger` is `true`.
+}
+
+// SignatureHelpTriggerKind how signature help was triggered. (Cycle N+9)
+type SignatureHelpTriggerKind int
+
+const (
+	SignatureHelpTriggerKindInvoked          SignatureHelpTriggerKind = 1 // Signature help was invoked manually by the user or client.
+	SignatureHelpTriggerKindTriggerCharacter SignatureHelpTriggerKind = 2 // Signature help was triggered by a trigger character.
+	SignatureHelpTriggerKindContentChange    SignatureHelpTriggerKind = 3 // Signature help was triggered by the cursor moving or by the document content changing.
+)
+
+// SignatureHelp represents the signature help response. (Cycle N+9)
+type SignatureHelp struct {
+	Signatures      []SignatureInformation `json:"signatures"`                // One or more signatures.
+	ActiveSignature *uint32                `json:"activeSignature,omitempty"` // The active signature index.
+	ActiveParameter *uint32                `json:"activeParameter,omitempty"` // The active parameter index.
+}
+
+// SignatureInformation represents a signature and its documentation. (Cycle N+9)
+type SignatureInformation struct {
+	Label           string                 `json:"label"`                     // Label of this signature. Will be shown in the UI.
+	Documentation   any                    `json:"documentation,omitempty"`   // Documentation (string | MarkupContent).
+	Parameters      []ParameterInformation `json:"parameters,omitempty"`      // The parameters of this signature.
+	ActiveParameter *uint32                `json:"activeParameter,omitempty"` // Index of the active parameter.
+}
+
+// ParameterInformation represents a parameter of a callable signature. (Cycle N+9)
+type ParameterInformation struct {
+	Label         any `json:"label"`                   // Label string or [start, end] offsets.
+	Documentation any `json:"documentation,omitempty"` // Documentation (string | MarkupContent).
+}
+
 // ShowMessageParams parameters for window/showMessage notification.
 type MessageType int
 
@@ -403,71 +473,70 @@ type PublishDiagnosticsParams struct {
 	Diagnostics []LspDiagnostic `json:"diagnostics"`
 }
 
-// CodeActionParams parameters for textDocument/codeAction (Cycle N+2)
+// CodeActionParams parameters for textDocument/codeAction
 type CodeActionParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 	Range        LSPRange               `json:"range"`
 	Context      CodeActionContext      `json:"context"`
 }
 
-// CodeActionContext contains context information for code action requests (Cycle N+2)
+// CodeActionContext contains context information for code action requests
 type CodeActionContext struct {
-	Diagnostics []LspDiagnostic       `json:"diagnostics"`           // Diagnostics that overlap the range
-	Only        []CodeActionKind      `json:"only,omitempty"`        // Requested kinds of code actions
-	TriggerKind CodeActionTriggerKind `json:"triggerKind,omitempty"` // How the action was triggered
+	Diagnostics []LspDiagnostic       `json:"diagnostics"`
+	Only        []CodeActionKind      `json:"only,omitempty"`
+	TriggerKind CodeActionTriggerKind `json:"triggerKind,omitempty"`
 }
 
-// CodeActionTriggerKind defines how a code action was invoked (Cycle N+2)
+// CodeActionTriggerKind defines how a code action was invoked
 type CodeActionTriggerKind int
 
 const (
-	CodeActionTriggerKindInvoked   CodeActionTriggerKind = 1 // Explicitly requested
-	CodeActionTriggerKindAutomatic CodeActionTriggerKind = 2 // Run automatically on save etc.
+	CodeActionTriggerKindInvoked   CodeActionTriggerKind = 1
+	CodeActionTriggerKindAutomatic CodeActionTriggerKind = 2
 )
 
-// CodeActionResult is the result of a code action request (Cycle N+2)
-// It can be a list of Commands or CodeActions. Using []any for flexibility.
+// CodeActionResult is the result of a code action request
 type CodeActionResult = []any // []Command | []CodeAction
 
-// Command represents a command that can be executed on the client (Cycle N+2)
+// Command represents a command that can be executed on the client
 type Command struct {
-	Title     string `json:"title"`               // Title of the command, like `save`.
-	Command   string `json:"command"`             // The identifier of the actual command handler.
-	Arguments []any  `json:"arguments,omitempty"` // Arguments that the command handler should be invoked with.
+	Title     string `json:"title"`
+	Command   string `json:"command"`
+	Arguments []any  `json:"arguments,omitempty"`
 }
 
-// CodeAction represents a potential action offered to the user (Cycle N+2)
+// CodeAction represents a potential action offered to the user
 type CodeAction struct {
-	Title       string          `json:"title"`                 // A short, human-readable title for this code action.
-	Kind        CodeActionKind  `json:"kind,omitempty"`        // The kind of the code action. Used to filter code actions.
-	Diagnostics []LspDiagnostic `json:"diagnostics,omitempty"` // The diagnostics that this code action resolves.
-	IsPreferred bool            `json:"isPreferred,omitempty"` // Marks this action as preferred when filters overlap.
-	Edit        *WorkspaceEdit  `json:"edit,omitempty"`        // The workspace edit this code action performs.
-	Command     *Command        `json:"command,omitempty"`     // A command this code action executes.
-	Data        any             `json:"data,omitempty"`        // A data entry field that is preserved between a code action and its resolve request.
+	Title       string          `json:"title"`
+	Kind        CodeActionKind  `json:"kind,omitempty"`
+	Diagnostics []LspDiagnostic `json:"diagnostics,omitempty"`
+	IsPreferred bool            `json:"isPreferred,omitempty"`
+	Edit        *WorkspaceEdit  `json:"edit,omitempty"`
+	Command     *Command        `json:"command,omitempty"`
+	Data        any             `json:"data,omitempty"`
 	// Add disabled, documentation etc. if needed
 }
 
-// WorkspaceEdit represents changes to multiple resources managed by the workspace (Cycle N+2)
+// WorkspaceEdit represents changes to multiple resources managed by the workspace
 type WorkspaceEdit struct {
-	Changes         map[DocumentURI][]TextEdit `json:"changes,omitempty"`         // Changes by resource URI.
-	DocumentChanges []TextDocumentEdit         `json:"documentChanges,omitempty"` // Supports versioned changes.
+	Changes         map[DocumentURI][]TextEdit `json:"changes,omitempty"`
+	DocumentChanges []TextDocumentEdit         `json:"documentChanges,omitempty"`
 	// Add changeAnnotations if needed
 }
 
-// TextEdit represents a textual change in a document (Cycle N+2)
+// TextEdit represents a textual change in a document
 type TextEdit struct {
-	Range   LSPRange `json:"range"`   // The range of the text document to be manipulated. To insert text into a document create a range where start === end.
-	NewText string   `json:"newText"` // The string to be inserted. For delete operations use an empty string.
+	Range   LSPRange `json:"range"`
+	NewText string   `json:"newText"`
 }
 
-// TextDocumentEdit represents edits to a specific version of a text document (Cycle N+2)
+// TextDocumentEdit represents edits to a specific version of a text document
 type TextDocumentEdit struct {
-	TextDocument OptionalVersionedTextDocumentIdentifier `json:"textDocument"` // The text document to change.
-	Edits        []TextEdit                              `json:"edits"`        // The edits to be applied.
+	TextDocument OptionalVersionedTextDocumentIdentifier `json:"textDocument"`
+	Edits        []TextEdit                              `json:"edits"`
 }
 
-// OptionalVersionedTextDocumentIdentifier is like VersionedTextDocumentIdentifier but version is optional (Cycle N+2)
+// OptionalVersionedTextDocumentIdentifier is like VersionedTextDocumentIdentifier but version is optional
 type OptionalVersionedTextDocumentIdentifier struct {
 	TextDocumentIdentifier
 	Version *int `json:"version"` // Version number is optional (null)

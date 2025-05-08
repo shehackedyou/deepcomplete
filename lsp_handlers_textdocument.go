@@ -1,6 +1,6 @@
 // deepcomplete/lsp_handlers_textdocument.go
 // Contains LSP method handlers related to text document synchronization and language features
-// (didOpen, didChange, didClose, completion, hover, definition, codeAction).
+// (didOpen, didChange, didClose, completion, hover, definition, codeAction, signatureHelp).
 package deepcomplete
 
 import (
@@ -143,7 +143,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	completionLogger.Info("Handling textDocument/completion")
 
 	s.filesMu.RLock()
-	file, ok := s.files[uri]
+	fileData, ok := s.files[uri] // Renamed 'file' to 'fileData' to avoid conflict
 	s.filesMu.RUnlock()
 
 	if !ok {
@@ -151,7 +151,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, completionLogger)
+	line, col, _, posErr := LspPositionToBytePosition(fileData.Content, lspPos, completionLogger)
 	if posErr != nil {
 		completionLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
 		return CompletionList{IsIncomplete: false, Items: []CompletionItem{}}, nil
@@ -169,7 +169,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	defer cancelCompletion()
 
 	var completionBuffer bytes.Buffer
-	completionErr := s.completer.GetCompletionStreamFromFile(completionCtx, absPath, file.Version, line, col, &completionBuffer)
+	completionErr := s.completer.GetCompletionStreamFromFile(completionCtx, absPath, fileData.Version, line, col, &completionBuffer)
 
 	select {
 	case <-completionCtx.Done():
@@ -210,7 +210,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second)
 		defer cancelAnalysis()
 		// Use GetIdentifierInfo for potentially faster kind determination
-		identInfo, kindAnalysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
+		identInfo, kindAnalysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, fileData.Version, line, col)
 		if kindAnalysisErr != nil {
 			completionLogger.Warn("Analysis for completion kind failed, using default kind", "error", kindAnalysisErr)
 		} else if identInfo != nil && identInfo.Object != nil { // Check if identifier was found
@@ -260,7 +260,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	hoverLogger.Info("Handling textDocument/hover")
 
 	s.filesMu.RLock()
-	file, ok := s.files[uri]
+	fileData, ok := s.files[uri] // Renamed 'file' to 'fileData'
 	s.filesMu.RUnlock()
 
 	if !ok {
@@ -268,7 +268,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, hoverLogger)
+	line, col, _, posErr := LspPositionToBytePosition(fileData.Content, lspPos, hoverLogger)
 	if posErr != nil {
 		hoverLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
 		return nil, nil
@@ -285,7 +285,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	defer cancel()
 
 	// Use the specific GetIdentifierInfo method
-	identInfo, analysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
+	identInfo, analysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, fileData.Version, line, col)
 
 	select {
 	case <-analysisCtx.Done():
@@ -355,7 +355,8 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	defLogger.Info("Handling textDocument/definition")
 
 	s.filesMu.RLock()
-	file, ok := s.files[uri]
+	// Get file data needed for position conversion and potential content read
+	fileData, ok := s.files[uri] // Renamed 'file' to 'fileData'
 	s.filesMu.RUnlock()
 
 	if !ok {
@@ -363,7 +364,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, defLogger)
+	line, col, _, posErr := LspPositionToBytePosition(fileData.Content, lspPos, defLogger)
 	if posErr != nil {
 		defLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
 		return nil, nil
@@ -380,7 +381,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	defer cancel()
 
 	// Use the specific GetIdentifierInfo method
-	identInfo, analysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
+	identInfo, analysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, fileData.Version, line, col)
 
 	select {
 	case <-analysisCtx.Done():
@@ -407,9 +408,9 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	}
 
 	obj := identInfo.Object
-	defPos := obj.Pos() // token.Pos
-	defFile := identInfo.FileSet.File(defPos)
-	if defFile == nil {
+	defPos := obj.Pos()                            // token.Pos
+	defFileToken := identInfo.FileSet.File(defPos) // Use FileSet from IdentifierInfo
+	if defFileToken == nil {
 		defLogger.Error("Could not find token.File for definition position", "identifier", obj.Name(), "pos", defPos)
 		return nil, nil
 	}
@@ -417,7 +418,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	// Read content of the definition file only if needed for conversion
 	var defFileContent []byte
 	var readErr error
-	defFileName := defFile.Name()
+	defFileName := defFileToken.Name()
 	if defFileName != absPath { // Check if definition is in a different file
 		defFileContent, readErr = os.ReadFile(defFileName)
 		if readErr != nil {
@@ -427,11 +428,11 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		}
 	} else {
 		// Use the content already held by the server for the current file
-		defFileContent = file.Content
+		defFileContent = fileData.Content // Use content from the file map
 	}
 
 	// Convert the definition token.Pos to an LSP Location
-	location, locErr := tokenPosToLSPLocation(defFile, defPos, defFileContent, defLogger)
+	location, locErr := tokenPosToLSPLocation(defFileToken, defPos, defFileContent, defLogger)
 	if locErr != nil {
 		defLogger.Error("Failed to convert definition position to LSP Location", "identifier", obj.Name(), "error", locErr)
 		return nil, nil
@@ -442,17 +443,96 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 }
 
 // handleCodeAction handles the 'textDocument/codeAction' request.
-// Currently a stub.
+// Provides basic quick fixes based on diagnostics.
 func (s *Server) handleCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params CodeActionParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	actionLogger := logger.With("uri", uri, "range", params.Range, "req_id", req.ID)
-	actionLogger.Info("Handling textDocument/codeAction (stub)")
+	actionLogger.Info("Handling textDocument/codeAction")
 
-	// TODO: Implement actual code action logic
-	// - Analyze the range/diagnostics provided in params.Context
-	// - Determine possible actions (e.g., quick fixes, refactors)
-	// - Return a list of Command or CodeAction objects
+	var codeActions []any // Can be Command or CodeAction
 
-	// Example: Return empty list for now
-	return []any{}, nil
+	// Get current file content for potential edits
+	s.filesMu.RLock()
+	// fileData variable removed as it wasn't used
+	_, ok := s.files[uri]
+	s.filesMu.RUnlock()
+	if !ok {
+		actionLogger.Warn("CodeAction request for unknown file")
+		return nil, nil // Return empty list if file not found
+	}
+
+	// Iterate through diagnostics provided in the context
+	for _, diag := range params.Context.Diagnostics {
+		actionLogger.Debug("Considering diagnostic for code action", "diagnostic_code", diag.Code, "diagnostic_source", diag.Source, "diagnostic_message", diag.Message)
+
+		// Example: Offer a quick fix for unresolved identifiers
+		if diag.Source == "deepcomplete-analyzer" && diag.Code == "unresolved-identifier" {
+			// TODO: Implement actual fix logic (e.g., suggest imports, create variable)
+			action := CodeAction{
+				Title:       fmt.Sprintf("Placeholder: Fix unresolved identifier '%s'", diag.Message[len("unresolved identifier: "):]),
+				Kind:        CodeActionKindQuickFix,
+				Diagnostics: []LspDiagnostic{diag},
+			}
+			codeActions = append(codeActions, action)
+			actionLogger.Debug("Added placeholder quickfix for unresolved identifier")
+		}
+		// Example: Offer quick fix for basic unused variable check
+		if diag.Source == "deepcomplete-analyzer" && diag.Code == "unused-variable" {
+			var varName string
+			parts := strings.SplitN(diag.Message, "'", 3)
+			if len(parts) == 3 {
+				varName = parts[1]
+			}
+
+			actionTitle := "Remove unused variable"
+			if varName != "" {
+				actionTitle = fmt.Sprintf("Remove unused variable '%s'", varName)
+			}
+
+			// Create a simple edit to remove the diagnostic range (basic removal)
+			fixEdit := &WorkspaceEdit{
+				Changes: map[DocumentURI][]TextEdit{
+					uri: {{Range: diag.Range, NewText: ""}},
+				},
+			}
+
+			action := CodeAction{
+				Title:       actionTitle,
+				Kind:        CodeActionKindQuickFix,
+				Diagnostics: []LspDiagnostic{diag},
+				Edit:        fixEdit,
+				IsPreferred: true, // Mark as preferred fix
+			}
+			codeActions = append(codeActions, action)
+			actionLogger.Debug("Added quickfix for unused variable")
+		}
+		// Add more checks for other diagnostic codes/sources here
+	}
+
+	if len(codeActions) == 0 {
+		actionLogger.Debug("No code actions generated for the given context")
+		return nil, nil
+	}
+
+	actionLogger.Info("Returning code actions", "count", len(codeActions))
+	return codeActions, nil
+}
+
+// handleSignatureHelp handles the 'textDocument/signatureHelp' request.
+// Currently a stub.
+func (s *Server) handleSignatureHelp(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params SignatureHelpParams, logger *slog.Logger) (any, error) {
+	uri := params.TextDocument.URI
+	lspPos := params.Position
+	sigLogger := logger.With("uri", uri, "lsp_line", lspPos.Line, "lsp_char", lspPos.Character, "req_id", req.ID)
+	sigLogger.Info("Handling textDocument/signatureHelp (stub)")
+
+	// TODO: Implement signature help logic
+	// 1. Get file content
+	// 2. Convert position
+	// 3. Analyze using analyzer to find enclosing CallExpr and its signature
+	// 4. Determine active parameter based on cursor position within args
+	// 5. Format signature information into SignatureHelp struct
+
+	// Return nil for now to indicate no signature help is available
+	return nil, nil
 }

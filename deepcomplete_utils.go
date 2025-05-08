@@ -996,21 +996,16 @@ func calculateCursorPos(file *token.File, line, col int, logger *slog.Logger) (t
 // Stream Processing Helpers
 // ============================================================================
 
-// Precompile regex for cleaning markdown code fences
+// Precompile regex for cleaning markdown code fences and FIM tokens
 var mdCodeFenceRegex = regexp.MustCompile("(?m)^```(?:go)?\n|```$")
+var fimTokenRegex = regexp.MustCompile(fmt.Sprintf("%s|%s|%s|%s", regexp.QuoteMeta(FimPrefixToken), regexp.QuoteMeta(FimMiddleToken), regexp.QuoteMeta(FimSuffixToken), regexp.QuoteMeta(FimEOTToken)))
 
 // cleanLLMOutput removes FIM tokens and markdown code fences.
 func cleanLLMOutput(rawOutput string) string {
-	cleaned := rawOutput
-	// Remove FIM tokens
-	cleaned = strings.ReplaceAll(cleaned, FimPrefixToken, "")
-	cleaned = strings.ReplaceAll(cleaned, FimMiddleToken, "")
-	cleaned = strings.ReplaceAll(cleaned, FimSuffixToken, "")
-	cleaned = strings.ReplaceAll(cleaned, FimEOTToken, "") // Remove EOT token as well
-
-	// Remove markdown code fences (```go or ```)
-	cleaned = mdCodeFenceRegex.ReplaceAllString(cleaned, "")
-
+	// Remove markdown code fences first
+	cleaned := mdCodeFenceRegex.ReplaceAllString(rawOutput, "")
+	// Then remove FIM tokens
+	cleaned = fimTokenRegex.ReplaceAllString(cleaned, "")
 	// Trim leading/trailing whitespace that might remain
 	return strings.TrimSpace(cleaned)
 }
@@ -1169,6 +1164,7 @@ func findEnclosingFuncBody(content []byte, offset int) (string, bool) {
 foundEnd:
 
 	if funcBodyEndOffset != -1 && funcBodyEndOffset >= funcBodyStartOffset {
+		// Ensure the cursor offset is actually within this found function body
 		if offset >= funcBodyStartOffset && offset <= funcBodyEndOffset {
 			return string(content[funcBodyStartOffset:funcBodyEndOffset]), true
 		}

@@ -37,6 +37,10 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 		},
 		HoverProvider:      true,
 		DefinitionProvider: true,
+		SignatureHelpProvider: &SignatureHelpOptions{ // Added SignatureHelp capability (Cycle N+9)
+			TriggerCharacters: []string{"(", ","},
+			// RetriggerCharacters: []string{}, // Optional
+		},
 		CodeActionProvider: &CodeActionOptions{
 			CodeActionKinds: []CodeActionKind{
 				CodeActionKindQuickFix,
@@ -71,7 +75,6 @@ func (s *Server) handleExit(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 	logger.Info("Handling exit notification")
 	if s.conn != nil {
 		// Use a short timeout for closing the connection gracefully
-		// closeCtx variable removed as it wasn't used. The timeout is implicitly handled by the context passed to Close.
 		_, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel() // Ensure cancel is called eventually
 		if err := s.conn.Close(); err != nil {

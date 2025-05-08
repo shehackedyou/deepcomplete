@@ -14,6 +14,9 @@ import (
 	"github.com/shehackedyou/deepcomplete"
 )
 
+// Set at build time
+var version = "dev"
+
 func main() {
 	// --- Flag Definitions ---
 	filePath := flag.String("file", "", "Path to the Go file (required unless -stdin is used)")
@@ -60,7 +63,7 @@ func main() {
 		logLevel = slog.LevelInfo // Default to Info
 	}
 
-	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false}
+	handlerOpts := slog.HandlerOptions{Level: logLevel, AddSource: false} // Keep CLI logs concise
 	finalLogger := slog.New(slog.NewTextHandler(os.Stderr, &handlerOpts))
 	slog.SetDefault(finalLogger) // Set as default
 
@@ -128,7 +131,7 @@ func main() {
 		fmt.Print(completion) // Print result directly to stdout
 
 	} else {
-		slog.Info("Getting completion from file", "path", *filePath, "line", *line, "col", *col)
+		slog.Info("Getting completion from file context", "path", *filePath, "line", *line, "col", *col) // More descriptive log
 
 		dummyVersion := 0 // CLI doesn't track versions
 		// GetCompletionStreamFromFile uses the logger configured in the completer

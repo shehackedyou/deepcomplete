@@ -126,16 +126,15 @@ func getDefaultConfig() Config {
 		MaxPreambleLen:        2048,
 		MaxSnippetLen:         2048,
 		MemoryCacheTTLSeconds: defaultMemoryCacheTTLSecs,
-		MemoryCacheTTL:        ttl, // Set derived duration
+		MemoryCacheTTL:        ttl,
 	}
 }
 
 // Validate checks if configuration values are valid, applying defaults for some fields.
-// It uses the provided logger to report warnings about applied defaults.
 func (c *Config) Validate(logger *stdslog.Logger) error {
 	var validationErrors []error
 	if logger == nil {
-		logger = stdslog.Default() // Use default if nil
+		logger = stdslog.Default()
 	}
 	tempDefault := getDefaultConfig()
 
@@ -173,7 +172,7 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		logger.Warn("Config validation: memory_cache_ttl_seconds is not positive, applying default.", "configured_value", c.MemoryCacheTTLSeconds, "default", tempDefault.MemoryCacheTTLSeconds)
 		c.MemoryCacheTTLSeconds = tempDefault.MemoryCacheTTLSeconds
 	}
-	// Derive the time.Duration from the seconds value
+	// Derive the time.Duration from the seconds value after validation/defaulting
 	c.MemoryCacheTTL = time.Duration(c.MemoryCacheTTLSeconds) * time.Second
 
 	if c.LogLevel == "" {
@@ -239,6 +238,7 @@ type Diagnostic struct {
 
 // AstContextInfo holds structured information extracted from code analysis.
 // This structure is populated by the Analyzer and used by the PreambleFormatter and LSP handlers.
+// TODO: Gradually phase out direct usage in favor of specific info structs.
 type AstContextInfo struct {
 	FilePath           string                  // Absolute path to the analyzed file.
 	Version            int                     // Document version (for LSP).
@@ -272,7 +272,6 @@ type AstContextInfo struct {
 }
 
 // IdentifierInfo holds information specifically about an identifier found at a position.
-// Moved here in Cycle N+1.
 type IdentifierInfo struct {
 	Name       string            // Identifier name
 	Object     types.Object      // Resolved object (var, func, type, etc.)
@@ -283,6 +282,19 @@ type IdentifierInfo struct {
 	Pkg        *packages.Package // Package containing the definition (might be different from requesting file's package)
 	Content    []byte            // Content of the file where the identifier was found (needed for range conversion)
 	IdentNode  *ast.Ident        // The *ast.Ident node itself for range calculation
+}
+
+// EnclosingContextInfo holds information about the enclosing function/method/block.
+type EnclosingContextInfo struct {
+	Func     *types.Func    // Type info for the enclosing function/method.
+	FuncNode *ast.FuncDecl  // AST node for the enclosing function/method.
+	Receiver string         // Formatted receiver type string if it's a method.
+	Block    *ast.BlockStmt // Innermost block statement containing the cursor.
+}
+
+// ScopeInfo holds variables/types available in the scope at a position.
+type ScopeInfo struct {
+	Variables map[string]types.Object // Map of identifiers (vars, consts, types, funcs) in scope.
 }
 
 // =============================================================================

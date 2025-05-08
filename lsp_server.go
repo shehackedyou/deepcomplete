@@ -216,13 +216,21 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		}
 		return s.handleDefinition(ctx, conn, req, params, methodLogger)
 
-	case "textDocument/codeAction": // Added routing for CodeAction
+	case "textDocument/signatureHelp": // Added routing (Cycle N+9)
+		var params SignatureHelpParams
+		if err := unmarshalParams(&params); err != nil {
+			methodLogger.Error("Failed to unmarshal signatureHelp params", "error", err)
+			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid signatureHelp params: %v", err)}
+		}
+		return s.handleSignatureHelp(ctx, conn, req, params, methodLogger)
+
+	case "textDocument/codeAction":
 		var params CodeActionParams
 		if err := unmarshalParams(&params); err != nil {
 			methodLogger.Error("Failed to unmarshal codeAction params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid codeAction params: %v", err)}
 		}
-		return s.handleCodeAction(ctx, conn, req, params, methodLogger) // Handler defined in lsp_handlers_textdocument.go
+		return s.handleCodeAction(ctx, conn, req, params, methodLogger)
 
 	case "workspace/didChangeConfiguration":
 		var params DidChangeConfigurationParams
@@ -249,7 +257,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			return nil, nil
 		}
 
-		s.requestTracker.Cancel(cancelID) // Use tracker to cancel
+		s.requestTracker.Cancel(cancelID)
 		methodLogger.Info("Cancellation request processed", "cancelled_id", cancelID)
 		return nil, nil
 
@@ -313,7 +321,8 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 	analysisCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, version, 1, 1)
+	// Use the main Analyze method for now to get diagnostics
+	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, version, 1, 1) // Use placeholder line/col
 	diagLogger.Info("Analysis for diagnostics completed", "duration", time.Since(analysisStart))
 
 	// --- Check if file version changed during analysis ---
