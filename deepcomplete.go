@@ -343,9 +343,6 @@ type GoPackagesAnalyzer struct {
 
 // NewGoPackagesAnalyzer initializes the analyzer, including setting up bbolt and ristretto caches.
 func NewGoPackagesAnalyzer(logger *stdslog.Logger) *GoPackagesAnalyzer {
-	// Note: We don't have the config here. The config should ideally be passed in,
-	// or the TTL needs to be managed differently. For now, cache uses a constant TTL.
-	// A better approach might be to have the DeepCompleter pass the TTL to SetMemoryCache.
 	if logger == nil {
 		logger = stdslog.Default()
 	}
@@ -406,7 +403,7 @@ func NewGoPackagesAnalyzer(logger *stdslog.Logger) *GoPackagesAnalyzer {
 		db:          db,
 		memoryCache: memCache,
 		logger:      analyzerLogger,
-		// config: config, // TODO: Pass config if needed for TTL or other settings
+		config:      getDefaultConfig(), // Initialize with default config for now
 	}
 }
 
@@ -438,15 +435,11 @@ func (a *GoPackagesAnalyzer) Close() error {
 }
 
 // loadPackageForAnalysis handles the core logic of loading package data.
-// This is extracted from the Analyze method for better modularity.
 func (a *GoPackagesAnalyzer) loadPackageForAnalysis(ctx context.Context, absFilename string, fset *token.FileSet, logger *slog.Logger) (*packages.Package, *ast.File, *token.File, []Diagnostic, []error) {
-	// This function reuses the logic previously in loadPackageAndFile
-	// It's kept internal to GoPackagesAnalyzer for now.
 	return loadPackageAndFile(ctx, absFilename, fset, logger)
 }
 
 // Analyze performs code analysis for a given file and position, utilizing caching.
-// Returns the populated AstContextInfo and any fatal error encountered.
 func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, version int, line, col int) (info *AstContextInfo, analysisErr error) {
 	analysisLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "Analyze")
 
@@ -470,12 +463,10 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				analysisErr = fmt.Errorf("panic (%v) occurred after error: %w", r, analysisErr)
 			}
 		}
-		// Consolidate non-fatal errors into ErrAnalysisFailed
 		if len(info.AnalysisErrors) > 0 && analysisErr == nil {
 			finalErr := errors.Join(info.AnalysisErrors...)
 			analysisErr = fmt.Errorf("%w: %w", ErrAnalysisFailed, finalErr)
 		} else if len(info.AnalysisErrors) > 0 && analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) {
-			// If a fatal error occurred AND non-fatal errors, wrap them
 			finalErr := errors.Join(info.AnalysisErrors...)
 			analysisErr = fmt.Errorf("%w (additional analysis issues: %w)", analysisErr, finalErr)
 		}
@@ -491,17 +482,16 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 
 	// --- Bbolt Cache Check (for preamble) ---
 	if a.db != nil {
-		// ... (bbolt cache check logic remains the same) ...
 		readStart := time.Now()
 		dbViewErr := a.db.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(cacheBucketName)
 			if b == nil {
 				return nil
-			} // Bucket not found is not an error
+			}
 			valBytes := b.Get(cacheKey)
 			if valBytes == nil {
 				return nil
-			} // Cache miss
+			}
 
 			var decoded CachedAnalysisEntry
 			if err := gob.NewDecoder(bytes.NewReader(valBytes)).Decode(&decoded); err != nil {
@@ -525,7 +515,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		analysisLogger.Debug("Bbolt cache read attempt finished", "duration", time.Since(readStart))
 
 		if cachedEntry != nil {
-			// ... (bbolt cache validation logic remains the same) ...
 			validationStart := time.Now()
 			currentHashes, hashErr := calculateInputHashes(dir, nil, analysisLogger)
 			if hashErr == nil && cachedEntry.GoModHash == goModHash && compareFileHashes(currentHashes, cachedEntry.InputFileHashes, analysisLogger) {
@@ -534,11 +523,10 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				if decodeErr := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob)).Decode(&analysisData); decodeErr == nil {
 					info.PackageName = analysisData.PackageName
 					info.PromptPreamble = analysisData.PromptPreamble
-					cacheHit = true // Preamble cache hit
+					cacheHit = true
 					loadDuration = time.Since(decodeStart)
 					analysisLogger.Debug("Preamble successfully decoded from bbolt cache.", "duration", loadDuration)
-					analysisLogger.Debug("Re-running load/analysis steps for diagnostics/hover despite cache hit for preamble.")
-					cacheHit = false // Force re-analysis for other parts by resetting cacheHit flag for the *full* analysis
+					cacheHit = false // Force re-analysis for other parts
 				} else {
 					analysisLogger.Warn("Failed to gob-decode cached analysis data. Treating as miss.", "error", decodeErr)
 					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr), analysisLogger)
@@ -564,19 +552,16 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	loadStart := time.Now()
 	fset := token.NewFileSet()
 	info.TargetFileSet = fset
-	// Use the extracted helper method
 	targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, analysisLogger)
 	info.Diagnostics = append(info.Diagnostics, loadDiagnostics...)
 	loadDuration = time.Since(loadStart)
 	analysisLogger.Debug("Package loading completed", "duration", loadDuration)
 	for _, loadErr := range loadErrors {
-		addAnalysisError(info, loadErr, analysisLogger) // Add non-fatal load errors
+		addAnalysisError(info, loadErr, analysisLogger)
 	}
-	// Check for critical load failure
 	if len(loadErrors) > 0 && targetPkg == nil {
-		// analysisErr will be set by the defer func based on info.AnalysisErrors
 		analysisLogger.Error("Critical package load error occurred.")
-		return info, analysisErr // Return early if package load failed critically
+		return info, analysisErr // analysisErr set by defer
 	}
 	info.TargetPackage = targetPkg
 	info.TargetAstFile = targetFileAST
@@ -585,20 +570,15 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	// --- Perform Analysis Steps (using loaded info) ---
 	stepsStart := time.Now()
 	if targetFile != nil {
-		// Pass the potentially loaded AST and package info to analysis steps
 		analyzeStepErr := performAnalysisSteps(ctx, targetFile, targetFileAST, targetPkg, fset, line, col, a, info, analysisLogger)
 		if analyzeStepErr != nil {
-			// This error is likely a fatal cursor error from performAnalysisSteps
 			analysisLogger.Error("Fatal error during performAnalysisSteps", "error", analyzeStepErr)
-			// analysisErr will be set by the defer func
-			return info, analyzeStepErr // Return the fatal error
+			return info, analyzeStepErr // Return fatal error
 		}
 	} else {
-		// Handle case where targetFile is nil (should be less likely now with earlier check)
-		if len(loadErrors) == 0 { // Only log if no previous load error explains it
+		if len(loadErrors) == 0 {
 			addAnalysisError(info, errors.New("cannot perform analysis steps: target token.File is nil"), analysisLogger)
 		}
-		// Attempt to gather package scope even if file-specific analysis fails
 		gatherScopeContext(ctx, nil, targetPkg, fset, info, analysisLogger)
 	}
 	stepsDuration = time.Since(stepsStart)
@@ -632,8 +612,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	// --- End Construct Preamble ---
 
 	// --- Bbolt Cache Write (if preamble was generated) ---
-	// Save preamble to cache only if it was *just* generated (not from cache hit)
-	// and no critical load errors occurred.
 	shouldSave := a.db != nil && info.PromptPreamble != "" && !cacheHit && len(loadErrors) == 0
 	if shouldSave {
 		// ... (bbolt cache write logic remains the same) ...
@@ -641,16 +619,11 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		saveStart := time.Now()
 		inputHashes, hashErr := calculateInputHashes(dir, targetPkg, analysisLogger)
 		if hashErr == nil {
-			analysisDataToCache := CachedAnalysisData{
-				PackageName:    info.PackageName,
-				PromptPreamble: info.PromptPreamble,
-			}
+			analysisDataToCache := CachedAnalysisData{PackageName: info.PackageName, PromptPreamble: info.PromptPreamble}
 			var gobBuf bytes.Buffer
 			if encodeErr := gob.NewEncoder(&gobBuf).Encode(&analysisDataToCache); encodeErr == nil {
 				analysisGob := gobBuf.Bytes()
-				entryToSave := CachedAnalysisEntry{
-					SchemaVersion: cacheSchemaVersion, GoModHash: goModHash, InputFileHashes: inputHashes, AnalysisGob: analysisGob,
-				}
+				entryToSave := CachedAnalysisEntry{SchemaVersion: cacheSchemaVersion, GoModHash: goModHash, InputFileHashes: inputHashes, AnalysisGob: analysisGob}
 				var entryBuf bytes.Buffer
 				if entryEncodeErr := gob.NewEncoder(&entryBuf).Encode(&entryToSave); entryEncodeErr == nil {
 					encodedBytes := entryBuf.Bytes()
@@ -693,48 +666,35 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 }
 
 // GetIdentifierInfo implements the Analyzer interface method.
-// It focuses on finding the identifier at the cursor and its related type/definition info.
 func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename string, version int, line, col int) (*IdentifierInfo, error) {
 	opLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "GetIdentifierInfo")
 	opLogger.Info("Starting identifier analysis")
 
-	// 1. Load Package and File AST (uses bbolt cache internally if configured)
 	fset := token.NewFileSet()
-	// Use internal helper
 	targetPkg, targetFileAST, targetFile, _, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, opLogger)
 
-	// Check for critical load errors
-	if targetPkg == nil { // Critical failure if package couldn't be determined
-		combinedErr := errors.Join(loadErrors...) // Combine any errors reported
+	if targetPkg == nil {
+		combinedErr := errors.Join(loadErrors...)
 		opLogger.Error("Critical error loading package, cannot get identifier info", "error", combinedErr)
-		// Wrap the error for clarity
 		return nil, fmt.Errorf("critical package load error: %w", combinedErr)
 	}
-	// Check if the specific file AST or token file is missing, even if package loaded
 	if targetFile == nil || targetFileAST == nil {
 		opLogger.Error("Target file AST or token.File is nil after loading, cannot get identifier info", "targetFile_nil", targetFile == nil, "targetAST_nil", targetFileAST == nil)
-		// Combine load errors with this specific issue
 		return nil, errors.Join(append(loadErrors, errors.New("target file AST or token.File is nil"))...)
 	}
-	// Check for missing type info, which is non-critical but limits results
 	if targetPkg.TypesInfo == nil {
 		opLogger.Warn("Type info is nil, identifier resolution might fail")
-		// Proceed, but hover/definition might be incomplete
 	}
 
-	// 2. Calculate Cursor Position
 	cursorPos, posErr := calculateCursorPos(targetFile, line, col, opLogger)
 	if posErr != nil {
-		// Wrap position calculation error
 		return nil, fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
 	}
 	if !cursorPos.IsValid() {
-		// Should be caught by calculateCursorPos, but double-check
 		return nil, fmt.Errorf("%w: invalid cursor position calculated (Pos: %d)", ErrPositionConversion, cursorPos)
 	}
 	opLogger = opLogger.With("cursorPos", cursorPos, "cursorPosStr", fset.PositionFor(cursorPos, true).String())
 
-	// 3. Find Path and Context Nodes (using helpers, potentially cached)
 	tempInfo := &AstContextInfo{
 		FilePath:       absFilename,
 		Version:        version,
@@ -742,30 +702,27 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 		TargetPackage:  targetPkg,
 		TargetFileSet:  fset,
 		TargetAstFile:  targetFileAST,
-		AnalysisErrors: make([]error, 0), // Initialize to capture non-fatal errors
+		AnalysisErrors: make([]error, 0),
 	}
 
 	path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
 	if pathErr != nil {
 		opLogger.Warn("Error finding enclosing path", "error", pathErr)
-		// Add non-fatal error and continue if possible
 		addAnalysisError(tempInfo, fmt.Errorf("finding enclosing path failed: %w", pathErr), opLogger)
 	}
-	// findContextNodes populates tempInfo.Identifier*, DefNode etc.
 	findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger)
 
-	// Log any non-fatal errors accumulated during context node finding
 	if len(tempInfo.AnalysisErrors) > 0 {
 		opLogger.Warn("Non-fatal errors during context node finding", "errors", errors.Join(tempInfo.AnalysisErrors...))
+		// Optionally wrap non-fatal errors if the caller should be aware
+		// return nil, fmt.Errorf("%w: %w", ErrAnalysisFailed, errors.Join(tempInfo.AnalysisErrors...))
 	}
 
-	// 4. Extract and Return Identifier Information
 	if tempInfo.IdentifierAtCursor == nil || tempInfo.IdentifierObject == nil {
 		opLogger.Debug("No identifier object found at cursor position")
-		return nil, nil // Not finding an identifier isn't an error
+		return nil, nil
 	}
 
-	// Read file content needed for range conversion later
 	fileContent, readErr := os.ReadFile(absFilename)
 	if readErr != nil {
 		opLogger.Error("Failed to read file content for identifier info", "error", readErr)
@@ -788,7 +745,6 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	}
 
 	opLogger.Info("Identifier info retrieved successfully", "identifier", identInfo.Name)
-	// Return found info. Non-fatal errors during analysis are logged but don't cause this specific function to fail.
 	return identInfo, nil
 }
 
@@ -1117,6 +1073,11 @@ func (dc *DeepCompleter) GetCurrentConfig() Config {
 		cfgCopy.Stop = stopsCopy
 	}
 	return cfgCopy
+}
+
+// Client returns the LLMClient instance. Added for Cycle N+5.
+func (dc *DeepCompleter) Client() LLMClient {
+	return dc.client
 }
 
 // InvalidateAnalyzerCache provides external access to invalidate the analyzer's disk cache.
