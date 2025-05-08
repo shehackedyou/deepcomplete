@@ -231,7 +231,8 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		s.clientCaps.TextDocument.Completion.CompletionItem != nil &&
 		s.clientCaps.TextDocument.Completion.CompletionItem.SnippetSupport {
 		insertTextFormat = SnippetFormat
-		insertText = completionText
+		// Basic snippet: just add a final tab stop
+		insertText = completionText + "${0}"
 		completionLogger.Debug("Using Snippet format for completion item")
 	} else {
 		completionLogger.Debug("Using PlainText format for completion item")
@@ -239,15 +240,15 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	// --- Create Completion Item ---
 	item := CompletionItem{
-		Label:            strings.Split(completionText, "\n")[0],
-		InsertText:       insertText,
+		Label:            strings.Split(completionText, "\n")[0], // Use first line as label
+		InsertText:       insertText,                             // Use plain text or basic snippet
 		InsertTextFormat: insertTextFormat,
-		Kind:             completionKind,
-		Detail:           "DeepComplete Suggestion",
+		Kind:             completionKind,            // Use determined or default kind
+		Detail:           "DeepComplete Suggestion", // Basic detail
 	}
 
 	return CompletionList{
-		IsIncomplete: false,
+		IsIncomplete: false, // Mark as complete
 		Items:        []CompletionItem{item},
 	}, nil
 }

@@ -57,7 +57,8 @@ func NewServer(completer *DeepCompleter, logger *slog.Logger, version string) *S
 			Name:    "DeepComplete LSP",
 			Version: version,
 		},
-		requestTracker: NewRequestTracker(),
+		// Initialize tracker with the server's logger
+		requestTracker: NewRequestTracker(logger),
 	}
 	publishExpvarMetrics(s) // Publish metrics on startup
 	return s
@@ -123,14 +124,18 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 
 	// Request Cancellation Handling
 	if isRequest {
+		// Add request to tracker *before* potentially blocking/long operations
 		s.requestTracker.Add(req.ID, ctx)
+		// Ensure removal happens even if the handler panics (hence the defer)
 		defer s.requestTracker.Remove(req.ID)
-	}
-	select {
-	case <-ctx.Done():
-		methodLogger.Warn("Request context cancelled before processing started", "error", ctx.Err())
-		return nil, &jsonrpc2.Error{Code: int64(JsonRpcRequestCancelled), Message: "Request cancelled"}
-	default: // Continue processing
+
+		// Check for cancellation *before* starting work
+		select {
+		case <-ctx.Done():
+			methodLogger.Warn("Request context cancelled before processing started", "error", ctx.Err())
+			return nil, &jsonrpc2.Error{Code: int64(JsonRpcRequestCancelled), Message: "Request cancelled"}
+		default: // Continue processing
+		}
 	}
 
 	// Helper to unmarshal params
@@ -151,7 +156,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		}
 		s.clientCaps = params.Capabilities
 		s.initParams = &params
-		return s.handleInitialize(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleInitialize(ctx, conn, req, params, methodLogger)
 
 	case "initialized":
 		methodLogger.Info("Client initialized notification received")
@@ -159,35 +164,35 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 
 	case "shutdown":
 		methodLogger.Info("Shutdown request received")
-		return s.handleShutdown(ctx, conn, req, methodLogger) // Pass method-specific logger
+		return s.handleShutdown(ctx, conn, req, methodLogger)
 
 	case "exit":
 		methodLogger.Info("Exit notification received")
-		return s.handleExit(ctx, conn, req, methodLogger) // Pass method-specific logger
+		return s.handleExit(ctx, conn, req, methodLogger)
 
 	case "textDocument/didOpen":
 		var params DidOpenTextDocumentParams
 		if err := unmarshalParams(&params); err != nil {
 			methodLogger.Error("Failed to unmarshal didOpen params", "error", err)
-			return nil, nil // Ignore notification errors
+			return nil, nil
 		}
-		return s.handleDidOpen(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleDidOpen(ctx, conn, req, params, methodLogger)
 
 	case "textDocument/didChange":
 		var params DidChangeTextDocumentParams
 		if err := unmarshalParams(&params); err != nil {
 			methodLogger.Error("Failed to unmarshal didChange params", "error", err)
-			return nil, nil // Ignore notification errors
+			return nil, nil
 		}
-		return s.handleDidChange(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleDidChange(ctx, conn, req, params, methodLogger)
 
 	case "textDocument/didClose":
 		var params DidCloseTextDocumentParams
 		if err := unmarshalParams(&params); err != nil {
 			methodLogger.Error("Failed to unmarshal didClose params", "error", err)
-			return nil, nil // Ignore notification errors
+			return nil, nil
 		}
-		return s.handleDidClose(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleDidClose(ctx, conn, req, params, methodLogger)
 
 	case "textDocument/completion":
 		var params CompletionParams
@@ -195,7 +200,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal completion params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid completion params: %v", err)}
 		}
-		return s.handleCompletion(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleCompletion(ctx, conn, req, params, methodLogger)
 
 	case "textDocument/hover":
 		var params HoverParams
@@ -203,7 +208,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal hover params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid hover params: %v", err)}
 		}
-		return s.handleHover(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleHover(ctx, conn, req, params, methodLogger)
 
 	case "textDocument/definition":
 		var params DefinitionParams
@@ -211,15 +216,15 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal definition params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid definition params: %v", err)}
 		}
-		return s.handleDefinition(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleDefinition(ctx, conn, req, params, methodLogger)
 
 	case "workspace/didChangeConfiguration":
 		var params DidChangeConfigurationParams
 		if err := unmarshalParams(&params); err != nil {
 			methodLogger.Error("Failed to unmarshal didChangeConfiguration params", "error", err)
-			return nil, nil // Ignore notification errors
+			return nil, nil
 		}
-		return s.handleDidChangeConfiguration(ctx, conn, req, params, methodLogger) // Pass method-specific logger
+		return s.handleDidChangeConfiguration(ctx, conn, req, params, methodLogger)
 
 	case "$/cancelRequest":
 		var params CancelParams
@@ -238,7 +243,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			return nil, nil
 		}
 
-		s.requestTracker.Cancel(cancelID)
+		s.requestTracker.Cancel(cancelID) // Use tracker to cancel
 		methodLogger.Info("Cancellation request processed", "cancelled_id", cancelID)
 		return nil, nil
 
@@ -297,12 +302,24 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 	}
 	diagLogger := logger.With("uri", uri, "version", version, "absPath", absPath, "operation", "triggerDiagnostics")
 	diagLogger.Info("Triggering background analysis for diagnostics")
+	analysisStart := time.Now()
 
 	analysisCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Analyzer uses its own internal logger
 	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, version, 1, 1) // Use placeholder line/col
+	diagLogger.Info("Analysis for diagnostics completed", "duration", time.Since(analysisStart))
+
+	// --- Check if file version changed during analysis ---
+	s.filesMu.RLock()
+	currentFile, exists := s.files[uri]
+	s.filesMu.RUnlock()
+	if !exists || currentFile.Version != version {
+		diagLogger.Warn("Skipping diagnostic publishing; file version changed during analysis", "analysis_version", version, "current_version", currentFile.Version)
+		return
+	}
+	// --- End Version Check ---
 
 	lspDiagnostics := []LspDiagnostic{}
 	if analysisInfo != nil && len(analysisInfo.Diagnostics) > 0 {
@@ -334,6 +351,7 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 		diagLogger.Warn("Analysis for diagnostics completed with non-fatal errors", "error", analysisErr)
 	}
 
+	// Publish diagnostics for the correct version
 	s.publishDiagnostics(uri, &version, lspDiagnostics, diagLogger) // Pass logger
 }
 
@@ -511,21 +529,24 @@ func publishExpvarMetrics(s *Server) {
 type RequestTracker struct {
 	mu       sync.Mutex
 	requests map[jsonrpc2.ID]context.CancelFunc
-	logger   *slog.Logger // Add logger to tracker
+	logger   *slog.Logger // Use logger passed during creation
 }
 
 // NewRequestTracker creates a new tracker.
-func NewRequestTracker() *RequestTracker {
-	logger := slog.Default().With("component", "RequestTracker")
+func NewRequestTracker(logger *slog.Logger) *RequestTracker {
+	if logger == nil {
+		logger = slog.Default() // Fallback
+	}
 	return &RequestTracker{
 		requests: make(map[jsonrpc2.ID]context.CancelFunc),
-		logger:   logger,
+		logger:   logger.With("component", "RequestTracker"), // Add component context
 	}
 }
 
 // Add registers a request ID and its associated context's cancel function.
 func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 	if id == (jsonrpc2.ID{}) {
+		rt.logger.Debug("Ignoring attempt to track notification (no ID)")
 		return
 	}
 	rt.mu.Lock()
@@ -534,16 +555,25 @@ func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 		rt.logger.Warn("Attempted to add already tracked request ID", "id", id)
 		return
 	}
-	reqCtx, cancel := context.WithCancel(context.Background()) // Create derived context
+	// Create a new context that can be cancelled independently
+	// Note: We don't link it to the parent `ctx` here because cancellation
+	// should primarily be triggered by the $/cancelRequest notification.
+	// The parent `ctx` cancellation is checked *before* calling the handler.
+	reqCtx, cancel := context.WithCancel(context.Background())
 	rt.requests[id] = cancel
 	rt.logger.Debug("Added request to tracker", "id", id)
+
+	// Optional: Monitor the original context in case the client disconnects
+	// or the parent context gets cancelled for other reasons.
 	go func() {
 		select {
 		case <-ctx.Done():
-			rt.logger.Debug("Original context done, cancelling tracked request", "id", id, "reason", ctx.Err())
-			cancel()
-			rt.Remove(id) // Clean up tracker entry
+			rt.logger.Warn("Original request context done, ensuring tracked request is cancelled", "id", id, "reason", ctx.Err())
+			rt.Cancel(id) // Attempt to cancel via the tracker
+			rt.Remove(id) // Clean up immediately
 		case <-reqCtx.Done():
+			// This means the derived context was cancelled, likely by rt.Cancel or rt.Remove.
+			// No action needed here, just log for debugging.
 			rt.logger.Debug("Tracked request context cancelled", "id", id)
 		}
 	}()
@@ -552,16 +582,17 @@ func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 // Remove deregisters a request ID. Should be called when a request handler finishes.
 func (rt *RequestTracker) Remove(id jsonrpc2.ID) {
 	if id == (jsonrpc2.ID{}) {
-		return
+		return // Ignore notifications
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if cancel, ok := rt.requests[id]; ok {
 		rt.logger.Debug("Removing request from tracker", "id", id)
-		cancel()
+		cancel() // Ensure cancellation function is called
 		delete(rt.requests, id)
 	} else {
-		rt.logger.Debug("Attempted to remove untracked request ID", "id", id)
+		// This might happen if cancellation happened concurrently
+		rt.logger.Debug("Attempted to remove request ID not found in tracker", "id", id)
 	}
 }
 
@@ -573,13 +604,15 @@ func (rt *RequestTracker) Cancel(id jsonrpc2.ID) {
 	}
 	rt.mu.Lock()
 	cancel, found := rt.requests[id]
+	// It's okay to leave the entry in the map here;
+	// the goroutine in Add or the defer in handle will eventually call Remove.
 	rt.mu.Unlock()
 
 	if found {
-		rt.logger.Info("Calling cancel function for request", "id", id)
-		cancel()
+		rt.logger.Info("Calling cancel function for request via $/cancelRequest", "id", id)
+		cancel() // Trigger cancellation
 	} else {
-		rt.logger.Debug("Cancel function not found for request ID", "id", id)
+		rt.logger.Debug("Cancel function not found for request ID (already removed or never added?)", "id", id)
 	}
 }
 
