@@ -1,6 +1,6 @@
 // deepcomplete/lsp_handlers_textdocument.go
 // Contains LSP method handlers related to text document synchronization and language features
-// (didOpen, didChange, didClose, completion, hover, definition).
+// (didOpen, didChange, didClose, completion, hover, definition, codeAction).
 package deepcomplete
 
 import (
@@ -209,12 +209,11 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	if currentConfig.UseAst {
 		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second)
 		defer cancelAnalysis()
-		// Use GetIdentifierInfo for potentially faster kind determination
 		identInfo, kindAnalysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
 		if kindAnalysisErr != nil {
 			completionLogger.Warn("Analysis for completion kind failed, using default kind", "error", kindAnalysisErr)
-		} else if identInfo != nil && identInfo.Object != nil { // Check if identifier was found
-			completionKind = mapTypeToCompletionKind(identInfo.Object) // Use refined mapping
+		} else if identInfo != nil && identInfo.Object != nil {
+			completionKind = mapTypeToCompletionKind(identInfo.Object)
 			completionLogger.Debug("Determined completion kind from analysis", "kind", completionKind, "identifier", identInfo.Name)
 		} else {
 			completionLogger.Debug("No specific identifier found at cursor for kind mapping, using default.")
@@ -312,13 +311,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	}
 
 	// Format hover content using the retrieved IdentifierInfo
-	// Create a minimal AstContextInfo shell needed by formatObjectForHover
-	tempAstInfo := &AstContextInfo{
-		TargetPackage:     identInfo.Pkg,
-		TargetFileSet:     identInfo.FileSet,
-		IdentifierDefNode: identInfo.DefNode,
-	}
-	hoverContent := formatObjectForHover(identInfo.Object, tempAstInfo, hoverLogger)
+	hoverContent := formatObjectForHover(identInfo, hoverLogger) // Pass IdentifierInfo
 	if hoverContent == "" {
 		hoverLogger.Debug("No hover content generated for identifier", "identifier", identInfo.Name)
 		return nil, nil
@@ -423,12 +416,12 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	// Read content of the definition file only if needed for conversion
 	var defFileContent []byte
 	var readErr error
-	// Check if the definition is in a different file than the request originated from
-	if defFile.Name() != absPath {
-		defFileContent, readErr = os.ReadFile(defFile.Name())
+	defFileName := defFile.Name()
+	if defFileName != absPath { // Check if definition is in a different file
+		defFileContent, readErr = os.ReadFile(defFileName)
 		if readErr != nil {
-			defLogger.Error("Failed to read definition file content", "path", defFile.Name(), "error", readErr)
-			s.sendShowMessage(MessageTypeWarning, fmt.Sprintf("Could not read definition file: %s", defFile.Name()))
+			defLogger.Error("Failed to read definition file content", "path", defFileName, "error", readErr)
+			s.sendShowMessage(MessageTypeWarning, fmt.Sprintf("Could not read definition file: %s", defFileName))
 			return nil, nil
 		}
 	} else {
@@ -444,5 +437,21 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	}
 
 	defLogger.Info("Definition found", "identifier", obj.Name(), "location_uri", location.URI, "location_line", location.Range.Start.Line)
-	return []Location{*location}, nil
+	return []Location{*location}, nil // Return as slice
+}
+
+// handleCodeAction handles the 'textDocument/codeAction' request.
+// Currently a stub.
+func (s *Server) handleCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params CodeActionParams, logger *slog.Logger) (any, error) {
+	uri := params.TextDocument.URI
+	actionLogger := logger.With("uri", uri, "range", params.Range, "req_id", req.ID)
+	actionLogger.Info("Handling textDocument/codeAction (stub)")
+
+	// TODO: Implement actual code action logic
+	// - Analyze the range/diagnostics provided in params.Context
+	// - Determine possible actions (e.g., quick fixes, refactors)
+	// - Return a list of Command or CodeAction objects
+
+	// Example: Return empty list for now
+	return []any{}, nil
 }

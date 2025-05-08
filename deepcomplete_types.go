@@ -61,13 +61,14 @@ CODE TO FILL:
 ` + FimPrefixToken + `%s` + FimMiddleToken + `%s` + FimSuffixToken + `
 [/INST]` // Note: LLM might still output FIM tokens, needs cleaning.
 
-	defaultMaxTokens      = 256            // Default maximum tokens for LLM response.
-	DefaultStop           = "\n"           // Default stop sequence for LLM. Exported for CLI use.
-	defaultTemperature    = 0.1            // Default sampling temperature for LLM.
-	defaultLogLevel       = "info"         // Default log level.
-	defaultConfigFileName = "config.json"  // Default config file name.
-	configDirName         = "deepcomplete" // Subdirectory name for config/data.
-	cacheSchemaVersion    = 2              // Used to invalidate cache if internal formats change.
+	defaultMaxTokens          = 256            // Default maximum tokens for LLM response.
+	DefaultStop               = "\n"           // Default stop sequence for LLM. Exported for CLI use.
+	defaultTemperature        = 0.1            // Default sampling temperature for LLM.
+	defaultLogLevel           = "info"         // Default log level.
+	defaultMemoryCacheTTLSecs = 300            // Default TTL for memory cache items (5 minutes).
+	defaultConfigFileName     = "config.json"  // Default config file name.
+	configDirName             = "deepcomplete" // Subdirectory name for config/data.
+	cacheSchemaVersion        = 2              // Used to invalidate cache if internal formats change.
 
 	// Retry constants
 	maxRetries = 3
@@ -76,50 +77,56 @@ CODE TO FILL:
 
 // Config holds the active configuration for the autocompletion service.
 type Config struct {
-	OllamaURL      string   `json:"ollama_url"`
-	Model          string   `json:"model"`
-	PromptTemplate string   `json:"-"` // Loaded internally, not from config file.
-	FimTemplate    string   `json:"-"` // Loaded internally, not from config file.
-	MaxTokens      int      `json:"max_tokens"`
-	Stop           []string `json:"stop"`
-	Temperature    float64  `json:"temperature"`
-	LogLevel       string   `json:"log_level"`        // Log level (debug, info, warn, error).
-	UseAst         bool     `json:"use_ast"`          // Enable AST/Type analysis.
-	UseFim         bool     `json:"use_fim"`          // Use Fill-in-the-Middle prompting.
-	MaxPreambleLen int      `json:"max_preamble_len"` // Max bytes for AST context preamble.
-	MaxSnippetLen  int      `json:"max_snippet_len"`  // Max bytes for code snippet context.
+	OllamaURL             string        `json:"ollama_url"`
+	Model                 string        `json:"model"`
+	PromptTemplate        string        `json:"-"` // Loaded internally, not from config file.
+	FimTemplate           string        `json:"-"` // Loaded internally, not from config file.
+	MaxTokens             int           `json:"max_tokens"`
+	Stop                  []string      `json:"stop"`
+	Temperature           float64       `json:"temperature"`
+	LogLevel              string        `json:"log_level"`                // Log level (debug, info, warn, error).
+	UseAst                bool          `json:"use_ast"`                  // Enable AST/Type analysis.
+	UseFim                bool          `json:"use_fim"`                  // Use Fill-in-the-Middle prompting.
+	MaxPreambleLen        int           `json:"max_preamble_len"`         // Max bytes for AST context preamble.
+	MaxSnippetLen         int           `json:"max_snippet_len"`          // Max bytes for code snippet context.
+	MemoryCacheTTLSeconds int           `json:"memory_cache_ttl_seconds"` // TTL for memory cache items.
+	MemoryCacheTTL        time.Duration `json:"-"`                        // Derived duration, not from file.
 }
 
 // FileConfig represents the structure of the JSON config file for unmarshalling.
 // Uses pointers to distinguish between unset fields and zero-value fields.
 type FileConfig struct {
-	OllamaURL      *string   `json:"ollama_url"`
-	Model          *string   `json:"model"`
-	MaxTokens      *int      `json:"max_tokens"`
-	Stop           *[]string `json:"stop"`
-	Temperature    *float64  `json:"temperature"`
-	LogLevel       *string   `json:"log_level"`
-	UseAst         *bool     `json:"use_ast"`
-	UseFim         *bool     `json:"use_fim"`
-	MaxPreambleLen *int      `json:"max_preamble_len"`
-	MaxSnippetLen  *int      `json:"max_snippet_len"`
+	OllamaURL             *string   `json:"ollama_url"`
+	Model                 *string   `json:"model"`
+	MaxTokens             *int      `json:"max_tokens"`
+	Stop                  *[]string `json:"stop"`
+	Temperature           *float64  `json:"temperature"`
+	LogLevel              *string   `json:"log_level"`
+	UseAst                *bool     `json:"use_ast"`
+	UseFim                *bool     `json:"use_fim"`
+	MaxPreambleLen        *int      `json:"max_preamble_len"`
+	MaxSnippetLen         *int      `json:"max_snippet_len"`
+	MemoryCacheTTLSeconds *int      `json:"memory_cache_ttl_seconds"`
 }
 
 // getDefaultConfig returns a new instance of the default configuration.
 func getDefaultConfig() Config {
+	ttl := time.Duration(defaultMemoryCacheTTLSecs) * time.Second
 	return Config{
-		OllamaURL:      defaultOllamaURL,
-		Model:          defaultModel,
-		PromptTemplate: promptTemplate,
-		FimTemplate:    fimPromptTemplate, // Uses constant defined above
-		MaxTokens:      defaultMaxTokens,
-		Stop:           []string{DefaultStop, "}", "//", "/*", FimEOTToken}, // Add FIM EOT token to default stops
-		Temperature:    defaultTemperature,
-		LogLevel:       defaultLogLevel,
-		UseAst:         true,
-		UseFim:         false,
-		MaxPreambleLen: 2048,
-		MaxSnippetLen:  2048,
+		OllamaURL:             defaultOllamaURL,
+		Model:                 defaultModel,
+		PromptTemplate:        promptTemplate,
+		FimTemplate:           fimPromptTemplate,
+		MaxTokens:             defaultMaxTokens,
+		Stop:                  []string{DefaultStop, "}", "//", "/*", FimEOTToken},
+		Temperature:           defaultTemperature,
+		LogLevel:              defaultLogLevel,
+		UseAst:                true,
+		UseFim:                false,
+		MaxPreambleLen:        2048,
+		MaxSnippetLen:         2048,
+		MemoryCacheTTLSeconds: defaultMemoryCacheTTLSecs,
+		MemoryCacheTTL:        ttl, // Set derived duration
 	}
 }
 
@@ -162,6 +169,13 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		logger.Warn("Config validation: max_snippet_len is not positive, applying default.", "configured_value", c.MaxSnippetLen, "default", tempDefault.MaxSnippetLen)
 		c.MaxSnippetLen = tempDefault.MaxSnippetLen
 	}
+	if c.MemoryCacheTTLSeconds <= 0 {
+		logger.Warn("Config validation: memory_cache_ttl_seconds is not positive, applying default.", "configured_value", c.MemoryCacheTTLSeconds, "default", tempDefault.MemoryCacheTTLSeconds)
+		c.MemoryCacheTTLSeconds = tempDefault.MemoryCacheTTLSeconds
+	}
+	// Derive the time.Duration from the seconds value
+	c.MemoryCacheTTL = time.Duration(c.MemoryCacheTTLSeconds) * time.Second
+
 	if c.LogLevel == "" {
 		logger.Warn("Config validation: log_level is empty, applying default.", "default", defaultLogLevel)
 		c.LogLevel = defaultLogLevel
@@ -224,6 +238,7 @@ type Diagnostic struct {
 }
 
 // AstContextInfo holds structured information extracted from code analysis.
+// This structure is populated by the Analyzer and used by the PreambleFormatter and LSP handlers.
 type AstContextInfo struct {
 	FilePath           string                  // Absolute path to the analyzed file.
 	Version            int                     // Document version (for LSP).
@@ -254,6 +269,20 @@ type AstContextInfo struct {
 	PromptPreamble     string                  // Generated context string for the LLM prompt.
 	AnalysisErrors     []error                 // List of non-fatal errors encountered during analysis.
 	Diagnostics        []Diagnostic            // List of diagnostics generated during analysis.
+}
+
+// IdentifierInfo holds information specifically about an identifier found at a position.
+// Moved here in Cycle N+1.
+type IdentifierInfo struct {
+	Name       string            // Identifier name
+	Object     types.Object      // Resolved object (var, func, type, etc.)
+	Type       types.Type        // Resolved type
+	DefNode    ast.Node          // AST node where defined
+	DefFilePos token.Position    // Definition position (requires FileSet to interpret fully)
+	FileSet    *token.FileSet    // FileSet needed for position interpretation
+	Pkg        *packages.Package // Package containing the definition (might be different from requesting file's package)
+	Content    []byte            // Content of the file where the identifier was found (needed for range conversion)
+	IdentNode  *ast.Ident        // The *ast.Ident node itself for range calculation
 }
 
 // =============================================================================

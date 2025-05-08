@@ -52,7 +52,6 @@ func NewServer(completer *DeepCompleter, logger *slog.Logger, version string) *S
 		logger:    logger,
 		completer: completer, // Completer holds the canonical config now
 		files:     make(map[DocumentURI]*OpenFile),
-		// config:    completer.GetCurrentConfig(), // Removed
 		serverInfo: &ServerInfo{
 			Name:    "DeepComplete LSP",
 			Version: version,
@@ -214,6 +213,14 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		}
 		return s.handleDefinition(ctx, conn, req, params, methodLogger)
 
+	case "textDocument/codeAction": // Added routing for CodeAction (Cycle N+2)
+		var params CodeActionParams
+		if err := unmarshalParams(&params); err != nil {
+			methodLogger.Error("Failed to unmarshal codeAction params", "error", err)
+			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid codeAction params: %v", err)}
+		}
+		return s.handleCodeAction(ctx, conn, req, params, methodLogger) // Handler defined in lsp_handlers_textdocument.go
+
 	case "workspace/didChangeConfiguration":
 		var params DidChangeConfigurationParams
 		if err := unmarshalParams(&params); err != nil {
@@ -310,7 +317,6 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 	s.filesMu.RLock()
 	currentFile, exists := s.files[uri]
 	s.filesMu.RUnlock()
-	// Only publish if the file still exists in our map AND the version matches the one we analyzed
 	if !exists || currentFile.Version != version {
 		diagLogger.Warn("Skipping diagnostic publishing; file version changed or file closed during analysis", "analysis_version", version, "current_version", currentFile.Version, "exists", exists)
 		return
@@ -346,7 +352,6 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 		diagLogger.Warn("Analysis for diagnostics completed with non-fatal errors", "error", analysisErr)
 	}
 
-	// Publish diagnostics for the correct version
 	s.publishDiagnostics(uri, &version, lspDiagnostics, diagLogger)
 }
 

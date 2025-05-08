@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	// Ristretto import removed as it's now abstracted by the Analyzer interface
 )
 
 // ============================================================================
@@ -15,7 +16,6 @@ import (
 // generateCacheKey creates a key for the memory cache based on context.
 // Key includes a prefix, file path, version, and cursor position for fine-grained caching.
 func generateCacheKey(prefix string, info *AstContextInfo) string {
-	// Ensure FilePath and CursorPos are valid before creating the key
 	filePath := info.FilePath
 	cursorPos := info.CursorPos
 	if filePath == "" {
@@ -28,14 +28,10 @@ func generateCacheKey(prefix string, info *AstContextInfo) string {
 	return fmt.Sprintf("%s:%s:%d:%d", prefix, filePath, info.Version, cursorPos)
 }
 
-// withMemoryCache wraps a function call with Ristretto caching logic.
+// withMemoryCache wraps a function call with caching logic using the Analyzer interface.
 // Tries to fetch from cache using cacheKey. If miss, calls computeFn,
 // stores the result with cost and ttl, and returns it.
 // Returns the result (cached or computed), a boolean indicating cache hit, and any error from computeFn.
-//
-// Note: This implementation currently uses type assertion to access the underlying
-// Ristretto cache in GoPackagesAnalyzer. A more robust design might involve
-// adding Get/Set methods to the Analyzer interface itself.
 func withMemoryCache[T any](
 	analyzer Analyzer, // Use the Analyzer interface
 	cacheKey string,
@@ -57,35 +53,22 @@ func withMemoryCache[T any](
 		return result, false, err // Execute compute function directly
 	}
 
-	// --- Ristretto Cache Interaction ---
-	// Attempt type assertion to access the concrete cache.
-	concreteAnalyzer, ok := analyzer.(*GoPackagesAnalyzer)
-	if !ok || concreteAnalyzer.memoryCache == nil {
-		// Log a warning only once if assertion fails or cache is nil internally
-		// This avoids spamming logs if caching is intended but fails structurally.
-		// A more robust system might track if this warning was already logged.
-		cacheLogger.Warn("Memory cache enabled but cannot access concrete cache instance. Skipping cache.")
-		result, err := computeFn()
-		return result, false, err
-	}
-	ristrettoCache := concreteAnalyzer.memoryCache // Access the Ristretto cache
+	// --- Cache Interaction via Analyzer Interface ---
 
-	// 1. Check cache
-	cachedResult, found := ristrettoCache.Get(cacheKey)
+	// 1. Check cache using the interface method
+	cachedResult, found := analyzer.GetMemoryCache(cacheKey)
 	if found {
 		// Attempt type assertion on the cached result
 		if typedResult, ok := cachedResult.(T); ok {
-			cacheLogger.Debug("Ristretto cache hit")
-			// Ensure cache metrics are updated on hit
-			ristrettoCache.Get(cacheKey)  // Calling Get again updates metrics
+			cacheLogger.Debug("Memory cache hit")
 			return typedResult, true, nil // Return cached value
 		}
 		// Type assertion failed - indicates corrupted or mismatched cache entry
-		cacheLogger.Error("Ristretto cache type assertion failed", "expected_type", fmt.Sprintf("%T", zero), "actual_type", fmt.Sprintf("%T", cachedResult))
-		ristrettoCache.Del(cacheKey) // Delete invalid entry
-		// Treat as cache miss after deleting invalid entry
+		cacheLogger.Error("Memory cache type assertion failed", "expected_type", fmt.Sprintf("%T", zero), "actual_type", fmt.Sprintf("%T", cachedResult))
+		// TODO: Consider adding an Invalidate(key) method to the interface?
+		// For now, we just treat it as a miss. The invalid entry will expire eventually.
 	} else {
-		cacheLogger.Debug("Ristretto cache miss")
+		cacheLogger.Debug("Memory cache miss")
 	}
 
 	// 2. Cache miss: Compute the value
@@ -95,20 +78,17 @@ func withMemoryCache[T any](
 		return zero, false, err
 	}
 
-	// 3. Store computed value in cache
+	// 3. Store computed value in cache using the interface method
 	if cost <= 0 {
 		cost = 1 // Ristretto cost must be positive
 	}
-	// Use SetWithTTL to store the item with its cost and expiration
-	setOk := ristrettoCache.SetWithTTL(cacheKey, computedResult, cost, ttl)
+	setOk := analyzer.SetMemoryCache(cacheKey, computedResult, cost, ttl)
 	if !setOk {
 		// Set can fail if the item is too large or other constraints aren't met
-		cacheLogger.Warn("Ristretto cache Set failed, item not cached", "cost", cost, "ttl", ttl)
+		cacheLogger.Warn("Memory cache Set failed, item not cached", "cost", cost, "ttl", ttl)
 	} else {
-		cacheLogger.Debug("Ristretto cache set successful", "cost", cost, "ttl", ttl)
+		cacheLogger.Debug("Memory cache set successful", "cost", cost, "ttl", ttl)
 	}
-	// Wait for the value to pass through buffers (optional, ensures visibility for immediate Get)
-	// ristrettoCache.Wait()
 
 	// Return the newly computed value
 	return computedResult, false, nil

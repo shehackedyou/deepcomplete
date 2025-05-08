@@ -21,6 +21,7 @@ import (
 
 const (
 	// Default TTL for memory cache entries related to analysis steps
+	// TODO: Make this configurable via Config struct (Cycle N+4 partially done)
 	analysisCacheTTL = 5 * time.Minute
 )
 
@@ -144,6 +145,7 @@ func findEnclosingPathAndNodes(
 	}
 
 	// Cache the path ([]ast.Node). Use cost 1 as size is hard to determine easily.
+	// Use the constant TTL for now. TODO: Use config value: time.Duration(config.MemoryCacheTTLSeconds) * time.Second
 	path, cacheHit, pathErr := withMemoryCache[[]ast.Node](analyzer, cacheKey, 1, analysisCacheTTL, computePathFn, pathLogger)
 	if pathErr != nil {
 		// Error already added by findEnclosingPath if it occurred there
@@ -179,43 +181,36 @@ func extractScopeInformation(
 	scopeLogger := logger.With("op", "extractScopeInformation")
 
 	// --- Cache Scope Extraction ---
-	// Cache key depends on cursor position as scope varies within blocks/functions
 	cacheKey := generateCacheKey("scopeInfo", info)
 	computeScopeFn := func() (map[string]types.Object, error) {
-		// Create a temporary map to store results, avoiding direct modification of info inside computeFn
 		tempScopeMap := make(map[string]types.Object)
-		// Create a temporary info struct copy for scope gathering to avoid race conditions if computeFn runs concurrently
-		tempInfo := *info
-		tempInfo.VariablesInScope = tempScopeMap // Point tempInfo to the temp map
+		tempInfo := *info // Create copy to avoid modifying original during computation
+		tempInfo.VariablesInScope = tempScopeMap
+		tempInfo.AnalysisErrors = make([]error, len(info.AnalysisErrors)) // Copy existing errors
+		copy(tempInfo.AnalysisErrors, info.AnalysisErrors)
 
-		// gatherScopeContext populates tempInfo.VariablesInScope and adds errors to tempInfo.AnalysisErrors
 		gatherScopeContext(ctx, path, targetPkg, info.TargetFileSet, &tempInfo, scopeLogger) // Pass ctx, logger
 
-		// Check for errors added during scope gathering
+		var newErrors []error
 		if len(tempInfo.AnalysisErrors) > len(info.AnalysisErrors) {
-			// Collect only the *new* errors added by gatherScopeContext
-			newErrors := tempInfo.AnalysisErrors[len(info.AnalysisErrors):]
-			// Return the computed map and a wrapped error containing the new issues
-			// Note: This error won't be cached by withMemoryCache
+			newErrors = tempInfo.AnalysisErrors[len(info.AnalysisErrors):]
+		}
+
+		if len(newErrors) > 0 {
 			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(newErrors...))
 		}
-		// Return the computed scope map
 		return tempScopeMap, nil
 	}
 
-	// Cache the scope map. Estimate cost based on number of items (simple approach).
-	// TTL set by constant.
+	// Use the constant TTL for now. TODO: Use config value.
 	computedScope, cacheHit, scopeErr := withMemoryCache[map[string]types.Object](
 		analyzer, cacheKey, int64(len(info.VariablesInScope)+1), analysisCacheTTL, computeScopeFn, scopeLogger,
 	)
 
-	// If there was an error during computation (not a cache error), add it to the main info struct
 	if scopeErr != nil {
 		addAnalysisError(info, scopeErr, scopeLogger)
-		// Continue even if scope computation had errors, might have partial results
 	}
 
-	// Update the main info struct with the cached or computed scope
 	if computedScope != nil {
 		info.VariablesInScope = computedScope
 	}
@@ -223,8 +218,6 @@ func extractScopeInformation(
 		scopeLogger.Debug("Scope information cache hit")
 	}
 
-	// gatherScopeContext adds errors to info internally, so we just return nil here.
-	// Any fatal error would have been returned by withMemoryCache if computeFn returned it.
 	return nil
 }
 
@@ -249,58 +242,56 @@ func extractRelevantComments(
 	// --- Cache Comment Extraction ---
 	cacheKey := generateCacheKey("comments", info)
 	computeCommentsFn := func() ([]string, error) {
-		// Create a temporary info struct copy to avoid race conditions
-		tempInfo := *info
-		tempInfo.CommentsNearCursor = nil // Start fresh
+		tempInfo := *info // Create copy
+		tempInfo.CommentsNearCursor = nil
+		tempInfo.AnalysisErrors = make([]error, len(info.AnalysisErrors))
+		copy(tempInfo.AnalysisErrors, info.AnalysisErrors)
 
-		// findRelevantComments populates tempInfo.CommentsNearCursor and adds errors to tempInfo.AnalysisErrors
 		findRelevantComments(ctx, targetFileAST, path, cursorPos, fset, &tempInfo, commentLogger) // Pass ctx, logger
 
-		// Check for errors added during comment finding
+		var newErrors []error
 		if len(tempInfo.AnalysisErrors) > len(info.AnalysisErrors) {
-			newErrors := tempInfo.AnalysisErrors[len(info.AnalysisErrors):]
+			newErrors = tempInfo.AnalysisErrors[len(info.AnalysisErrors):]
+		}
+
+		if len(newErrors) > 0 {
 			return tempInfo.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(newErrors...))
 		}
 		return tempInfo.CommentsNearCursor, nil
 	}
 
-	// Cache the resulting slice of strings. Estimate cost based on total length.
+	// Use the constant TTL for now. TODO: Use config value.
 	computedComments, cacheHit, commentErr := withMemoryCache[[]string](
 		analyzer, cacheKey, estimateCost(info.CommentsNearCursor), analysisCacheTTL, computeCommentsFn, commentLogger,
 	)
 
-	// If there was an error during computation, add it to the main info struct
 	if commentErr != nil {
 		addAnalysisError(info, commentErr, commentLogger)
-		// Continue even if comment computation had errors
 	}
 
-	// Update the main info struct with the cached or computed comments
 	if computedComments != nil {
 		info.CommentsNearCursor = computedComments
 	} else {
-		info.CommentsNearCursor = []string{} // Ensure it's an empty slice if nil was returned/cached
+		info.CommentsNearCursor = []string{} // Ensure empty slice
 	}
 
 	if cacheHit {
 		commentLogger.Debug("Relevant comments cache hit")
 	}
 
-	// findRelevantComments adds errors internally.
 	return nil
 }
 
 // findEnclosingPath finds the AST node path from the root to the node enclosing the cursor.
-// This is the actual computation function called by the cached wrapper.
 func findEnclosingPath(ctx context.Context, targetFileAST *ast.File, cursorPos token.Pos, info *AstContextInfo, logger *slog.Logger) ([]ast.Node, error) {
 	if targetFileAST == nil {
 		err := errors.New("cannot find enclosing path: targetFileAST is nil")
-		addAnalysisError(info, err, logger) // Pass logger
+		addAnalysisError(info, err, logger)
 		return nil, err
 	}
 	if !cursorPos.IsValid() {
 		err := errors.New("cannot find enclosing path: invalid cursor position")
-		addAnalysisError(info, err, logger) // Pass logger
+		addAnalysisError(info, err, logger)
 		return nil, err
 	}
 	path, _ := astutil.PathEnclosingInterval(targetFileAST, cursorPos, cursorPos)
@@ -311,15 +302,12 @@ func findEnclosingPath(ctx context.Context, targetFileAST *ast.File, cursorPos t
 }
 
 // gatherScopeContext walks the enclosing path to find relevant scope information.
-// This is the actual computation function called by the cached wrapper.
-// It populates the provided info struct's VariablesInScope map.
 func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *packages.Package, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
-	// Ensure the map exists before adding to it
 	if info.VariablesInScope == nil {
 		info.VariablesInScope = make(map[string]types.Object)
 	}
 
-	addPackageScope(ctx, targetPkg, info, logger) // Pass ctx, logger
+	addPackageScope(ctx, targetPkg, info, logger)
 
 	if path != nil {
 		for i := len(path) - 1; i >= 0; i-- {
@@ -328,7 +316,6 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 			case *ast.File:
 				continue
 			case *ast.FuncDecl:
-				// Only capture the *first* FuncDecl encountered walking up
 				if info.EnclosingFuncNode == nil {
 					info.EnclosingFuncNode = n
 					if fset != nil && n.Recv != nil && len(n.Recv.List) > 0 && n.Recv.List[0].Type != nil {
@@ -338,7 +325,7 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 						} else {
 							logger.Warn("Could not format receiver type", "error", err)
 							info.ReceiverType = "[error formatting receiver]"
-							addAnalysisError(info, fmt.Errorf("receiver format error: %w", err), logger) // Pass logger
+							addAnalysisError(info, fmt.Errorf("receiver format error: %w", err), logger)
 						}
 					} else if n.Recv != nil {
 						logger.Debug("Could not get receiver type string from AST", "recv", n.Recv)
@@ -348,11 +335,10 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 				if n.Name != nil {
 					funcName = n.Name.Name
 				}
-				// Try to get type info only for the first encountered FuncDecl
 				if info.EnclosingFunc == nil && targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Defs != nil && n.Name != nil {
 					if obj, ok := targetPkg.TypesInfo.Defs[n.Name]; ok && obj != nil {
 						if fn, ok := obj.(*types.Func); ok {
-							info.EnclosingFunc = fn // Capture the type info
+							info.EnclosingFunc = fn
 							if sig, ok := fn.Type().(*types.Signature); ok {
 								addSignatureToScope(sig, info.VariablesInScope)
 							} else {
@@ -361,32 +347,31 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 						} else {
 							logger.Warn("Object defined for func name is not a *types.Func", "func", funcName, "object_type", fmt.Sprintf("%T", obj))
 						}
-					} else { // Def not found for this func name
-						addAnalysisError(info, fmt.Errorf("definition for func '%s' not found in TypesInfo", funcName), logger) // Pass logger
+					} else {
+						addAnalysisError(info, fmt.Errorf("definition for func '%s' not found in TypesInfo", funcName), logger)
 					}
-				} else if info.EnclosingFunc == nil { // Type info missing or already logged error
+				} else if info.EnclosingFunc == nil {
 					reason := getMissingTypeInfoReason(targetPkg)
-					// Avoid adding duplicate errors if type info is generally missing
 					if !strings.Contains(errors.Join(info.AnalysisErrors...).Error(), "type info") {
-						addAnalysisError(info, fmt.Errorf("type info for enclosing func '%s' unavailable: %s", funcName, reason), logger) // Pass logger
+						addAnalysisError(info, fmt.Errorf("type info for enclosing func '%s' unavailable: %s", funcName, reason), logger)
 					}
 				}
 
 			case *ast.BlockStmt:
-				if info.EnclosingBlock == nil { // Capture innermost block
+				if info.EnclosingBlock == nil {
 					info.EnclosingBlock = n
 				}
-				posStr := getPosString(fset, n.Pos()) // Use helper from utils.go
+				posStr := getPosString(fset, n.Pos())
 				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Scopes != nil {
 					if scope := targetPkg.TypesInfo.Scopes[n]; scope != nil {
 						addScopeVariables(scope, info.CursorPos, info.VariablesInScope)
-					} else { // Scope info missing for this specific block
-						addAnalysisError(info, fmt.Errorf("scope info missing for block at %s", posStr), logger) // Pass logger
+					} else {
+						addAnalysisError(info, fmt.Errorf("scope info missing for block at %s", posStr), logger)
 					}
-				} else if info.EnclosingBlock == n { // Log only if type info is missing for the innermost block
+				} else if info.EnclosingBlock == n {
 					reason := getMissingTypeInfoReason(targetPkg)
 					if !strings.Contains(errors.Join(info.AnalysisErrors...).Error(), "type info") {
-						addAnalysisError(info, fmt.Errorf("cannot get scope variables for block at %s: %s", posStr, reason), logger) // Pass logger
+						addAnalysisError(info, fmt.Errorf("cannot get scope variables for block at %s: %s", posStr, reason), logger)
 					}
 				}
 			}
@@ -403,14 +388,14 @@ func addPackageScope(ctx context.Context, targetPkg *packages.Package, info *Ast
 		if pkgScope != nil {
 			addScopeVariables(pkgScope, token.NoPos, info.VariablesInScope) // cursorPos doesn't apply
 		} else {
-			addAnalysisError(info, fmt.Errorf("package scope missing for pkg %s", targetPkg.PkgPath), logger) // Pass logger
+			addAnalysisError(info, fmt.Errorf("package scope missing for pkg %s", targetPkg.PkgPath), logger)
 		}
 	} else {
 		reason := "targetPkg is nil"
 		if targetPkg != nil {
 			reason = fmt.Sprintf("package.Types field is nil for pkg %s", targetPkg.PkgPath)
 		}
-		addAnalysisError(info, fmt.Errorf("cannot add package scope: %s", reason), logger) // Pass logger
+		addAnalysisError(info, fmt.Errorf("cannot add package scope: %s", reason), logger)
 	}
 }
 
@@ -461,30 +446,27 @@ func addTupleToScope(tuple *types.Tuple, scopeMap map[string]types.Object) {
 }
 
 // findRelevantComments uses ast.CommentMap to find comments near the cursor.
-// This is the actual computation function called by the cached wrapper.
-// It populates the provided info struct's CommentsNearCursor slice.
 func findRelevantComments(ctx context.Context, targetFileAST *ast.File, path []ast.Node, cursorPos token.Pos, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
 	if targetFileAST == nil || fset == nil {
-		addAnalysisError(info, errors.New("cannot find comments: targetFileAST or fset is nil"), logger) // Pass logger
+		addAnalysisError(info, errors.New("cannot find comments: targetFileAST or fset is nil"), logger)
 		return
 	}
 	if targetFileAST.Comments == nil {
 		logger.Debug("No comments found in target AST file.")
-		if info.CommentsNearCursor == nil { // Initialize if nil
+		if info.CommentsNearCursor == nil {
 			info.CommentsNearCursor = []string{}
 		}
 		return
 	}
 	cmap := ast.NewCommentMap(fset, targetFileAST, targetFileAST.Comments)
 	if cmap == nil {
-		addAnalysisError(info, errors.New("failed to create ast.CommentMap"), logger) // Pass logger
+		addAnalysisError(info, errors.New("failed to create ast.CommentMap"), logger)
 		if info.CommentsNearCursor == nil {
 			info.CommentsNearCursor = []string{}
 		}
 		return
 	}
-	// findCommentsWithMap returns the comments; assign to info struct
-	info.CommentsNearCursor = findCommentsWithMap(cmap, path, cursorPos, fset, logger) // Pass logger
+	info.CommentsNearCursor = findCommentsWithMap(cmap, path, cursorPos, fset, logger)
 }
 
 // findCommentsWithMap implements the logic to find preceding or enclosing doc comments.
@@ -597,14 +579,14 @@ func findContextNodes(
 ) {
 	if len(path) == 0 || fset == nil {
 		if fset == nil {
-			addAnalysisError(info, errors.New("Fset is nil in findContextNodes"), logger) // Pass logger
+			addAnalysisError(info, errors.New("Fset is nil in findContextNodes"), logger)
 		} else {
 			logger.Debug("Cannot find context nodes: AST path is empty.")
 		}
 		return
 	}
 
-	posStr := func(p token.Pos) string { return getPosString(fset, p) } // Util func
+	posStr := func(p token.Pos) string { return getPosString(fset, p) }
 	hasTypeInfo := pkg != nil && pkg.TypesInfo != nil
 	var typesMap map[ast.Expr]types.TypeAndValue
 	var defsMap map[*ast.Ident]types.Object
@@ -614,17 +596,17 @@ func findContextNodes(
 		defsMap = pkg.TypesInfo.Defs
 		usesMap = pkg.TypesInfo.Uses
 		if typesMap == nil {
-			addAnalysisError(info, errors.New("type info map 'Types' is nil"), logger) // Pass logger
+			addAnalysisError(info, errors.New("type info map 'Types' is nil"), logger)
 		}
 		if defsMap == nil {
-			addAnalysisError(info, errors.New("type info map 'Defs' is nil"), logger) // Pass logger
+			addAnalysisError(info, errors.New("type info map 'Defs' is nil"), logger)
 		}
 		if usesMap == nil {
-			addAnalysisError(info, errors.New("type info map 'Uses' is nil"), logger) // Pass logger
+			addAnalysisError(info, errors.New("type info map 'Uses' is nil"), logger)
 		}
 	} else {
-		reason := getMissingTypeInfoReason(pkg)                                                // Assumes helpers_diagnostics.go exists
-		addAnalysisError(info, fmt.Errorf("cannot perform type analysis: %s", reason), logger) // Pass logger
+		reason := getMissingTypeInfoReason(pkg)
+		addAnalysisError(info, fmt.Errorf("cannot perform type analysis: %s", reason), logger)
 	}
 
 	innermostNode := path[0]
@@ -636,10 +618,10 @@ func findContextNodes(
 			if tv, ok := typesMap[compLit]; ok {
 				info.CompositeLitType = tv.Type
 				if info.CompositeLitType == nil {
-					addAnalysisError(info, fmt.Errorf("composite literal type resolved to nil at %s", litPosStr), logger) // Pass logger
+					addAnalysisError(info, fmt.Errorf("composite literal type resolved to nil at %s", litPosStr), logger)
 				}
 			} else {
-				addAnalysisError(info, fmt.Errorf("missing type info for composite literal at %s", litPosStr), logger) // Pass logger
+				addAnalysisError(info, fmt.Errorf("missing type info for composite literal at %s", litPosStr), logger)
 			}
 		}
 		return
@@ -666,14 +648,14 @@ func findContextNodes(
 					info.CallExprFuncType = sig
 					info.ExpectedArgType = determineExpectedArgType(sig, info.CallArgIndex)
 				} else {
-					addAnalysisError(info, fmt.Errorf("type of call func (%T) at %s is %T, not signature", callExpr.Fun, funPosStr, tv.Type), logger) // Pass logger
+					addAnalysisError(info, fmt.Errorf("type of call func (%T) at %s is %T, not signature", callExpr.Fun, funPosStr, tv.Type), logger)
 				}
 			} else {
 				reason := "missing type info entry"
 				if ok && tv.Type == nil {
 					reason = "type info resolved to nil"
 				}
-				addAnalysisError(info, fmt.Errorf("%s for call func (%T) at %s", reason, callExpr.Fun, funPosStr), logger) // Pass logger
+				addAnalysisError(info, fmt.Errorf("%s for call func (%T) at %s", reason, callExpr.Fun, funPosStr), logger)
 			}
 		}
 		return
@@ -689,10 +671,10 @@ func findContextNodes(
 				if tv, ok := typesMap[selExpr.X]; ok {
 					info.SelectorExprType = tv.Type
 					if tv.Type == nil {
-						addAnalysisError(info, fmt.Errorf("type info resolved to nil for selector base expr (%T) starting at %s", selExpr.X, basePosStr), logger) // Pass logger
+						addAnalysisError(info, fmt.Errorf("type info resolved to nil for selector base expr (%T) starting at %s", selExpr.X, basePosStr), logger)
 					}
 				} else {
-					addAnalysisError(info, fmt.Errorf("missing type info entry for selector base expr (%T) starting at %s", selExpr.X, basePosStr), logger) // Pass logger
+					addAnalysisError(info, fmt.Errorf("missing type info entry for selector base expr (%T) starting at %s", selExpr.X, basePosStr), logger)
 				}
 			}
 			return
@@ -730,7 +712,7 @@ func findContextNodes(
 				info.IdentifierType = obj.Type()
 				defPosStr := posStr(obj.Pos())
 				if info.IdentifierType == nil {
-					addAnalysisError(info, fmt.Errorf("object '%s' at %s found but type is nil", obj.Name(), defPosStr), logger) // Pass logger
+					addAnalysisError(info, fmt.Errorf("object '%s' at %s found but type is nil", obj.Name(), defPosStr), logger)
 				}
 				findDefiningNode(ctx, obj, fset, pkg, info, logger) // Pass ctx, logger
 
@@ -739,14 +721,14 @@ func findContextNodes(
 					if tv, ok := typesMap[ident]; ok && tv.Type != nil {
 						info.IdentifierType = tv.Type
 					} else {
-						addAnalysisError(info, fmt.Errorf("missing object and type info for identifier '%s' at %s", ident.Name, identPosStr), logger) // Pass logger
+						addAnalysisError(info, fmt.Errorf("missing object and type info for identifier '%s' at %s", ident.Name, identPosStr), logger)
 					}
 				} else {
-					addAnalysisError(info, fmt.Errorf("object not found for identifier '%s' at %s (and Types map is nil)", ident.Name, identPosStr), logger) // Pass logger
+					addAnalysisError(info, fmt.Errorf("object not found for identifier '%s' at %s (and Types map is nil)", ident.Name, identPosStr), logger)
 				}
 			}
 		} else {
-			addAnalysisError(info, errors.New("missing type info for identifier analysis"), logger) // Pass logger
+			addAnalysisError(info, errors.New("missing type info for identifier analysis"), logger)
 		}
 	}
 	logger.Debug("Finished context node identification.")
@@ -764,7 +746,7 @@ func findDefiningNode(ctx context.Context, obj types.Object, fset *token.FileSet
 
 	defFile := fset.File(defPos)
 	if defFile == nil {
-		addAnalysisError(info, fmt.Errorf("could not find token.File for definition of '%s' at pos %s", obj.Name(), defPosStr), logger) // Pass logger
+		addAnalysisError(info, fmt.Errorf("could not find token.File for definition of '%s' at pos %s", obj.Name(), defPosStr), logger)
 		return
 	}
 	defFileName := defFile.Name()
@@ -798,13 +780,13 @@ func findDefiningNode(ctx context.Context, obj types.Object, fset *token.FileSet
 	}
 
 	if defAST == nil {
-		addAnalysisError(info, fmt.Errorf("could not find AST for definition file '%s' of object '%s'", defFileName, obj.Name()), logger) // Pass logger
+		addAnalysisError(info, fmt.Errorf("could not find AST for definition file '%s' of object '%s'", defFileName, obj.Name()), logger)
 		return
 	}
 
 	defPath, _ := astutil.PathEnclosingInterval(defAST, defPos, defPos)
 	if len(defPath) == 0 {
-		addAnalysisError(info, fmt.Errorf("could not find AST path for definition of '%s' at pos %s", obj.Name(), defPosStr), logger) // Pass logger
+		addAnalysisError(info, fmt.Errorf("could not find AST path for definition of '%s' at pos %s", obj.Name(), defPosStr), logger)
 		return
 	}
 

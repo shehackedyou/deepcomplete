@@ -1,6 +1,5 @@
 // deepcomplete/lsp_handlers_lifecycle.go
 // Contains LSP method handlers related to the server lifecycle (initialize, shutdown, exit).
-// Cycle 5: Moved implementations from lsp_server.go.
 package deepcomplete
 
 import (
@@ -19,23 +18,29 @@ import (
 func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params InitializeParams, logger *slog.Logger) (any, error) {
 	logger.Info("Handling initialize request", "client_name", params.ClientInfo.Name, "client_version", params.ClientInfo.Version)
 
-	// Define server capabilities (can be adjusted based on client capabilities if needed)
+	// Define server capabilities
 	serverCapabilities := ServerCapabilities{
 		TextDocumentSync: &TextDocumentSyncOptions{
-			OpenClose: true,                     // We need open/close notifications
-			Change:    TextDocumentSyncKindFull, // We only support full document sync on change
+			OpenClose: true,
+			Change:    TextDocumentSyncKindFull, // Only support full document sync
 		},
 		CompletionProvider: &CompletionOptions{
 			// Define trigger characters, resolve provider, etc. if needed later
 		},
-		HoverProvider:      true, // We provide hover information
-		DefinitionProvider: true, // We provide definition information
+		HoverProvider:      true, // Provide hover information
+		DefinitionProvider: true, // Provide definition information
+		CodeActionProvider: true, // Announce code action capability (Cycle N+2)
+		// TODO: Add other capabilities like signatureHelpProvider, referencesProvider etc.
 	}
 
 	result := InitializeResult{
 		Capabilities: serverCapabilities,
 		ServerInfo:   s.serverInfo, // Server info defined in NewServer
 	}
+
+	// Store client capabilities for later reference
+	s.clientCaps = params.Capabilities
+	s.initParams = &params // Store init params if needed later
 
 	logger.Info("Initialization successful", "server_capabilities", result.Capabilities)
 	return result, nil
@@ -45,9 +50,8 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 // The server should prepare for termination but not exit yet.
 func (s *Server) handleShutdown(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, logger *slog.Logger) (any, error) {
 	logger.Info("Handling shutdown request")
-	// Perform any pre-shutdown cleanup if necessary (e.g., saving state).
-	// Note: The core completer cleanup (like closing DB) happens when the main process exits
-	// and its defer function runs, or potentially via a dedicated shutdown method on the completer if needed.
+	// Perform any pre-shutdown cleanup if necessary.
+	// Core completer cleanup happens when the main process exits.
 	return nil, nil
 }
 
@@ -55,12 +59,10 @@ func (s *Server) handleShutdown(ctx context.Context, conn *jsonrpc2.Conn, req *j
 // The server should terminate its process.
 func (s *Server) handleExit(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, logger *slog.Logger) (any, error) {
 	logger.Info("Handling exit notification")
-	// The LSP spec mentions the server should exit with code 0 if shutdown was received, 1 otherwise.
-	// For simplicity, we just close the connection, which will terminate the main Run loop.
-	// The OS exit code can be handled by the main function if needed.
+	// Closing the connection signals the main Run loop to exit.
 	if s.conn != nil {
-		s.conn.Close() // Closing the connection signals the main loop to exit
+		s.conn.Close()
 	}
-	// os.Exit(0) // Or os.Exit(1) depending on shutdown status, but letting Run loop exit is cleaner.
+	// The main function can handle the actual os.Exit code based on shutdown status if needed.
 	return nil, nil
 }

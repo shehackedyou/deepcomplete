@@ -171,6 +171,11 @@ func LoadAndMergeConfig(path string, cfg *Config, logger *slog.Logger) (loaded b
 		cfg.MaxSnippetLen = *fileCfg.MaxSnippetLen
 		mergedFields++
 	}
+	// Merge MemoryCacheTTLSeconds if present
+	if fileCfg.MemoryCacheTTLSeconds != nil {
+		cfg.MemoryCacheTTLSeconds = *fileCfg.MemoryCacheTTLSeconds
+		mergedFields++
+	}
 
 	logger.Debug("Merged configuration from file", "path", path, "fields_merged", mergedFields)
 	return loaded, nil
@@ -187,29 +192,19 @@ func WriteDefaultConfig(path string, defaultConfig Config, logger *slog.Logger) 
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
 
-	type ExportableConfig struct {
-		OllamaURL      string   `json:"ollama_url"`
-		Model          string   `json:"model"`
-		MaxTokens      int      `json:"max_tokens"`
-		Stop           []string `json:"stop"`
-		Temperature    float64  `json:"temperature"`
-		LogLevel       string   `json:"log_level"`
-		UseAst         bool     `json:"use_ast"`
-		UseFim         bool     `json:"use_fim"`
-		MaxPreambleLen int      `json:"max_preamble_len"`
-		MaxSnippetLen  int      `json:"max_snippet_len"`
-	}
-	expCfg := ExportableConfig{
-		OllamaURL:      defaultConfig.OllamaURL,
-		Model:          defaultConfig.Model,
-		MaxTokens:      defaultConfig.MaxTokens,
-		Stop:           defaultConfig.Stop,
-		Temperature:    defaultConfig.Temperature,
-		LogLevel:       defaultConfig.LogLevel,
-		UseAst:         defaultConfig.UseAst,
-		UseFim:         defaultConfig.UseFim,
-		MaxPreambleLen: defaultConfig.MaxPreambleLen,
-		MaxSnippetLen:  defaultConfig.MaxSnippetLen,
+	// Use FileConfig structure for writing to ensure only configurable fields are included
+	expCfg := FileConfig{
+		OllamaURL:             &defaultConfig.OllamaURL,
+		Model:                 &defaultConfig.Model,
+		MaxTokens:             &defaultConfig.MaxTokens,
+		Stop:                  &defaultConfig.Stop, // Note: Stop is a slice, assign pointer to the slice
+		Temperature:           &defaultConfig.Temperature,
+		LogLevel:              &defaultConfig.LogLevel,
+		UseAst:                &defaultConfig.UseAst,
+		UseFim:                &defaultConfig.UseFim,
+		MaxPreambleLen:        &defaultConfig.MaxPreambleLen,
+		MaxSnippetLen:         &defaultConfig.MaxSnippetLen,
+		MemoryCacheTTLSeconds: &defaultConfig.MemoryCacheTTLSeconds, // Add TTL field
 	}
 
 	jsonData, err := json.MarshalIndent(expCfg, "", "  ")
@@ -217,7 +212,7 @@ func WriteDefaultConfig(path string, defaultConfig Config, logger *slog.Logger) 
 		return fmt.Errorf("failed to marshal default config to JSON: %w", err)
 	}
 
-	if err := os.WriteFile(path, jsonData, 0640); err != nil {
+	if err := os.WriteFile(path, jsonData, 0640); err != nil { // Restricted permissions
 		return fmt.Errorf("failed to write default config file %s: %w", path, err)
 	}
 	logger.Info("Wrote default configuration", "path", path)
@@ -1168,10 +1163,13 @@ func findEnclosingFuncBody(content []byte, offset int) (string, bool) {
 foundEnd:
 
 	if funcBodyEndOffset != -1 && funcBodyEndOffset >= funcBodyStartOffset {
+		// Ensure the cursor offset is actually within this found function body
+		// We check >= funcBodyStartOffset because the cursor could be right after '{'
+		// We check <= funcBodyEndOffset because the cursor could be right before '}'
 		if offset >= funcBodyStartOffset && offset <= funcBodyEndOffset {
 			return string(content[funcBodyStartOffset:funcBodyEndOffset]), true
 		}
 	}
 
-	return "", false
+	return "", false // Matching brace not found or cursor not inside
 }

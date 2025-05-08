@@ -57,6 +57,7 @@ type InitializeParams struct {
 	ClientInfo            *ClientInfo        `json:"clientInfo,omitempty"`
 	Capabilities          ClientCapabilities `json:"capabilities"`
 	InitializationOptions json.RawMessage    `json:"initializationOptions,omitempty"`
+	Trace                 string             `json:"trace,omitempty"` // off, messages, verbose
 }
 
 // ClientInfo information about the client.
@@ -69,11 +70,20 @@ type ClientInfo struct {
 type ClientCapabilities struct {
 	Workspace    *WorkspaceClientCapabilities    `json:"workspace,omitempty"`
 	TextDocument *TextDocumentClientCapabilities `json:"textDocument,omitempty"`
+	Window       *WindowClientCapabilities       `json:"window,omitempty"`
+	Experimental any                             `json:"experimental,omitempty"`
 }
 
 // WorkspaceClientCapabilities workspace specific client capabilities.
 type WorkspaceClientCapabilities struct {
-	Configuration bool `json:"configuration,omitempty"`
+	ApplyEdit              bool                                `json:"applyEdit,omitempty"`
+	DidChangeConfiguration *DidChangeConfigurationCapabilities `json:"didChangeConfiguration,omitempty"`
+	// Add other workspace capabilities like workspaceFolders, symbol, executeCommand etc. if needed
+}
+
+// DidChangeConfigurationCapabilities capabilities for workspace/didChangeConfiguration.
+type DidChangeConfigurationCapabilities struct {
+	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
 }
 
 // TextDocumentClientCapabilities text document specific client capabilities.
@@ -81,16 +91,20 @@ type TextDocumentClientCapabilities struct {
 	Completion *CompletionClientCapabilities `json:"completion,omitempty"`
 	Hover      *HoverClientCapabilities      `json:"hover,omitempty"`
 	Definition *DefinitionClientCapabilities `json:"definition,omitempty"`
+	CodeAction *CodeActionClientCapabilities `json:"codeAction,omitempty"` // Added (Cycle N+2)
+	// Add other text document capabilities like signatureHelp, references etc. if needed
 }
 
 // CompletionClientCapabilities client capabilities for completion.
 type CompletionClientCapabilities struct {
 	CompletionItem *CompletionItemClientCapabilities `json:"completionItem,omitempty"`
+	// Add contextSupport etc. if needed
 }
 
 // CompletionItemClientCapabilities client capabilities specific to completion items.
 type CompletionItemClientCapabilities struct {
 	SnippetSupport bool `json:"snippetSupport,omitempty"`
+	// Add commitCharactersSupport, documentationFormat etc. if needed
 }
 
 // HoverClientCapabilities client capabilities for hover.
@@ -103,6 +117,30 @@ type DefinitionClientCapabilities struct {
 	LinkSupport bool `json:"linkSupport,omitempty"`
 }
 
+// CodeActionClientCapabilities client capabilities for code actions. (Cycle N+2)
+type CodeActionClientCapabilities struct {
+	DynamicRegistration      bool                            `json:"dynamicRegistration,omitempty"`
+	CodeActionLiteralSupport *CodeActionLiteralSupportClient `json:"codeActionLiteralSupport,omitempty"`
+	IsPreferredSupport       bool                            `json:"isPreferredSupport,omitempty"`
+	// Add resolveSupport etc. if needed
+}
+
+// CodeActionLiteralSupportClient capabilities specific to CodeActionLiterals. (Cycle N+2)
+type CodeActionLiteralSupportClient struct {
+	CodeActionKind CodeActionKindClientCapabilities `json:"codeActionKind"`
+}
+
+// CodeActionKindClientCapabilities defines capabilities for code action kinds. (Cycle N+2)
+type CodeActionKindClientCapabilities struct {
+	ValueSet []CodeActionKind `json:"valueSet"` // The code action kinds the client supports
+}
+
+// WindowClientCapabilities capabilities specific to the window.
+type WindowClientCapabilities struct {
+	WorkDoneProgress bool `json:"workDoneProgress,omitempty"`
+	// Add showMessage, showDocument etc. if needed
+}
+
 // InitializeResult result of the initialize request.
 type InitializeResult struct {
 	Capabilities ServerCapabilities `json:"capabilities"`
@@ -113,29 +151,55 @@ type InitializeResult struct {
 type ServerCapabilities struct {
 	TextDocumentSync   *TextDocumentSyncOptions `json:"textDocumentSync,omitempty"`
 	CompletionProvider *CompletionOptions       `json:"completionProvider,omitempty"`
-	HoverProvider      bool                     `json:"hoverProvider,omitempty"`
-	DefinitionProvider bool                     `json:"definitionProvider,omitempty"`
-	// DiagnosticProvider *DiagnosticOptions `json:"diagnosticProvider,omitempty"` // Optional
+	HoverProvider      bool                     `json:"hoverProvider,omitempty"`      // Simple boolean for now
+	DefinitionProvider bool                     `json:"definitionProvider,omitempty"` // Simple boolean for now
+	CodeActionProvider any                      `json:"codeActionProvider,omitempty"` // bool | CodeActionOptions (Cycle N+2)
+	// Add other capabilities like signatureHelpProvider, referencesProvider etc. if needed
 }
 
 // TextDocumentSyncOptions options for text document synchronization.
 type TextDocumentSyncOptions struct {
 	OpenClose bool                 `json:"openClose,omitempty"`
-	Change    TextDocumentSyncKind `json:"change,omitempty"` // Specifies how changes are synced (1=Full)
+	Change    TextDocumentSyncKind `json:"change,omitempty"`
+	// Add willSave, willSaveWaitUntil, save if needed
 }
 
 // TextDocumentSyncKind defines how text document changes are synced.
 type TextDocumentSyncKind int
 
 const (
-	TextDocumentSyncKindNone TextDocumentSyncKind = 0
-	TextDocumentSyncKindFull TextDocumentSyncKind = 1 // We only support Full sync
+	TextDocumentSyncKindNone        TextDocumentSyncKind = 0
+	TextDocumentSyncKindFull        TextDocumentSyncKind = 1 // We only support Full sync
+	TextDocumentSyncKindIncremental TextDocumentSyncKind = 2
 )
 
 // CompletionOptions server completion capabilities.
 type CompletionOptions struct {
-	// Add triggerCharacters, resolveProvider etc. if needed
+	ResolveProvider   bool     `json:"resolveProvider,omitempty"`   // Server provides additional info on resolve request
+	TriggerCharacters []string `json:"triggerCharacters,omitempty"` // Characters that trigger completion automatically
+	// Add allCommitCharacters, workDoneProgress if needed
 }
+
+// CodeActionOptions server capabilities for code actions. (Cycle N+2)
+type CodeActionOptions struct {
+	CodeActionKinds []CodeActionKind `json:"codeActionKinds,omitempty"` // Kinds of code actions supported
+	ResolveProvider bool             `json:"resolveProvider,omitempty"`
+	// Add workDoneProgress if needed
+}
+
+// CodeActionKind defines the kind of code action (string). (Cycle N+2)
+type CodeActionKind string
+
+const (
+	CodeActionKindQuickFix              CodeActionKind = "quickfix"
+	CodeActionKindRefactor              CodeActionKind = "refactor"
+	CodeActionKindRewrite               CodeActionKind = "refactor.rewrite"
+	CodeActionKindExtract               CodeActionKind = "refactor.extract"
+	CodeActionKindInline                CodeActionKind = "refactor.inline"
+	CodeActionKindSource                CodeActionKind = "source"
+	CodeActionKindSourceOrganizeImports CodeActionKind = "source.organizeImports"
+	CodeActionKindSourceFixAll          CodeActionKind = "source.fixAll"
+)
 
 // ServerInfo information about the server.
 type ServerInfo struct {
@@ -156,19 +220,22 @@ type DidCloseTextDocumentParams struct {
 // DidChangeTextDocumentParams parameters for textDocument/didChange.
 type DidChangeTextDocumentParams struct {
 	TextDocument   VersionedTextDocumentIdentifier  `json:"textDocument"`
-	ContentChanges []TextDocumentContentChangeEvent `json:"contentChanges"` // Array, but we only handle the last one for Full sync
+	ContentChanges []TextDocumentContentChangeEvent `json:"contentChanges"`
 }
 
 // VersionedTextDocumentIdentifier identifies a text document with a version number.
 type VersionedTextDocumentIdentifier struct {
 	TextDocumentIdentifier
-	Version int `json:"version"` // Must be non-negative
+	Version int `json:"version"` // Can be null if client doesn't support versioning
 }
 
 // TextDocumentContentChangeEvent an event describing a change to a text document.
 type TextDocumentContentChangeEvent struct {
-	// Range is omitted - we only support Full sync
-	Text string `json:"text"` // The new full content of the document
+	// For Full sync: Range and RangeLength are omitted. Text contains the full content.
+	// For Incremental sync: Range, RangeLength, and Text are provided.
+	// Range       *LSPRange `json:"range,omitempty"`
+	// RangeLength *uint32   `json:"rangeLength,omitempty"`
+	Text string `json:"text"`
 }
 
 // DidChangeConfigurationParams parameters for workspace/didChangeConfiguration.
@@ -179,7 +246,7 @@ type DidChangeConfigurationParams struct {
 // CompletionParams parameters for textDocument/completion.
 type CompletionParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     LSPPosition            `json:"position"` // LSP Position (UTF-16)
+	Position     LSPPosition            `json:"position"`
 	Context      *CompletionContext     `json:"context,omitempty"`
 }
 
@@ -193,25 +260,26 @@ type CompletionContext struct {
 type CompletionTriggerKind int
 
 const (
-	CompletionTriggerKindInvoked              CompletionTriggerKind = 1 // Invoked by user explicitly
-	CompletionTriggerKindTriggerChar          CompletionTriggerKind = 2 // Triggered by typing a trigger character
-	CompletionTriggerKindTriggerForIncomplete CompletionTriggerKind = 3 // Triggered again for incomplete list
+	CompletionTriggerKindInvoked              CompletionTriggerKind = 1
+	CompletionTriggerKindTriggerChar          CompletionTriggerKind = 2
+	CompletionTriggerKindTriggerForIncomplete CompletionTriggerKind = 3
 )
 
 // CompletionList represents a list of completion items.
 type CompletionList struct {
-	IsIncomplete bool             `json:"isIncomplete"` // We currently always return complete lists
+	IsIncomplete bool             `json:"isIncomplete"`
 	Items        []CompletionItem `json:"items"`
 }
 
 // CompletionItem represents a single completion suggestion.
 type CompletionItem struct {
-	Label            string             `json:"label"`                      // Text shown in list
-	Kind             CompletionItemKind `json:"kind,omitempty"`             // Type of completion (function, variable, etc.)
-	Detail           string             `json:"detail,omitempty"`           // Additional info (e.g., type signature)
-	Documentation    string             `json:"documentation,omitempty"`    // Documentation string
-	InsertTextFormat InsertTextFormat   `json:"insertTextFormat,omitempty"` // PlainText or Snippet
-	InsertText       string             `json:"insertText,omitempty"`       // Text to insert
+	Label            string             `json:"label"`
+	Kind             CompletionItemKind `json:"kind,omitempty"`
+	Detail           string             `json:"detail,omitempty"`
+	Documentation    any                `json:"documentation,omitempty"` // string | MarkupContent
+	InsertTextFormat InsertTextFormat   `json:"insertTextFormat,omitempty"`
+	InsertText       string             `json:"insertText,omitempty"`
+	// Add other fields like preselect, sortText, filterText, textEdit, additionalTextEdits, command etc.
 }
 
 // CompletionItemKind defines the kind of completion item (LSP standard).
@@ -224,15 +292,15 @@ const (
 	CompletionItemKindConstructor   CompletionItemKind = 4
 	CompletionItemKindField         CompletionItemKind = 5
 	CompletionItemKindVariable      CompletionItemKind = 6
-	CompletionItemKindClass         CompletionItemKind = 7 // Often used for Type specs
+	CompletionItemKindClass         CompletionItemKind = 7
 	CompletionItemKindInterface     CompletionItemKind = 8
-	CompletionItemKindModule        CompletionItemKind = 9 // Often used for Packages
+	CompletionItemKindModule        CompletionItemKind = 9
 	CompletionItemKindProperty      CompletionItemKind = 10
 	CompletionItemKindUnit          CompletionItemKind = 11
 	CompletionItemKindValue         CompletionItemKind = 12
 	CompletionItemKindEnum          CompletionItemKind = 13
 	CompletionItemKindKeyword       CompletionItemKind = 14
-	CompletionItemKindSnippet       CompletionItemKind = 15 // Default for model suggestions
+	CompletionItemKindSnippet       CompletionItemKind = 15
 	CompletionItemKindColor         CompletionItemKind = 16
 	CompletionItemKindFile          CompletionItemKind = 17
 	CompletionItemKindReference     CompletionItemKind = 18
@@ -255,24 +323,24 @@ const (
 
 // CancelParams parameters for $/cancelRequest.
 type CancelParams struct {
-	ID any `json:"id"` // ID of the request to cancel (number or string)
+	ID any `json:"id"` // number | string
 }
 
 // HoverParams parameters for textDocument/hover.
 type HoverParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     LSPPosition            `json:"position"` // LSP Position (UTF-16)
+	Position     LSPPosition            `json:"position"`
 }
 
 // HoverResult result for textDocument/hover.
 type HoverResult struct {
 	Contents MarkupContent `json:"contents"`
-	Range    *LSPRange     `json:"range,omitempty"` // Optional: range of the hovered symbol
+	Range    *LSPRange     `json:"range,omitempty"`
 }
 
 // MarkupContent represents structured content for hover/documentation.
 type MarkupContent struct {
-	Kind  MarkupKind `json:"kind"` // e.g., "markdown" or "plaintext"
+	Kind  MarkupKind `json:"kind"` // "plaintext" | "markdown"
 	Value string     `json:"value"`
 }
 
@@ -287,7 +355,7 @@ const (
 // DefinitionParams parameters for textDocument/definition.
 type DefinitionParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     LSPPosition            `json:"position"` // LSP Position (UTF-16)
+	Position     LSPPosition            `json:"position"`
 }
 
 // DefinitionResult can be Location, []Location, or LocationLink[]
@@ -320,18 +388,89 @@ const (
 
 // LspDiagnostic represents a diagnostic (LSP Standard).
 type LspDiagnostic struct {
-	Range    LSPRange              `json:"range"`            // The range (LSP UTF-16) at which the message applies.
-	Severity LspDiagnosticSeverity `json:"severity"`         // The diagnostic's severity.
-	Code     any                   `json:"code,omitempty"`   // The diagnostic's code (number or string).
-	Source   string                `json:"source,omitempty"` // e.g. 'go' or 'deepcomplete'.
-	Message  string                `json:"message"`          // The diagnostic's message.
+	Range    LSPRange              `json:"range"`
+	Severity LspDiagnosticSeverity `json:"severity"`
+	Code     any                   `json:"code,omitempty"` // number | string
+	Source   string                `json:"source,omitempty"`
+	Message  string                `json:"message"`
+	// Add relatedInformation, tags etc. if needed
 }
 
 // PublishDiagnosticsParams parameters for textDocument/publishDiagnostics notification.
 type PublishDiagnosticsParams struct {
 	URI         DocumentURI     `json:"uri"`
-	Version     *int            `json:"version,omitempty"` // Optional: Document version.
-	Diagnostics []LspDiagnostic `json:"diagnostics"`       // Array of diagnostic items.
+	Version     *int            `json:"version,omitempty"` // Use pointer to allow omitting
+	Diagnostics []LspDiagnostic `json:"diagnostics"`
+}
+
+// CodeActionParams parameters for textDocument/codeAction (Cycle N+2)
+type CodeActionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Range        LSPRange               `json:"range"`
+	Context      CodeActionContext      `json:"context"`
+}
+
+// CodeActionContext contains context information for code action requests (Cycle N+2)
+type CodeActionContext struct {
+	Diagnostics []LspDiagnostic       `json:"diagnostics"`           // Diagnostics that overlap the range
+	Only        []CodeActionKind      `json:"only,omitempty"`        // Requested kinds of code actions
+	TriggerKind CodeActionTriggerKind `json:"triggerKind,omitempty"` // How the action was triggered
+}
+
+// CodeActionTriggerKind defines how a code action was invoked (Cycle N+2)
+type CodeActionTriggerKind int
+
+const (
+	CodeActionTriggerKindInvoked   CodeActionTriggerKind = 1 // Explicitly requested
+	CodeActionTriggerKindAutomatic CodeActionTriggerKind = 2 // Run automatically on save etc.
+)
+
+// CodeActionResult is the result of a code action request (Cycle N+2)
+// It can be a list of Commands or CodeActions. Using []any for flexibility.
+type CodeActionResult = []any // []Command | []CodeAction
+
+// Command represents a command that can be executed on the client (Cycle N+2)
+type Command struct {
+	Title     string `json:"title"`               // Title of the command, like `save`.
+	Command   string `json:"command"`             // The identifier of the actual command handler.
+	Arguments []any  `json:"arguments,omitempty"` // Arguments that the command handler should be invoked with.
+}
+
+// CodeAction represents a potential action offered to the user (Cycle N+2)
+type CodeAction struct {
+	Title       string          `json:"title"`                 // A short, human-readable title for this code action.
+	Kind        CodeActionKind  `json:"kind,omitempty"`        // The kind of the code action. Used to filter code actions.
+	Diagnostics []LspDiagnostic `json:"diagnostics,omitempty"` // The diagnostics that this code action resolves.
+	IsPreferred bool            `json:"isPreferred,omitempty"` // Marks this action as preferred when filters overlap.
+	Edit        *WorkspaceEdit  `json:"edit,omitempty"`        // The workspace edit this code action performs.
+	Command     *Command        `json:"command,omitempty"`     // A command this code action executes.
+	Data        any             `json:"data,omitempty"`        // A data entry field that is preserved between a code action and its resolve request.
+	// Add disabled, documentation etc. if needed
+}
+
+// WorkspaceEdit represents changes to multiple resources managed by the workspace (Cycle N+2)
+type WorkspaceEdit struct {
+	Changes         map[DocumentURI][]TextEdit `json:"changes,omitempty"`         // Changes by resource URI.
+	DocumentChanges []TextDocumentEdit         `json:"documentChanges,omitempty"` // Supports versioned changes.
+	// Add changeAnnotations if needed
+}
+
+// TextEdit represents a textual change in a document (Cycle N+2)
+type TextEdit struct {
+	Range   LSPRange `json:"range"`   // The range of the text document to be manipulated. To insert text into a document create a range where start === end.
+	NewText string   `json:"newText"` // The string to be inserted. For delete operations use an empty string.
+}
+
+// TextDocumentEdit represents edits to a specific version of a text document (Cycle N+2)
+type TextDocumentEdit struct {
+	TextDocument OptionalVersionedTextDocumentIdentifier `json:"textDocument"` // The text document to change.
+	Edits        []TextEdit                              `json:"edits"`        // The edits to be applied.
+}
+
+// OptionalVersionedTextDocumentIdentifier is like VersionedTextDocumentIdentifier but version is optional (Cycle N+2)
+type OptionalVersionedTextDocumentIdentifier struct {
+	TextDocumentIdentifier
+	Version *int `json:"version"` // Version number is optional (null)
 }
 
 // ============================================================================
@@ -384,10 +523,9 @@ type ErrorObject struct {
 // ============================================================================
 
 // mapTypeToCompletionKind maps a Go types.Object to an LSP CompletionItemKind.
-// Provides more specific kinds than the previous version.
 func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 	if obj == nil {
-		return CompletionItemKindSnippet // Default for LLM suggestions without type info
+		return CompletionItemKindSnippet
 	}
 
 	switch o := obj.(type) {
@@ -396,35 +534,18 @@ func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 		if ok && sig.Recv() != nil {
 			return CompletionItemKindMethod
 		}
-		// Could potentially check if it's a constructor-like function
 		return CompletionItemKindFunction
 	case *types.Var:
 		if o.IsField() {
 			return CompletionItemKindField
 		}
-		// Check if it's a package-level variable
-		if o.Parent() != nil && o.Parent() == o.Pkg().Scope() {
-			// Could potentially treat as Constant if it looks like one, but Variable is safer
-			return CompletionItemKindVariable
-		}
 		return CompletionItemKindVariable
 	case *types.Const:
-		// Check underlying type if possible
-		if t := o.Type(); t != nil {
-			if basic, ok := t.Underlying().(*types.Basic); ok {
-				// Check if it's boolean or numeric-like constant
-				if basic.Info()&(types.IsBoolean|types.IsNumeric) != 0 {
-					return CompletionItemKindConstant
-				}
-				// Could check for string constants etc.
-			}
-		}
-		return CompletionItemKindConstant // Default for const
+		return CompletionItemKindConstant
 	case *types.TypeName:
-		// Get the underlying type to determine the specific kind
 		underlying := o.Type().Underlying()
 		if underlying == nil {
-			return CompletionItemKindClass // Fallback for type names
+			return CompletionItemKindClass
 		}
 		switch underlying.(type) {
 		case *types.Struct:
@@ -432,40 +553,28 @@ func mapTypeToCompletionKind(obj types.Object) CompletionItemKind {
 		case *types.Interface:
 			return CompletionItemKindInterface
 		case *types.Basic:
-			// Could differentiate basic types (int, string) further if needed
-			return CompletionItemKindKeyword // Often used for basic type keywords
-		case *types.Signature: // Type alias for a function type
+			return CompletionItemKindKeyword
+		case *types.Signature:
 			return CompletionItemKindFunction
-		case *types.Map:
-			return CompletionItemKindClass // Or Struct/Keyword depending on preference
-		case *types.Slice, *types.Array:
-			return CompletionItemKindClass // Or Struct/Keyword
-		case *types.Pointer:
-			// Look at the element type of the pointer
-			if elem := underlying.(*types.Pointer).Elem(); elem != nil {
-				// Recursively map the element type (avoid infinite recursion for self-referential types)
-				// For simplicity, just return Class for pointers for now.
-				return CompletionItemKindClass
-			}
+		case *types.Map, *types.Slice, *types.Array, *types.Pointer:
 			return CompletionItemKindClass
 		default:
-			return CompletionItemKindClass // General fallback for other type kinds
+			return CompletionItemKindClass
 		}
 	case *types.PkgName:
 		return CompletionItemKindModule
 	case *types.Builtin:
-		return CompletionItemKindFunction // Built-in functions like make, append
+		return CompletionItemKindFunction
 	case *types.Nil:
-		return CompletionItemKindValue // `nil` is a value
+		return CompletionItemKindValue
 	case *types.Label:
-		return CompletionItemKindReference // Labels are like references
+		return CompletionItemKindReference
 	default:
-		return CompletionItemKindText // Safest generic fallback
+		return CompletionItemKindText
 	}
 }
 
 // tokenPosToLSPLocation converts a token.Pos to an LSP Location.
-// Requires the token.File containing the position and the file content.
 func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logger *slog.Logger) (*Location, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -485,7 +594,7 @@ func tokenPosToLSPLocation(file *token.File, pos token.Pos, content []byte, logg
 		return nil, fmt.Errorf("invalid offset %d calculated from pos %d in file %s (size %d, content len %d)", offset, pos, file.Name(), file.Size(), len(content))
 	}
 
-	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger) // Pass logger
+	lspLine, lspChar, convErr := byteOffsetToLSPPosition(content, offset, logger)
 	if convErr != nil {
 		return nil, fmt.Errorf("failed converting byte offset %d to LSP position: %w", offset, convErr)
 	}
@@ -541,8 +650,8 @@ func nodeRangeToLSPRange(fset *token.FileSet, node ast.Node, content []byte, log
 		return nil, fmt.Errorf("invalid byte offsets calculated: start=%d, end=%d, file_size=%d, content_len=%d", startOffset, endOffset, fileSize, contentLen)
 	}
 
-	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger) // Pass logger
-	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)         // Pass logger
+	startLine, startChar, startErr := byteOffsetToLSPPosition(content, startOffset, logger)
+	endLine, endChar, endErr := byteOffsetToLSPPosition(content, endOffset, logger)
 
 	if startErr != nil || endErr != nil {
 		return nil, fmt.Errorf("failed converting offsets to LSP positions: startErr=%v, endErr=%v", startErr, endErr)

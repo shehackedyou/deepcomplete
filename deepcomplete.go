@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/ast"
 	"go/token"
 	"go/types"
 	"io"
@@ -26,7 +25,7 @@ import (
 
 	"github.com/dgraph-io/ristretto"
 	"go.etcd.io/bbolt"
-	"golang.org/x/tools/go/packages" // Added for packages.Package type hint
+	// Added for packages.Package type hint
 )
 
 // =============================================================================
@@ -37,8 +36,8 @@ var (
 	cacheBucketName = []byte("AnalysisCache") // Name of the bbolt bucket for caching.
 )
 
-// Core type definitions (Config, AstContextInfo, Diagnostic, etc.) are in deepcomplete_types.go.
-// Exported error variables (Err*) are in deepcomplete_errors.go.
+// Core type definitions are in deepcomplete_types.go.
+// Exported error variables are in deepcomplete_errors.go.
 
 // =============================================================================
 // Interfaces for Components
@@ -47,7 +46,6 @@ var (
 // LLMClient defines the interface for interacting with the language model backend.
 type LLMClient interface {
 	// GenerateStream sends a prompt to the LLM and returns a stream of generated text.
-	// It should return ErrOllamaUnavailable for connection/availability issues.
 	GenerateStream(ctx context.Context, prompt string, config Config, logger *stdslog.Logger) (io.ReadCloser, error)
 }
 
@@ -59,39 +57,23 @@ type Analyzer interface {
 	Analyze(ctx context.Context, filename string, version int, line, col int) (*AstContextInfo, error)
 
 	// GetIdentifierInfo attempts to find information about the identifier at the given position.
-	// Useful for Hover and Definition providers. Returns nil, nil if no identifier is found.
-	// Returns an error for loading or critical analysis issues.
 	GetIdentifierInfo(ctx context.Context, filename string, version int, line, col int) (*IdentifierInfo, error)
 
-	// GetEnclosingFuncInfo retrieves information about the function/method enclosing the position.
-	// GetEnclosingFuncInfo(ctx context.Context, filename string, version int, line, col int) (*EnclosingFuncInfo, error) // Example for future
+	// GetMemoryCache retrieves an item from the memory cache.
+	GetMemoryCache(key string) (any, bool)
+	// SetMemoryCache adds an item to the memory cache.
+	SetMemoryCache(key string, value any, cost int64, ttl time.Duration) bool
 
-	// GetScopeInfo retrieves variables/types available in the scope at the position.
-	// GetScopeInfo(ctx context.Context, filename string, version int, line, col int) (*ScopeInfo, error) // Example for future
-
-	// Close cleans up any resources used by the analyzer (e.g., cache connections).
+	// Close cleans up any resources used by the analyzer.
 	Close() error
-	// InvalidateCache removes cached data related to a specific directory (e.g., when go.mod changes).
+	// InvalidateCache removes cached data related to a specific directory.
 	InvalidateCache(dir string) error
-	// InvalidateMemoryCacheForURI removes memory-cached data for a specific file URI (e.g., on file change).
+	// InvalidateMemoryCacheForURI removes memory-cached data for a specific file URI.
 	InvalidateMemoryCacheForURI(uri string, version int) error
 	// MemoryCacheEnabled returns true if the in-memory cache is configured and active.
 	MemoryCacheEnabled() bool
 	// GetMemoryCacheMetrics returns performance metrics for the in-memory cache.
 	GetMemoryCacheMetrics() *ristretto.Metrics
-}
-
-// IdentifierInfo holds information specifically about an identifier found at a position.
-type IdentifierInfo struct {
-	Name       string            // Identifier name
-	Object     types.Object      // Resolved object (var, func, type, etc.)
-	Type       types.Type        // Resolved type
-	DefNode    ast.Node          // AST node where defined
-	DefFilePos token.Position    // Definition position (requires FileSet to interpret fully)
-	FileSet    *token.FileSet    // FileSet needed for position interpretation
-	Pkg        *packages.Package // Package containing the definition (might be different from requesting file's package)
-	Content    []byte            // Content of the file where the identifier was found (needed for range conversion)
-	IdentNode  *ast.Ident        // The *ast.Ident node itself for range calculation
 }
 
 // PromptFormatter defines the interface for constructing the final prompt sent to the LLM.
@@ -106,7 +88,6 @@ type PromptFormatter interface {
 
 // LoadConfig loads configuration from standard locations, merges with defaults,
 // validates, and attempts to write a default config if needed.
-// Returns the final Config and a non-fatal ErrConfig if warnings occurred.
 func LoadConfig(logger *stdslog.Logger) (Config, error) {
 	if logger == nil {
 		logger = stdslog.Default()
@@ -127,7 +108,7 @@ func LoadConfig(logger *stdslog.Logger) (Config, error) {
 		loaded, loadErr := LoadAndMergeConfig(primaryPath, &cfg, logger)
 		if loadErr != nil {
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				configParseError = loadErr // Store specific parse error
+				configParseError = loadErr
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", primaryPath, loadErr))
 			logger.Warn("Failed to load or merge config", "path", primaryPath, "error", loadErr)
@@ -143,7 +124,7 @@ func LoadConfig(logger *stdslog.Logger) (Config, error) {
 		loaded, loadErr := LoadAndMergeConfig(secondaryPath, &cfg, logger)
 		if loadErr != nil {
 			if configParseError == nil && strings.Contains(loadErr.Error(), "parsing config file JSON") {
-				configParseError = loadErr // Store specific parse error
+				configParseError = loadErr
 			}
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", secondaryPath, loadErr))
 			logger.Warn("Failed to load or merge config", "path", secondaryPath, "error", loadErr)
@@ -174,7 +155,7 @@ func LoadConfig(logger *stdslog.Logger) (Config, error) {
 			logger.Warn("Cannot determine path to write default config.")
 			loadErrors = append(loadErrors, errors.New("cannot determine default config path"))
 		}
-		cfg = getDefaultConfig() // Reset to defaults if write failed or no path found
+		cfg = getDefaultConfig()
 		logger.Info("Using default configuration values.")
 	}
 
@@ -658,7 +639,6 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	fset := token.NewFileSet()
 	targetPkg, targetFileAST, targetFile, _, loadErrors := loadPackageAndFile(ctx, absFilename, fset, opLogger)
 
-	// Check for critical load errors
 	if len(loadErrors) > 0 && targetPkg == nil {
 		combinedErr := errors.Join(loadErrors...)
 		opLogger.Error("Critical error loading package, cannot get identifier info", "error", combinedErr)
@@ -670,7 +650,6 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	}
 	if targetPkg.TypesInfo == nil {
 		opLogger.Warn("Type info is nil, identifier resolution might fail")
-		// Continue, but resolution might not work
 	}
 
 	// 2. Calculate Cursor Position
@@ -684,27 +663,22 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	opLogger = opLogger.With("cursorPos", cursorPos, "cursorPosStr", fset.PositionFor(cursorPos, true).String())
 
 	// 3. Find Path and Context Nodes (using helpers, potentially cached)
-	// Create a temporary AstContextInfo to pass to helpers
-	// Note: We don't need the full AstContextInfo here, just enough for findContextNodes
 	tempInfo := &AstContextInfo{
 		FilePath:       absFilename,
 		Version:        version,
 		CursorPos:      cursorPos,
-		TargetPackage:  targetPkg, // Pass loaded package info
+		TargetPackage:  targetPkg,
 		TargetFileSet:  fset,
 		TargetAstFile:  targetFileAST,
-		AnalysisErrors: make([]error, 0), // Initialize to capture errors from helpers
+		AnalysisErrors: make([]error, 0),
 	}
 
 	path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
 	if pathErr != nil {
 		opLogger.Warn("Error finding enclosing path", "error", pathErr)
-		// Continue if possible
 	}
-	// findContextNodes populates tempInfo.Identifier*, DefNode etc.
 	findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger)
 
-	// Log any non-fatal errors from findContextNodes
 	if len(tempInfo.AnalysisErrors) > 0 {
 		opLogger.Warn("Non-fatal errors during context node finding", "errors", errors.Join(tempInfo.AnalysisErrors...))
 	}
@@ -712,10 +686,9 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	// 4. Extract and Return Identifier Information
 	if tempInfo.IdentifierAtCursor == nil || tempInfo.IdentifierObject == nil {
 		opLogger.Debug("No identifier object found at cursor position")
-		return nil, nil // Not an error, just no identifier found
+		return nil, nil
 	}
 
-	// Read file content needed for range conversion later
 	fileContent, readErr := os.ReadFile(absFilename)
 	if readErr != nil {
 		opLogger.Error("Failed to read file content for identifier info", "error", readErr)
@@ -727,19 +700,40 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 		Object:    tempInfo.IdentifierObject,
 		Type:      tempInfo.IdentifierType,
 		DefNode:   tempInfo.IdentifierDefNode,
-		FileSet:   fset,                        // Include fileset
-		Pkg:       targetPkg,                   // Include package info
-		Content:   fileContent,                 // Include content
-		IdentNode: tempInfo.IdentifierAtCursor, // Store the identifier node
+		FileSet:   fset,
+		Pkg:       targetPkg,
+		Content:   fileContent,
+		IdentNode: tempInfo.IdentifierAtCursor,
 	}
 
-	// Get definition position if available
 	if defPos := identInfo.Object.Pos(); defPos.IsValid() {
-		identInfo.DefFilePos = fset.Position(defPos) // Store token.Position
+		identInfo.DefFilePos = fset.Position(defPos)
 	}
 
 	opLogger.Info("Identifier info retrieved successfully", "identifier", identInfo.Name)
-	return identInfo, nil // Return found info
+	return identInfo, nil // Return found info, ignore non-fatal analysis errors
+}
+
+// GetMemoryCache implements the Analyzer interface method.
+func (a *GoPackagesAnalyzer) GetMemoryCache(key string) (any, bool) {
+	a.mu.Lock()
+	cache := a.memoryCache
+	a.mu.Unlock()
+	if cache == nil {
+		return nil, false
+	}
+	return cache.Get(key)
+}
+
+// SetMemoryCache implements the Analyzer interface method.
+func (a *GoPackagesAnalyzer) SetMemoryCache(key string, value any, cost int64, ttl time.Duration) bool {
+	a.mu.Lock()
+	cache := a.memoryCache
+	a.mu.Unlock()
+	if cache == nil {
+		return false
+	}
+	return cache.SetWithTTL(key, value, cost, ttl)
 }
 
 // InvalidateCache removes the bbolt cached entry for a given directory.
@@ -879,7 +873,6 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				suffix = suffix[:endByte] + marker
 			}
 		}
-		// Use FIM tokens defined in types.go
 		return fmt.Sprintf(template, finalPreamble.String(), prefix, suffix)
 	} else {
 		template := config.PromptTemplate
