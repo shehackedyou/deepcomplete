@@ -677,7 +677,6 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 		select {
 		case <-ctx.Done():
 			attemptLogger.Warn("Context cancelled before attempt", "error", ctx.Err())
-			// Return the context error, wrapped to indicate it happened during retry setup
 			return fmt.Errorf("retry cancelled before attempt %d: %w", i+1, ctx.Err())
 		default:
 		}
@@ -687,56 +686,43 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 			return nil // Success
 		}
 
-		// Check for non-retryable errors (including context errors from *within* the operation)
 		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
 			attemptLogger.Warn("Attempt failed due to context error. Not retrying.", "error", lastErr)
-			return lastErr // Return the original context error
+			return lastErr
 		}
 
-		// Check for specific retryable Ollama errors
 		var ollamaErr *OllamaError
 		isRetryableOllama := errors.As(lastErr, &ollamaErr) &&
 			(ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests || ollamaErr.Status == http.StatusInternalServerError)
-
-		// Check for general network/connection errors (assuming ErrOllamaUnavailable wraps these)
 		isRetryableNetwork := errors.Is(lastErr, ErrOllamaUnavailable) || errors.Is(lastErr, ErrStreamProcessing)
-
 		isRetryable := isRetryableOllama || isRetryableNetwork
 
 		if !isRetryable {
 			attemptLogger.Warn("Attempt failed with non-retryable error.", "error", lastErr)
-			return lastErr // Return the original non-retryable error
+			return lastErr
 		}
 
-		// If it's the last attempt, break the loop and return the last error
 		if i == maxRetries-1 {
 			break
 		}
 
-		// Calculate delay with exponential backoff and jitter
-		// Jitter helps prevent thundering herd issues if multiple instances retry simultaneously.
-		jitter := time.Duration(rand.Int63n(int64(currentDelay) / 4)) // Jitter up to 25% of delay
+		jitter := time.Duration(rand.Int63n(int64(currentDelay) / 4))
 		waitDuration := currentDelay + jitter
 		attemptLogger.Warn("Attempt failed with retryable error. Retrying...", "error", lastErr, "delay", waitDuration)
 
-		// Wait for the duration or until the context is cancelled
 		select {
 		case <-ctx.Done():
 			attemptLogger.Warn("Context cancelled during retry wait", "error", ctx.Err())
-			// Return the context error, wrapped to indicate when cancellation occurred
 			return fmt.Errorf("retry cancelled during wait after attempt %d: %w", i+1, ctx.Err())
 		case <-time.After(waitDuration):
-			// Exponential backoff: double the delay for the next attempt, up to a maximum
 			currentDelay *= 2
-			maxDelay := 5 * time.Second // Set a reasonable max delay
+			maxDelay := 5 * time.Second
 			if currentDelay > maxDelay {
 				currentDelay = maxDelay
 			}
 		}
 	}
-	// If loop finishes, it means all retries failed
 	logger.Error("Operation failed after all retries.", "retries", maxRetries, "final_error", lastErr)
-	// Return the last error encountered, wrapped to indicate exhaustion of retries
 	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
 }
 
@@ -751,7 +737,7 @@ type Spinner struct {
 	stopChan chan struct{}
 	doneChan chan struct{}
 	running  bool
-	logger   *slog.Logger // Add logger to spinner
+	logger   *slog.Logger
 }
 
 func NewSpinner(logger *slog.Logger) *Spinner {
@@ -761,7 +747,7 @@ func NewSpinner(logger *slog.Logger) *Spinner {
 	return &Spinner{
 		chars:  []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		index:  0,
-		logger: logger.With("component", "Spinner"), // Add component context
+		logger: logger.With("component", "Spinner"),
 	}
 }
 
@@ -850,13 +836,17 @@ type SnippetContext struct {
 	Prefix   string
 	Suffix   string
 	FullLine string
+	// Added field for fallback context when AST is disabled
+	FallbackContext string
 }
 
-func extractSnippetContext(filename string, row, col int, logger *slog.Logger) (SnippetContext, error) {
+// extractSnippetContext extracts code prefix, suffix, and full line around the cursor.
+// If useAST is false, it attempts to include the enclosing function body as fallback context.
+func extractSnippetContext(filename string, row, col int, useAST bool, logger *slog.Logger) (SnippetContext, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger = logger.With("file", filename, "line", row, "col", col)
+	logger = logger.With("file", filename, "line", row, "col", col, "useAST", useAST)
 	var ctx SnippetContext
 
 	contentBytes, err := os.ReadFile(filename)
@@ -892,35 +882,86 @@ func extractSnippetContext(filename string, row, col int, logger *slog.Logger) (
 	ctx.Prefix = content[:offset]
 	ctx.Suffix = content[offset:]
 
+	// --- Extract Full Line ---
 	lineStartPos := file.LineStart(row)
 	if !lineStartPos.IsValid() {
 		logger.Warn("Could not get start position for line, cannot extract full line", "line", row)
-		return ctx, nil
-	}
-	startOffset := file.Offset(lineStartPos)
+		// Continue without full line if needed
+	} else {
+		startOffset := file.Offset(lineStartPos)
+		lineEndOffset := file.Size()
+		fileLineCount := file.LineCount()
+		if row < fileLineCount {
+			nextLineStartPos := file.LineStart(row + 1)
+			if nextLineStartPos.IsValid() {
+				lineEndOffset = file.Offset(nextLineStartPos)
+			} else {
+				logger.Warn("Could not get start position for next line", "line", row+1)
+			}
+		}
 
-	lineEndOffset := file.Size()
-	fileLineCount := file.LineCount()
-	if row < fileLineCount {
-		nextLineStartPos := file.LineStart(row + 1)
-		if nextLineStartPos.IsValid() {
-			lineEndOffset = file.Offset(nextLineStartPos)
+		if startOffset >= 0 && lineEndOffset >= startOffset && lineEndOffset <= len(content) {
+			lineContent := content[startOffset:lineEndOffset]
+			lineContent = strings.TrimRight(lineContent, "\n")
+			lineContent = strings.TrimRight(lineContent, "\r")
+			ctx.FullLine = lineContent
 		} else {
-			logger.Warn("Could not get start position for next line", "line", row+1)
+			logger.Warn("Could not extract full line content due to invalid offsets",
+				"startOffset", startOffset,
+				"lineEndOffset", lineEndOffset,
+				"contentLen", len(content))
 		}
 	}
 
-	if startOffset >= 0 && lineEndOffset >= startOffset && lineEndOffset <= len(content) {
-		lineContent := content[startOffset:lineEndOffset]
-		lineContent = strings.TrimRight(lineContent, "\n")
-		lineContent = strings.TrimRight(lineContent, "\r")
-		ctx.FullLine = lineContent
-	} else {
-		logger.Warn("Could not extract full line content due to invalid offsets",
-			"startOffset", startOffset,
-			"lineEndOffset", lineEndOffset,
-			"contentLen", len(content))
+	// --- Fallback Context if AST is Disabled ---
+	if !useAST {
+		logger.Debug("AST disabled, attempting to extract fallback context (enclosing function)")
+		// Simple heuristic: Find the 'func' keyword before the cursor
+		funcKeywordIndex := strings.LastIndex(ctx.Prefix, "\nfunc ")
+		if funcKeywordIndex == -1 { // Check from start if not found after newline
+			funcKeywordIndex = strings.Index(ctx.Prefix, "func ")
+		}
+
+		if funcKeywordIndex != -1 {
+			// Find the start of the function body '{'
+			braceIndex := strings.Index(content[funcKeywordIndex:], "{")
+			if braceIndex != -1 {
+				funcStartOffset := funcKeywordIndex + braceIndex + 1 // Start after '{'
+
+				// Find the matching '}' - This is naive and can be wrong with nested braces
+				// A simple balance counter is better than just finding the next '}'
+				balance := 1
+				funcEndOffset := -1
+				for i := funcStartOffset; i < len(content); i++ {
+					switch content[i] {
+					case '{':
+						balance++
+					case '}':
+						balance--
+						if balance == 0 {
+							funcEndOffset = i // Found matching brace
+							break
+						}
+					}
+				}
+
+				if funcEndOffset != -1 {
+					// Extract the function body (excluding braces)
+					fallback := content[funcStartOffset:funcEndOffset]
+					// Add a marker indicating it's fallback context
+					ctx.FallbackContext = "// Fallback Context (Enclosing Function Body - Approx.):\n" + fallback
+					logger.Debug("Extracted fallback function body context", "start", funcStartOffset, "end", funcEndOffset, "length", len(fallback))
+				} else {
+					logger.Warn("Could not find matching closing brace for fallback function context")
+				}
+			} else {
+				logger.Warn("Could not find opening brace '{' after 'func' keyword for fallback context")
+			}
+		} else {
+			logger.Debug("Could not find preceding 'func' keyword for fallback context")
+		}
 	}
+
 	return ctx, nil
 }
 
@@ -1088,7 +1129,73 @@ func firstN(s string, n int) string {
 // getPosString safely gets a position string or returns a placeholder.
 func getPosString(fset *token.FileSet, pos token.Pos) string {
 	if fset != nil && pos.IsValid() {
-		return fset.Position(pos).String()
+		// Use PositionFor for more control over output format if needed
+		// return fset.PositionFor(pos, true).String() // true for adjusted position
+		return fset.Position(pos).String() // Default position string
 	}
 	return fmt.Sprintf("Pos(%d)", pos)
+}
+
+// --- Helper for Fallback Context Extraction ---
+
+// findEnclosingFuncBody attempts to find the body of the function enclosing the offset.
+// This uses basic string searching and brace balancing, not full parsing.
+func findEnclosingFuncBody(content []byte, offset int) (string, bool) {
+	if offset < 0 || offset > len(content) {
+		return "", false
+	}
+
+	// Search backwards for "func " preceded by a newline or start of file
+	searchStart := offset
+	if searchStart > len(content) {
+		searchStart = len(content)
+	}
+	prefix := content[:searchStart]
+	funcKeywordIndex := strings.LastIndex(string(prefix), "\nfunc ")
+	if funcKeywordIndex == -1 {
+		if strings.HasPrefix(string(prefix), "func ") {
+			funcKeywordIndex = 0 // Found at the very beginning
+		} else {
+			return "", false // "func " not found before cursor
+		}
+	} else {
+		funcKeywordIndex++ // Adjust index to start of "func "
+	}
+
+	// Find the opening brace '{' after the "func " keyword
+	braceSearchStart := funcKeywordIndex + len("func ")
+	if braceSearchStart >= len(content) {
+		return "", false // No content after "func "
+	}
+	braceIndex := strings.Index(string(content[braceSearchStart:]), "{")
+	if braceIndex == -1 {
+		return "", false // Opening brace not found
+	}
+	funcBodyStartOffset := braceSearchStart + braceIndex + 1 // Position after '{'
+
+	// Find the matching closing brace '}' using a balance counter
+	balance := 1
+	funcBodyEndOffset := -1
+	for i := funcBodyStartOffset; i < len(content); i++ {
+		switch content[i] {
+		case '{':
+			balance++
+		case '}':
+			balance--
+			if balance == 0 {
+				funcBodyEndOffset = i // Found the matching brace
+				goto foundEnd         // Exit loop once matching brace is found
+			}
+		}
+	}
+foundEnd:
+
+	if funcBodyEndOffset != -1 && funcBodyEndOffset >= funcBodyStartOffset {
+		// Ensure the cursor offset is actually within this found function body
+		if offset >= funcBodyStartOffset && offset <= funcBodyEndOffset {
+			return string(content[funcBodyStartOffset:funcBodyEndOffset]), true
+		}
+	}
+
+	return "", false // Matching brace not found or cursor not inside
 }

@@ -140,7 +140,7 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		logger.Warn("Config validation: max_tokens is not positive, applying default.", "configured_value", c.MaxTokens, "default", tempDefault.MaxTokens)
 		c.MaxTokens = tempDefault.MaxTokens
 	}
-	// Validate Temperature range
+	// Validate Temperature range [0.0, 2.0]
 	if c.Temperature < 0.0 || c.Temperature > 2.0 {
 		logger.Warn("Config validation: temperature is outside reasonable range [0.0, 2.0], applying default.", "configured_value", c.Temperature, "default", tempDefault.Temperature)
 		validationErrors = append(validationErrors, fmt.Errorf("temperature %f is outside valid range [0.0, 2.0]", c.Temperature))

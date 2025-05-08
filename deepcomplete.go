@@ -243,39 +243,31 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		// --- Enhanced Error Handling ---
-		// Check for context cancellation first
 		if errors.Is(err, context.Canceled) {
 			logger.Warn("Ollama request context cancelled", "url", endpointURL)
-			return nil, context.Canceled // Return context error directly
+			return nil, context.Canceled
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			logger.Error("Ollama request context deadline exceeded", "url", endpointURL, "timeout", c.httpClient.Timeout)
-			// Wrap DeadlineExceeded with ErrOllamaUnavailable for classification
 			return nil, fmt.Errorf("%w: context deadline exceeded: %w", ErrOllamaUnavailable, context.DeadlineExceeded)
 		}
 
-		// Check for specific network errors
 		var netErr net.Error
 		if errors.As(err, &netErr) {
 			if netErr.Timeout() {
 				logger.Error("Network timeout connecting to Ollama", "host", u.Host, "error", netErr)
 				return nil, fmt.Errorf("%w: network timeout: %w", ErrOllamaUnavailable, netErr)
 			}
-			// Check for connection refused specifically
 			if opErr, ok := netErr.(*net.OpError); ok && opErr.Op == "dial" {
-				// Note: This check might be OS-dependent ("connection refused")
-				// A more general check is if opErr.Err contains "connection refused"
 				logger.Error("Connection refused or network error connecting to Ollama", "host", u.Host, "error", opErr)
 				return nil, fmt.Errorf("%w: connection failed: %w", ErrOllamaUnavailable, opErr)
 			}
 		}
 
-		// Generic HTTP/network error
 		logger.Error("HTTP request to Ollama failed", "url", endpointURL, "error", err)
 		return nil, fmt.Errorf("%w: http request failed: %w", ErrOllamaUnavailable, err)
 	}
 
-	// Check HTTP status code *after* checking for Do errors
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, readErr := io.ReadAll(resp.Body)
@@ -289,14 +281,11 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 				bodyString = ollamaErrResp.Error
 			}
 		}
-		// Use the custom OllamaError type to include status
 		apiErr := &OllamaError{Message: fmt.Sprintf("Ollama API request failed: %s", bodyString), Status: resp.StatusCode}
 		logger.Error("Ollama API returned non-OK status", "status", resp.Status, "response_body", bodyString)
-		// Wrap the specific OllamaError with the general ErrOllamaUnavailable
 		return nil, fmt.Errorf("%w: %w", ErrOllamaUnavailable, apiErr)
 	}
 
-	// Return the response body for streaming
 	return resp.Body, nil
 }
 
@@ -539,7 +528,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		if targetFile != nil {
 			analyzeStepErr := performAnalysisSteps(ctx, targetFile, targetFileAST, targetPkg, fset, line, col, a, info, analysisLogger)
 			if analyzeStepErr != nil {
-				// Error should already be added to info.AnalysisErrors or returned if fatal
 				analysisLogger.Error("Error during performAnalysisSteps", "error", analyzeStepErr)
 			}
 		} else {
@@ -702,31 +690,56 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 	if logger == nil {
 		logger = stdslog.Default()
 	}
-	var finalPrompt strings.Builder
+	var finalPreamble strings.Builder // Use builder for efficient preamble construction
 	template := config.PromptTemplate
 	maxPreambleLen := config.MaxPreambleLen
 	maxSnippetLen := config.MaxSnippetLen
 	maxFIMPartLen := maxSnippetLen / 2
 
-	if len(contextPreamble) > maxPreambleLen {
-		logger.Warn("Truncating context preamble", "original_length", len(contextPreamble), "max_length", maxPreambleLen)
+	// --- Add Fallback Context if present ---
+	if snippetCtx.FallbackContext != "" {
+		// Apply truncation to fallback context separately if needed
+		truncatedFallback := snippetCtx.FallbackContext
+		if len(truncatedFallback) > maxPreambleLen {
+			logger.Warn("Truncating fallback context", "original_length", len(truncatedFallback), "max_length", maxPreambleLen)
+			marker := "// ... (Fallback context truncated)\n"
+			startByte := len(truncatedFallback) - maxPreambleLen + len(marker)
+			if startByte < 0 {
+				startByte = 0
+			}
+			if len(marker)+len(truncatedFallback[startByte:]) > maxPreambleLen {
+				truncatedFallback = truncatedFallback[len(truncatedFallback)-maxPreambleLen:]
+			} else {
+				truncatedFallback = marker + truncatedFallback[startByte:]
+			}
+		}
+		finalPreamble.WriteString(truncatedFallback)
+		finalPreamble.WriteString("\n---\n") // Separator
+	}
+
+	// --- Add Main Preamble (AST-based or default) ---
+	truncatedPreamble := contextPreamble
+	if len(truncatedPreamble) > maxPreambleLen {
+		logger.Warn("Truncating context preamble", "original_length", len(truncatedPreamble), "max_length", maxPreambleLen)
 		marker := "... (context truncated)\n"
-		startByte := len(contextPreamble) - maxPreambleLen + len(marker)
+		startByte := len(truncatedPreamble) - maxPreambleLen + len(marker)
 		if startByte < 0 {
 			startByte = 0
 		}
-		if len(marker)+len(contextPreamble[startByte:]) > maxPreambleLen {
-			contextPreamble = contextPreamble[len(contextPreamble)-maxPreambleLen:]
+		if len(marker)+len(truncatedPreamble[startByte:]) > maxPreambleLen {
+			truncatedPreamble = truncatedPreamble[len(truncatedPreamble)-maxPreambleLen:]
 		} else {
-			contextPreamble = marker + contextPreamble[startByte:]
+			truncatedPreamble = marker + truncatedPreamble[startByte:]
 		}
 	}
+	finalPreamble.WriteString(truncatedPreamble) // Append the (potentially truncated) main preamble
+
+	// --- Format Snippet based on FIM ---
+	prefix := snippetCtx.Prefix
+	suffix := snippetCtx.Suffix
 
 	if config.UseFim {
 		template = config.FimTemplate
-		prefix := snippetCtx.Prefix
-		suffix := snippetCtx.Suffix
-
 		if len(prefix) > maxFIMPartLen {
 			logger.Warn("Truncating FIM prefix", "original_length", len(prefix), "max_length", maxFIMPartLen)
 			marker := "...(prefix truncated)"
@@ -753,9 +766,11 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				suffix = suffix[:endByte] + marker
 			}
 		}
-		fmt.Fprintf(&finalPrompt, template, contextPreamble, prefix, suffix)
+		// Format FIM template with combined preamble, prefix, and suffix
+		return fmt.Sprintf(template, finalPreamble.String(), prefix, suffix)
 	} else {
-		snippet := snippetCtx.Prefix
+		// Non-FIM uses only prefix as the snippet
+		snippet := prefix
 		if len(snippet) > maxSnippetLen {
 			logger.Warn("Truncating code snippet (prefix)", "original_length", len(snippet), "max_length", maxSnippetLen)
 			marker := "...(code truncated)\n"
@@ -769,9 +784,9 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				snippet = marker + snippet[startByte:]
 			}
 		}
-		fmt.Fprintf(&finalPrompt, template, contextPreamble, snippet)
+		// Format non-FIM template with combined preamble and snippet (prefix)
+		return fmt.Sprintf(template, finalPreamble.String(), snippet)
 	}
-	return finalPrompt.String()
 }
 
 // =============================================================================
@@ -837,7 +852,6 @@ func NewDeepCompleterWithConfig(config Config, logger *stdslog.Logger) (*DeepCom
 		config.FimTemplate = fimPromptTemplate
 	}
 	if err := config.Validate(serviceLogger); err != nil {
-		// Wrap validation error
 		return nil, fmt.Errorf("provided config validation failed: %w", err)
 	}
 
@@ -870,7 +884,6 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 	}
 	if err := newConfig.Validate(dc.logger); err != nil {
 		dc.logger.Error("Invalid configuration provided for update", "error", err)
-		// Wrap validation error
 		return fmt.Errorf("invalid configuration update: %w", err)
 	}
 
@@ -938,6 +951,7 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 	currentConfig := dc.GetCurrentConfig()
 
 	contextPreamble := "// Provide Go code completion below."
+	// For basic completion, AST is not used, so pass false
 	snippetCtx := SnippetContext{Prefix: codeSnippet, Suffix: "", FullLine: ""}
 
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig, opLogger)
@@ -956,7 +970,6 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 		opLogger.Debug("Calling Ollama GenerateStream for basic completion")
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig, opLogger)
 		if apiErr != nil {
-			// No need to wrap here, client should return wrapped errors already
 			return apiErr
 		}
 		defer reader.Close()
@@ -967,7 +980,6 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 		buffer.Reset()
 		streamErr := streamCompletion(streamCtx, reader, &buffer, opLogger)
 		if streamErr != nil {
-			// Wrap stream error
 			return fmt.Errorf("streaming completion failed: %w", streamErr)
 		}
 		return nil
@@ -977,25 +989,21 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 	if err != nil {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err() // Return context error directly if outer context cancelled
+			return "", ctx.Err()
 		default:
 		}
-		// Check specific underlying errors after retries
 		if errors.Is(err, ErrOllamaUnavailable) {
 			opLogger.Error("Ollama unavailable for basic completion after retries", "error", err)
-			// Return the wrapped error containing ErrOllamaUnavailable
 			return "", err
 		}
 		if errors.Is(err, ErrStreamProcessing) {
 			opLogger.Error("Stream processing error for basic completion after retries", "error", err)
-			// Return the wrapped error containing ErrStreamProcessing
 			return "", err
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			opLogger.Warn("Basic completion context cancelled or timed out after retries", "error", err)
-			return "", err // Return the context error
+			return "", err
 		}
-		// Generic failure after retries
 		opLogger.Error("Failed to get basic completion after retries", "error", err)
 		return "", fmt.Errorf("failed to get basic completion after %d retries: %w", maxRetries, err)
 	}
@@ -1009,7 +1017,7 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFilename string, version int, line, col int, w io.Writer) error {
 	opLogger := dc.logger.With("operation", "GetCompletionStreamFromFile", "path", absFilename, "version", version, "line", line, "col", col)
 	currentConfig := dc.GetCurrentConfig()
-	var contextPreamble string = "// Basic file context only."
+	var contextPreamble string = "// Basic file context only." // Default preamble
 	var analysisInfo *AstContextInfo
 	var analysisErr error // Stores non-fatal analysis errors (ErrAnalysisFailed)
 
@@ -1021,10 +1029,8 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 
 		if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) {
 			opLogger.Error("Fatal error during analysis/cache check", "error", analysisErr)
-			// Wrap fatal analysis error
 			return fmt.Errorf("analysis failed fatally: %w", analysisErr)
 		}
-		// If analysisErr is ErrAnalysisFailed, log it but proceed
 		if analysisErr != nil {
 			opLogger.Warn("Non-fatal error during analysis/cache check", "error", analysisErr)
 			if analysisInfo != nil && analysisInfo.PromptPreamble != "" {
@@ -1041,12 +1047,16 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 		opLogger.Info("AST analysis disabled by config.")
 	}
 
-	snippetCtx, snippetErr := extractSnippetContext(absFilename, line, col, opLogger)
+	// Pass currentConfig.UseAst to extractSnippetContext
+	snippetCtx, snippetErr := extractSnippetContext(absFilename, line, col, currentConfig.UseAst, opLogger)
 	if snippetErr != nil {
 		opLogger.Error("Failed to extract code snippet context", "error", snippetErr)
-		// Wrap snippet extraction error
 		return fmt.Errorf("failed to extract code snippet context: %w", snippetErr)
 	}
+
+	// If AST was disabled and fallback context was generated, prepend it to the main preamble
+	// Note: The formatter now handles prepending fallback context.
+	// No change needed here for contextPreamble construction itself.
 
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig, opLogger)
 	opLogger.Debug("Generated prompt", "length", len(prompt))
@@ -1062,12 +1072,11 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 		opLogger.Debug("Calling Ollama GenerateStream")
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig, opLogger)
 		if apiErr != nil {
-			return apiErr // Propagate client error (already wrapped)
+			return apiErr
 		}
 		defer reader.Close()
 		streamErr := streamCompletion(apiCtx, reader, w, opLogger)
 		if streamErr != nil {
-			// Wrap stream error
 			return fmt.Errorf("streaming completion failed: %w", streamErr)
 		}
 		return nil
@@ -1080,32 +1089,26 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 			return ctx.Err()
 		default:
 		}
-		// Check specific underlying errors after retries
 		if errors.Is(err, ErrOllamaUnavailable) {
 			opLogger.Error("Ollama unavailable for stream after retries", "error", err)
-			return err // Return wrapped ErrOllamaUnavailable
+			return err
 		}
 		if errors.Is(err, ErrStreamProcessing) {
 			opLogger.Error("Stream processing error for stream after retries", "error", err)
-			return err // Return wrapped ErrStreamProcessing
+			return err
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			opLogger.Warn("Completion stream context cancelled or timed out after retries", "error", err)
-			return err // Return context error
+			return err
 		}
-		// Generic failure after retries
 		opLogger.Error("Failed to get completion stream after retries", "error", err)
 		return fmt.Errorf("failed to get completion stream after %d retries: %w", maxRetries, err)
 	}
 
-	// Log analysis errors even if completion succeeded
 	if analysisErr != nil {
 		opLogger.Warn("Completion stream successful, but context analysis encountered non-fatal errors", "analysis_error", analysisErr)
-		// Optionally return analysisErr here if you want the caller to know,
-		// but typically LSP completion doesn't fail just because analysis had warnings.
-		// return analysisErr
 	} else {
 		opLogger.Info("Completion stream successful")
 	}
-	return nil // Success
+	return nil
 }
