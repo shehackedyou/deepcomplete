@@ -17,6 +17,8 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+// analysisCacheTTL is now derived from config within the analyzer
+
 // ============================================================================
 // Analysis Step Orchestration & Core Logic Helpers
 // ============================================================================
@@ -137,7 +139,7 @@ func performAnalysisSteps(
 	return nil
 }
 
-// findEnclosingPathAndNodes finds the AST path and identifies context nodes.
+// findEnclosingPathAndNodes finds the AST node path and identifies context nodes.
 // Populates info struct directly. Returns the path and any fatal error.
 // Uses memory cache for the path finding part.
 // NOTE: This function is part of the refactoring target.
@@ -163,7 +165,7 @@ func findEnclosingPathAndNodes(
 	}
 
 	// Get TTL from config via analyzer
-	currentConfig := analyzer.(*GoPackagesAnalyzer).getConfig()
+	currentConfig := analyzer.(*GoPackagesAnalyzer).getConfig() // Need concrete type to get config
 	ttl := currentConfig.MemoryCacheTTL
 
 	path, cacheHit, pathErr := withMemoryCache[[]ast.Node](analyzer, cacheKey, 1, ttl, computePathFn, pathLogger)
@@ -203,20 +205,23 @@ func extractScopeInformation(
 	cacheKey := generateCacheKey("scopeInfo", info)
 	computeScopeFn := func() (map[string]types.Object, error) {
 		tempScopeMap := make(map[string]types.Object)
-		tempInfoCopy := *info
+		// Pass pointer to tempInfo to capture errors and context
+		tempInfoPtr := info          // Keep original pointer
+		tempInfoCopy := *tempInfoPtr // Create a copy of the struct for modification
 		tempInfoCopy.VariablesInScope = tempScopeMap
-		tempInfoCopy.AnalysisErrors = make([]error, len(info.AnalysisErrors))
-		copy(tempInfoCopy.AnalysisErrors, info.AnalysisErrors)
+		tempInfoCopy.AnalysisErrors = make([]error, 0) // Reset errors for this computation
 
-		gatherScopeContext(ctx, path, targetPkg, info.TargetFileSet, &tempInfoCopy, scopeLogger)
-
-		var newErrors []error
-		if len(tempInfoCopy.AnalysisErrors) > len(info.AnalysisErrors) {
-			newErrors = tempInfoCopy.AnalysisErrors[len(info.AnalysisErrors):]
+		// Path needed for block scopes
+		// Re-find path within computeFn as it might not be available outside
+		pathForScope, pathErr := findEnclosingPath(ctx, info.TargetAstFile, cursorPos, &tempInfoCopy, scopeLogger) // Use info's AST
+		if pathErr != nil {
+			addAnalysisError(&tempInfoCopy, fmt.Errorf("finding enclosing path failed for scope: %w", pathErr), scopeLogger)
 		}
 
-		if len(newErrors) > 0 {
-			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(newErrors...))
+		gatherScopeContext(ctx, pathForScope, targetPkg, info.TargetFileSet, &tempInfoCopy, scopeLogger)
+
+		if len(tempInfoCopy.AnalysisErrors) > 0 {
+			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(tempInfoCopy.AnalysisErrors...))
 		}
 		return tempScopeMap, nil
 	}
@@ -226,7 +231,7 @@ func extractScopeInformation(
 	ttl := currentConfig.MemoryCacheTTL
 
 	computedScope, cacheHit, scopeErr := withMemoryCache[map[string]types.Object](
-		analyzer, cacheKey, int64(len(info.VariablesInScope)+1), ttl, computeScopeFn, scopeLogger,
+		analyzer, cacheKey, 10, ttl, computeScopeFn, scopeLogger, // Cost 10 for scope map
 	)
 
 	if scopeErr != nil {
@@ -250,7 +255,7 @@ func extractScopeInformation(
 func extractRelevantComments(
 	ctx context.Context,
 	targetFileAST *ast.File,
-	path []ast.Node,
+	path []ast.Node, // Path might be stale if called after cache hit for path
 	cursorPos token.Pos,
 	fset *token.FileSet,
 	analyzer Analyzer,
@@ -265,20 +270,22 @@ func extractRelevantComments(
 	// --- Cache Comment Extraction ---
 	cacheKey := generateCacheKey("comments", info)
 	computeCommentsFn := func() ([]string, error) {
-		tempInfoCopy := *info // Create copy
+		// Pass pointer to tempInfo
+		tempInfoPtr := info          // Keep original pointer
+		tempInfoCopy := *tempInfoPtr // Create copy
 		tempInfoCopy.CommentsNearCursor = nil
-		tempInfoCopy.AnalysisErrors = make([]error, len(info.AnalysisErrors))
-		copy(tempInfoCopy.AnalysisErrors, info.AnalysisErrors)
+		tempInfoCopy.AnalysisErrors = make([]error, 0)
 
-		findRelevantComments(ctx, targetFileAST, path, cursorPos, fset, &tempInfoCopy, commentLogger)
-
-		var newErrors []error
-		if len(tempInfoCopy.AnalysisErrors) > len(info.AnalysisErrors) {
-			newErrors = tempInfoCopy.AnalysisErrors[len(info.AnalysisErrors):]
+		// Re-find path within computeFn to ensure it's correct
+		pathForComments, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, &tempInfoCopy, commentLogger)
+		if pathErr != nil {
+			addAnalysisError(&tempInfoCopy, fmt.Errorf("finding enclosing path failed for comments: %w", pathErr), commentLogger)
 		}
 
-		if len(newErrors) > 0 {
-			return tempInfoCopy.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(newErrors...))
+		findRelevantComments(ctx, targetFileAST, pathForComments, cursorPos, fset, &tempInfoCopy, commentLogger)
+
+		if len(tempInfoCopy.AnalysisErrors) > 0 {
+			return tempInfoCopy.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(tempInfoCopy.AnalysisErrors...))
 		}
 		return tempInfoCopy.CommentsNearCursor, nil
 	}
@@ -288,7 +295,7 @@ func extractRelevantComments(
 	ttl := currentConfig.MemoryCacheTTL
 
 	computedComments, cacheHit, commentErr := withMemoryCache[[]string](
-		analyzer, cacheKey, estimateCost(info.CommentsNearCursor), ttl, computeCommentsFn, commentLogger,
+		analyzer, cacheKey, 5, ttl, computeCommentsFn, commentLogger, // Cost 5 for comments
 	)
 
 	if commentErr != nil {
@@ -312,12 +319,12 @@ func extractRelevantComments(
 func findEnclosingPath(ctx context.Context, targetFileAST *ast.File, cursorPos token.Pos, info *AstContextInfo, logger *slog.Logger) ([]ast.Node, error) {
 	if targetFileAST == nil {
 		err := errors.New("cannot find enclosing path: targetFileAST is nil")
-		addAnalysisError(info, err, logger)
+		// Avoid adding error directly to info here, let caller handle it
 		return nil, err
 	}
 	if !cursorPos.IsValid() {
 		err := errors.New("cannot find enclosing path: invalid cursor position")
-		addAnalysisError(info, err, logger)
+		// Avoid adding error directly to info here
 		return nil, err
 	}
 	path, _ := astutil.PathEnclosingInterval(targetFileAST, cursorPos, cursorPos)

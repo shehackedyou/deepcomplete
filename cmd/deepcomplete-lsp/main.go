@@ -85,12 +85,15 @@ func main() {
 		slog.Warn("DeepCompleter initialized with configuration warnings", "error", initErr)
 	}
 
-	// --- Check Ollama Availability ---
+	// --- Check Ollama Availability (Cycle N+5) ---
+	// Use a background context for the initial check
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer checkCancel()
 	// Use the new Client() getter method
 	if err := completer.Client().CheckAvailability(checkCtx, completer.GetCurrentConfig(), finalLogger); err != nil {
 		slog.Error("Initial Ollama availability check failed. Completions may not work.", "error", err)
+		// Optionally send a showMessage notification if LSP connection were already established,
+		// but here it's too early. Log is sufficient.
 	} else {
 		slog.Info("Initial Ollama availability check successful.")
 	}

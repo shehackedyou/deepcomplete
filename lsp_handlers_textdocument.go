@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/types" // Needed for signature help formatting
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -143,7 +145,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	completionLogger.Info("Handling textDocument/completion")
 
 	s.filesMu.RLock()
-	fileData, ok := s.files[uri] // Renamed 'file' to 'fileData' to avoid conflict
+	fileData, ok := s.files[uri]
 	s.filesMu.RUnlock()
 
 	if !ok {
@@ -260,7 +262,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	hoverLogger.Info("Handling textDocument/hover")
 
 	s.filesMu.RLock()
-	fileData, ok := s.files[uri] // Renamed 'file' to 'fileData'
+	fileData, ok := s.files[uri]
 	s.filesMu.RUnlock()
 
 	if !ok {
@@ -466,7 +468,7 @@ func (s *Server) handleCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req 
 		actionLogger.Debug("Considering diagnostic for code action", "diagnostic_code", diag.Code, "diagnostic_source", diag.Source, "diagnostic_message", diag.Message)
 
 		// Example: Offer a quick fix for unresolved identifiers
-		if diag.Source == "deepcomplete-analyzer" && diag.Code == "unresolved-identifier" {
+		if diag.Source == DiagSourceAnalyzer && diag.Code == DiagCodeUnresolvedIdentifier {
 			// TODO: Implement actual fix logic (e.g., suggest imports, create variable)
 			action := CodeAction{
 				Title:       fmt.Sprintf("Placeholder: Fix unresolved identifier '%s'", diag.Message[len("unresolved identifier: "):]),
@@ -477,7 +479,7 @@ func (s *Server) handleCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req 
 			actionLogger.Debug("Added placeholder quickfix for unresolved identifier")
 		}
 		// Example: Offer quick fix for basic unused variable check
-		if diag.Source == "deepcomplete-analyzer" && diag.Code == "unused-variable" {
+		if diag.Source == DiagSourceAnalyzer && diag.Code == DiagCodeUnusedVariable {
 			var varName string
 			parts := strings.SplitN(diag.Message, "'", 3)
 			if len(parts) == 3 {
@@ -519,20 +521,150 @@ func (s *Server) handleCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req 
 }
 
 // handleSignatureHelp handles the 'textDocument/signatureHelp' request.
-// Currently a stub.
+// Attempts to provide signature help based on enclosing call expression.
 func (s *Server) handleSignatureHelp(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params SignatureHelpParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	lspPos := params.Position
 	sigLogger := logger.With("uri", uri, "lsp_line", lspPos.Line, "lsp_char", lspPos.Character, "req_id", req.ID)
-	sigLogger.Info("Handling textDocument/signatureHelp (stub)")
+	sigLogger.Info("Handling textDocument/signatureHelp")
 
-	// TODO: Implement signature help logic
-	// 1. Get file content
-	// 2. Convert position
-	// 3. Analyze using analyzer to find enclosing CallExpr and its signature
-	// 4. Determine active parameter based on cursor position within args
-	// 5. Format signature information into SignatureHelp struct
+	s.filesMu.RLock()
+	fileData, ok := s.files[uri]
+	s.filesMu.RUnlock()
+	if !ok {
+		sigLogger.Warn("SignatureHelp request for unknown file")
+		return nil, nil // Return null if file not found
+	}
 
-	// Return nil for now to indicate no signature help is available
-	return nil, nil
+	line, col, _, posErr := LspPositionToBytePosition(fileData.Content, lspPos, sigLogger)
+	if posErr != nil {
+		sigLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
+		return nil, nil
+	}
+	sigLogger = sigLogger.With("go_line", line, "go_col", col)
+
+	absPath, pathErr := ValidateAndGetFilePath(string(uri), sigLogger)
+	if pathErr != nil {
+		sigLogger.Error("Invalid file URI", "error", pathErr)
+		return nil, nil // Don't return error to client, just null result
+	}
+
+	analysisCtx, cancel := context.WithTimeout(ctx, 5*time.Second) // Shorter timeout for signature help
+	defer cancel()
+
+	// Use Analyze for now, as GetEnclosingContext doesn't return everything needed yet
+	// TODO: Refactor Analyze further or add a specific GetCallContext method
+	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, fileData.Version, line, col)
+
+	select {
+	case <-analysisCtx.Done():
+		sigLogger.Info("SignatureHelp analysis cancelled or timed out", "error", analysisCtx.Err())
+		return nil, nil
+	default:
+	}
+
+	if analysisErr != nil {
+		sigLogger.Warn("Analysis for signature help encountered errors", "error", analysisErr)
+		return nil, nil
+	}
+	if analysisInfo == nil {
+		sigLogger.Warn("Analysis returned nil info for signature help")
+		return nil, nil
+	}
+
+	// Check if the cursor is inside a call expression
+	if analysisInfo.CallExpr == nil || analysisInfo.CallExprFuncType == nil {
+		sigLogger.Debug("Cursor not inside a known call expression")
+		return nil, nil
+	}
+
+	sig := analysisInfo.CallExprFuncType
+	paramsTuple := sig.Params()
+
+	// Format parameters
+	var parameters []ParameterInformation
+	if paramsTuple != nil {
+		for i := 0; i < paramsTuple.Len(); i++ {
+			p := paramsTuple.At(i)
+			if p != nil {
+				// TODO: Add documentation lookup for parameters if possible
+				parameters = append(parameters, ParameterInformation{
+					Label: types.ObjectString(p, types.RelativeTo(analysisInfo.TargetPackage.Types)), // Use appropriate qualifier
+				})
+			}
+		}
+	}
+
+	// Format signature label
+	var sigLabelBuilder strings.Builder
+	if analysisInfo.IdentifierObject != nil { // Use resolved object name if available
+		sigLabelBuilder.WriteString(analysisInfo.IdentifierObject.Name())
+	} else { // Fallback to AST name
+		switch fun := analysisInfo.CallExpr.Fun.(type) {
+		case *ast.Ident:
+			sigLabelBuilder.WriteString(fun.Name)
+		case *ast.SelectorExpr:
+			if fun.Sel != nil {
+				sigLabelBuilder.WriteString(fun.Sel.Name)
+			} else {
+				sigLabelBuilder.WriteString("(unknown)")
+			}
+		default:
+			sigLabelBuilder.WriteString("(unknown)")
+		}
+	}
+	sigLabelBuilder.WriteString("(")
+	for i, p := range parameters {
+		if i > 0 {
+			sigLabelBuilder.WriteString(", ")
+		}
+		// Assuming label is string for now, might need adjustment if label offsets are used
+		if labelStr, ok := p.Label.(string); ok {
+			sigLabelBuilder.WriteString(labelStr)
+		}
+	}
+	sigLabelBuilder.WriteString(")")
+	// TODO: Add result types to label
+
+	sigInfo := SignatureInformation{
+		Label:      sigLabelBuilder.String(),
+		Parameters: parameters,
+		// Documentation: // TODO: Add function documentation
+	}
+
+	// Determine active parameter
+	activeParam := uint32(analysisInfo.CallArgIndex)
+	// Clamp active parameter index if it's out of bounds
+	if paramsTuple == nil || activeParam >= uint32(paramsTuple.Len()) {
+		// If variadic and cursor is at or after the variadic param, keep it clamped to the last param index
+		if sig.Variadic() && paramsTuple != nil && activeParam >= uint32(paramsTuple.Len()-1) {
+			activeParam = uint32(paramsTuple.Len() - 1)
+		} else {
+			// If not variadic or before variadic param, and index is invalid, maybe set to nil?
+			// LSP spec allows nil for activeParameter. Setting to 0 might be confusing.
+			// Let's try setting it to nil if index is clearly out of bounds.
+			if paramsTuple != nil && activeParam >= uint32(paramsTuple.Len()) {
+				sigHelp := &SignatureHelp{
+					Signatures:      []SignatureInformation{sigInfo},
+					ActiveSignature: new(uint32), // Pointer to 0
+					ActiveParameter: nil,         // Indicate no specific parameter is active
+				}
+				sigLogger.Debug("Active parameter index out of bounds, setting to null")
+				return sigHelp, nil
+			}
+			// Default to 0 if clamping isn't straightforward or index is negative (shouldn't happen)
+			activeParam = 0
+			sigLogger.Debug("Clamping active parameter index", "calculated_index", analysisInfo.CallArgIndex, "num_params", paramsTuple.Len())
+
+		}
+	}
+
+	sigHelp := &SignatureHelp{
+		Signatures:      []SignatureInformation{sigInfo},
+		ActiveSignature: new(uint32), // Pointer to 0 (index of the first signature)
+		ActiveParameter: &activeParam,
+	}
+
+	sigLogger.Info("Signature help provided", "active_param", activeParam)
+	return sigHelp, nil
 }
