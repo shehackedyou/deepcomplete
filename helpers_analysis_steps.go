@@ -12,9 +12,16 @@ import (
 	"go/token"
 	"go/types"
 	"log/slog"
+	"strings"
+	"time" // Added for cache TTL
 
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
+)
+
+const (
+	// Default TTL for memory cache entries related to analysis steps
+	analysisCacheTTL = 5 * time.Minute
 )
 
 // ============================================================================
@@ -48,7 +55,11 @@ func performAnalysisSteps(
 	if targetFile == nil {
 		logger.Warn("Target token.File is nil, proceeding with package scope analysis only.")
 		addAnalysisError(info, errors.New("target token.File is nil, cannot perform file-specific analysis"), logger) // Pass logger
-		gatherScopeContext(ctx, nil, targetPkg, fset, info, logger)                                                   // Pass ctx, logger
+		// Pass ctx, logger, analyzer interface
+		scopeErr := extractScopeInformation(ctx, nil, targetPkg, token.NoPos, analyzer, info, logger)
+		if scopeErr != nil {
+			logger.Warn("Error extracting package scope information", "error", scopeErr)
+		}
 		return nil
 	}
 
@@ -56,9 +67,13 @@ func performAnalysisSteps(
 	cursorPos, posErr := calculateCursorPos(targetFile, line, col, logger) // Pass logger
 	if posErr != nil {
 		err := fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
-		addAnalysisError(info, err, logger)                         // Pass logger
-		gatherScopeContext(ctx, nil, targetPkg, fset, info, logger) // Pass ctx, logger
-		return err
+		addAnalysisError(info, err, logger) // Pass logger
+		// Attempt package scope analysis even with invalid cursor
+		scopeErr := extractScopeInformation(ctx, nil, targetPkg, token.NoPos, analyzer, info, logger) // Pass ctx, logger, analyzer interface
+		if scopeErr != nil {
+			logger.Warn("Error extracting package scope information after cursor error", "error", scopeErr)
+		}
+		return err // Return the original cursor position error
 	}
 	info.CursorPos = cursorPos
 	logger = logger.With("cursorPos", info.CursorPos, "cursorPosStr", fset.PositionFor(info.CursorPos, true).String())
@@ -66,21 +81,27 @@ func performAnalysisSteps(
 
 	if targetFileAST != nil {
 		// Pass down analyzer interface, context, and logger
+		// This function now uses caching internally
 		path, pathErr := findEnclosingPathAndNodes(ctx, targetFileAST, info.CursorPos, targetPkg, fset, analyzer, info, logger)
 		if pathErr != nil {
 			logger.Warn("Error finding enclosing path or nodes, context may be less accurate", "error", pathErr)
+			// Continue analysis if possible, pathErr is already added to info.AnalysisErrors
 		}
 
 		// Pass down analyzer interface, context, and logger
+		// This function now uses caching internally
 		scopeErr := extractScopeInformation(ctx, path, targetPkg, info.CursorPos, analyzer, info, logger)
 		if scopeErr != nil {
 			logger.Warn("Error extracting scope information", "error", scopeErr)
+			// Error is added to info.AnalysisErrors internally
 		}
 
 		// Pass down analyzer interface, context, and logger
+		// This function now uses caching internally
 		commentErr := extractRelevantComments(ctx, targetFileAST, path, info.CursorPos, fset, analyzer, info, logger)
 		if commentErr != nil {
 			logger.Warn("Error extracting relevant comments", "error", commentErr)
+			// Error is added to info.AnalysisErrors internally
 		}
 
 		// Pass logger
@@ -88,7 +109,11 @@ func performAnalysisSteps(
 
 	} else {
 		addAnalysisError(info, errors.New("cannot perform detailed AST analysis: targetFileAST is nil"), logger) // Pass logger
-		gatherScopeContext(ctx, nil, targetPkg, fset, info, logger)                                              // Pass ctx, logger
+		// Attempt package scope analysis even without AST
+		scopeErr := extractScopeInformation(ctx, nil, targetPkg, token.NoPos, analyzer, info, logger) // Pass ctx, logger, analyzer interface
+		if scopeErr != nil {
+			logger.Warn("Error extracting package scope information without AST", "error", scopeErr)
+		}
 	}
 
 	return nil
@@ -96,6 +121,7 @@ func performAnalysisSteps(
 
 // findEnclosingPathAndNodes finds the AST path and identifies context nodes.
 // Populates info struct directly. Returns the path and any fatal error.
+// Uses memory cache for the path finding part.
 func findEnclosingPathAndNodes(
 	ctx context.Context, // Pass context
 	targetFileAST *ast.File,
@@ -106,17 +132,38 @@ func findEnclosingPathAndNodes(
 	info *AstContextInfo, // Populate this struct
 	logger *slog.Logger,
 ) ([]ast.Node, error) {
-
-	path, pathFindErr := findEnclosingPath(ctx, targetFileAST, cursorPos, info, logger) // Pass ctx, logger
-	if pathFindErr != nil {
-		return nil, pathFindErr
+	if logger == nil {
+		logger = slog.Default()
 	}
-	findContextNodes(ctx, path, cursorPos, pkg, fset, analyzer, info, logger) // Pass ctx, logger, analyzer interface
+	pathLogger := logger.With("op", "findEnclosingPathAndNodes")
+
+	// --- Cache Path Finding ---
+	cacheKey := generateCacheKey("astPath", info) // Use helper from helpers_cache.go
+	computePathFn := func() ([]ast.Node, error) {
+		return findEnclosingPath(ctx, targetFileAST, cursorPos, info, pathLogger) // Pass ctx, logger
+	}
+
+	// Cache the path ([]ast.Node). Use cost 1 as size is hard to determine easily.
+	path, cacheHit, pathErr := withMemoryCache[[]ast.Node](analyzer, cacheKey, 1, analysisCacheTTL, computePathFn, pathLogger)
+	if pathErr != nil {
+		// Error already added by findEnclosingPath if it occurred there
+		return nil, pathErr // Return the error if path finding failed
+	}
+	if cacheHit {
+		pathLogger.Debug("AST path cache hit")
+	}
+
+	// --- Find Context Nodes (Not Cached Here, depends on path) ---
+	// This part still runs even on cache hit for the path, as it populates info.
+	findContextNodes(ctx, path, cursorPos, pkg, fset, analyzer, info, pathLogger) // Pass ctx, logger, analyzer interface
+
+	// Return the path (cached or computed), non-fatal errors are collected in info.AnalysisErrors
 	return path, nil
 }
 
 // extractScopeInformation gathers variables/types in scope.
 // Populates info struct directly. Returns any fatal error.
+// Uses memory cache.
 func extractScopeInformation(
 	ctx context.Context, // Pass context
 	path []ast.Node,
@@ -126,12 +173,64 @@ func extractScopeInformation(
 	info *AstContextInfo, // Populate this struct
 	logger *slog.Logger,
 ) error {
-	gatherScopeContext(ctx, path, targetPkg, info.TargetFileSet, info, logger) // Pass ctx, logger. Populates info, adds errors internally
+	if logger == nil {
+		logger = slog.Default()
+	}
+	scopeLogger := logger.With("op", "extractScopeInformation")
+
+	// --- Cache Scope Extraction ---
+	// Cache key depends on cursor position as scope varies within blocks/functions
+	cacheKey := generateCacheKey("scopeInfo", info)
+	computeScopeFn := func() (map[string]types.Object, error) {
+		// Create a temporary map to store results, avoiding direct modification of info inside computeFn
+		tempScopeMap := make(map[string]types.Object)
+		// Create a temporary info struct copy for scope gathering to avoid race conditions if computeFn runs concurrently
+		tempInfo := *info
+		tempInfo.VariablesInScope = tempScopeMap // Point tempInfo to the temp map
+
+		// gatherScopeContext populates tempInfo.VariablesInScope and adds errors to tempInfo.AnalysisErrors
+		gatherScopeContext(ctx, path, targetPkg, info.TargetFileSet, &tempInfo, scopeLogger) // Pass ctx, logger
+
+		// Check for errors added during scope gathering
+		if len(tempInfo.AnalysisErrors) > len(info.AnalysisErrors) {
+			// Collect only the *new* errors added by gatherScopeContext
+			newErrors := tempInfo.AnalysisErrors[len(info.AnalysisErrors):]
+			// Return the computed map and a wrapped error containing the new issues
+			// Note: This error won't be cached by withMemoryCache
+			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(newErrors...))
+		}
+		// Return the computed scope map
+		return tempScopeMap, nil
+	}
+
+	// Cache the scope map. Estimate cost based on number of items (simple approach).
+	// TTL set by constant.
+	computedScope, cacheHit, scopeErr := withMemoryCache[map[string]types.Object](
+		analyzer, cacheKey, int64(len(info.VariablesInScope)+1), analysisCacheTTL, computeScopeFn, scopeLogger,
+	)
+
+	// If there was an error during computation (not a cache error), add it to the main info struct
+	if scopeErr != nil {
+		addAnalysisError(info, scopeErr, scopeLogger)
+		// Continue even if scope computation had errors, might have partial results
+	}
+
+	// Update the main info struct with the cached or computed scope
+	if computedScope != nil {
+		info.VariablesInScope = computedScope
+	}
+	if cacheHit {
+		scopeLogger.Debug("Scope information cache hit")
+	}
+
+	// gatherScopeContext adds errors to info internally, so we just return nil here.
+	// Any fatal error would have been returned by withMemoryCache if computeFn returned it.
 	return nil
 }
 
 // extractRelevantComments finds comments near the cursor.
 // Populates info struct directly. Returns any fatal error.
+// Uses memory cache.
 func extractRelevantComments(
 	ctx context.Context, // Pass context
 	targetFileAST *ast.File,
@@ -142,11 +241,57 @@ func extractRelevantComments(
 	info *AstContextInfo, // Populate this struct
 	logger *slog.Logger,
 ) error {
-	findRelevantComments(ctx, targetFileAST, path, cursorPos, fset, info, logger) // Pass ctx, logger. Populates info, adds errors internally
+	if logger == nil {
+		logger = slog.Default()
+	}
+	commentLogger := logger.With("op", "extractRelevantComments")
+
+	// --- Cache Comment Extraction ---
+	cacheKey := generateCacheKey("comments", info)
+	computeCommentsFn := func() ([]string, error) {
+		// Create a temporary info struct copy to avoid race conditions
+		tempInfo := *info
+		tempInfo.CommentsNearCursor = nil // Start fresh
+
+		// findRelevantComments populates tempInfo.CommentsNearCursor and adds errors to tempInfo.AnalysisErrors
+		findRelevantComments(ctx, targetFileAST, path, cursorPos, fset, &tempInfo, commentLogger) // Pass ctx, logger
+
+		// Check for errors added during comment finding
+		if len(tempInfo.AnalysisErrors) > len(info.AnalysisErrors) {
+			newErrors := tempInfo.AnalysisErrors[len(info.AnalysisErrors):]
+			return tempInfo.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(newErrors...))
+		}
+		return tempInfo.CommentsNearCursor, nil
+	}
+
+	// Cache the resulting slice of strings. Estimate cost based on total length.
+	computedComments, cacheHit, commentErr := withMemoryCache[[]string](
+		analyzer, cacheKey, estimateCost(info.CommentsNearCursor), analysisCacheTTL, computeCommentsFn, commentLogger,
+	)
+
+	// If there was an error during computation, add it to the main info struct
+	if commentErr != nil {
+		addAnalysisError(info, commentErr, commentLogger)
+		// Continue even if comment computation had errors
+	}
+
+	// Update the main info struct with the cached or computed comments
+	if computedComments != nil {
+		info.CommentsNearCursor = computedComments
+	} else {
+		info.CommentsNearCursor = []string{} // Ensure it's an empty slice if nil was returned/cached
+	}
+
+	if cacheHit {
+		commentLogger.Debug("Relevant comments cache hit")
+	}
+
+	// findRelevantComments adds errors internally.
 	return nil
 }
 
 // findEnclosingPath finds the AST node path from the root to the node enclosing the cursor.
+// This is the actual computation function called by the cached wrapper.
 func findEnclosingPath(ctx context.Context, targetFileAST *ast.File, cursorPos token.Pos, info *AstContextInfo, logger *slog.Logger) ([]ast.Node, error) {
 	if targetFileAST == nil {
 		err := errors.New("cannot find enclosing path: targetFileAST is nil")
@@ -166,7 +311,14 @@ func findEnclosingPath(ctx context.Context, targetFileAST *ast.File, cursorPos t
 }
 
 // gatherScopeContext walks the enclosing path to find relevant scope information.
+// This is the actual computation function called by the cached wrapper.
+// It populates the provided info struct's VariablesInScope map.
 func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *packages.Package, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
+	// Ensure the map exists before adding to it
+	if info.VariablesInScope == nil {
+		info.VariablesInScope = make(map[string]types.Object)
+	}
+
 	addPackageScope(ctx, targetPkg, info, logger) // Pass ctx, logger
 
 	if path != nil {
@@ -176,6 +328,7 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 			case *ast.File:
 				continue
 			case *ast.FuncDecl:
+				// Only capture the *first* FuncDecl encountered walking up
 				if info.EnclosingFuncNode == nil {
 					info.EnclosingFuncNode = n
 					if fset != nil && n.Recv != nil && len(n.Recv.List) > 0 && n.Recv.List[0].Type != nil {
@@ -195,12 +348,11 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 				if n.Name != nil {
 					funcName = n.Name.Name
 				}
-				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Defs != nil && n.Name != nil {
+				// Try to get type info only for the first encountered FuncDecl
+				if info.EnclosingFunc == nil && targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Defs != nil && n.Name != nil {
 					if obj, ok := targetPkg.TypesInfo.Defs[n.Name]; ok && obj != nil {
 						if fn, ok := obj.(*types.Func); ok {
-							if info.EnclosingFunc == nil {
-								info.EnclosingFunc = fn
-							}
+							info.EnclosingFunc = fn // Capture the type info
 							if sig, ok := fn.Type().(*types.Signature); ok {
 								addSignatureToScope(sig, info.VariablesInScope)
 							} else {
@@ -209,28 +361,33 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 						} else {
 							logger.Warn("Object defined for func name is not a *types.Func", "func", funcName, "object_type", fmt.Sprintf("%T", obj))
 						}
-					} else if info.EnclosingFunc == nil {
+					} else { // Def not found for this func name
 						addAnalysisError(info, fmt.Errorf("definition for func '%s' not found in TypesInfo", funcName), logger) // Pass logger
 					}
-				} else if info.EnclosingFunc == nil {
-					reason := getMissingTypeInfoReason(targetPkg)                                                                     // Assumes helpers_diagnostics.go exists
-					addAnalysisError(info, fmt.Errorf("type info for enclosing func '%s' unavailable: %s", funcName, reason), logger) // Pass logger
+				} else if info.EnclosingFunc == nil { // Type info missing or already logged error
+					reason := getMissingTypeInfoReason(targetPkg)
+					// Avoid adding duplicate errors if type info is generally missing
+					if !strings.Contains(errors.Join(info.AnalysisErrors...).Error(), "type info") {
+						addAnalysisError(info, fmt.Errorf("type info for enclosing func '%s' unavailable: %s", funcName, reason), logger) // Pass logger
+					}
 				}
 
 			case *ast.BlockStmt:
-				if info.EnclosingBlock == nil {
+				if info.EnclosingBlock == nil { // Capture innermost block
 					info.EnclosingBlock = n
 				}
 				posStr := getPosString(fset, n.Pos()) // Use helper from utils.go
 				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Scopes != nil {
 					if scope := targetPkg.TypesInfo.Scopes[n]; scope != nil {
 						addScopeVariables(scope, info.CursorPos, info.VariablesInScope)
-					} else {
+					} else { // Scope info missing for this specific block
 						addAnalysisError(info, fmt.Errorf("scope info missing for block at %s", posStr), logger) // Pass logger
 					}
-				} else if info.EnclosingBlock == n {
-					reason := getMissingTypeInfoReason(targetPkg)                                                                // Assumes helpers_diagnostics.go exists
-					addAnalysisError(info, fmt.Errorf("cannot get scope variables for block at %s: %s", posStr, reason), logger) // Pass logger
+				} else if info.EnclosingBlock == n { // Log only if type info is missing for the innermost block
+					reason := getMissingTypeInfoReason(targetPkg)
+					if !strings.Contains(errors.Join(info.AnalysisErrors...).Error(), "type info") {
+						addAnalysisError(info, fmt.Errorf("cannot get scope variables for block at %s: %s", posStr, reason), logger) // Pass logger
+					}
 				}
 			}
 		}
@@ -304,6 +461,8 @@ func addTupleToScope(tuple *types.Tuple, scopeMap map[string]types.Object) {
 }
 
 // findRelevantComments uses ast.CommentMap to find comments near the cursor.
+// This is the actual computation function called by the cached wrapper.
+// It populates the provided info struct's CommentsNearCursor slice.
 func findRelevantComments(ctx context.Context, targetFileAST *ast.File, path []ast.Node, cursorPos token.Pos, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
 	if targetFileAST == nil || fset == nil {
 		addAnalysisError(info, errors.New("cannot find comments: targetFileAST or fset is nil"), logger) // Pass logger
@@ -311,15 +470,20 @@ func findRelevantComments(ctx context.Context, targetFileAST *ast.File, path []a
 	}
 	if targetFileAST.Comments == nil {
 		logger.Debug("No comments found in target AST file.")
-		info.CommentsNearCursor = []string{}
+		if info.CommentsNearCursor == nil { // Initialize if nil
+			info.CommentsNearCursor = []string{}
+		}
 		return
 	}
 	cmap := ast.NewCommentMap(fset, targetFileAST, targetFileAST.Comments)
 	if cmap == nil {
 		addAnalysisError(info, errors.New("failed to create ast.CommentMap"), logger) // Pass logger
-		info.CommentsNearCursor = []string{}
+		if info.CommentsNearCursor == nil {
+			info.CommentsNearCursor = []string{}
+		}
 		return
 	}
+	// findCommentsWithMap returns the comments; assign to info struct
 	info.CommentsNearCursor = findCommentsWithMap(cmap, path, cursorPos, fset, logger) // Pass logger
 }
 
