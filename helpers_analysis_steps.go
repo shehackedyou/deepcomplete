@@ -34,7 +34,7 @@ func performAnalysisSteps(
 	targetFile *token.File,
 	targetFileAST *ast.File,
 	targetPkg *packages.Package,
-	fset *token.FileSet,
+	fset *token.FileSet, // Accept fset
 	line, col int, // 1-based line/col from request
 	analyzer Analyzer,
 	info *AstContextInfo, // Pass info struct to be populated
@@ -206,22 +206,23 @@ func extractScopeInformation(
 	computeScopeFn := func() (map[string]types.Object, error) {
 		tempScopeMap := make(map[string]types.Object)
 		// Pass pointer to tempInfo to capture errors and context
-		tempInfoPtr := info          // Keep original pointer
-		tempInfoCopy := *tempInfoPtr // Create a copy of the struct for modification
-		tempInfoCopy.VariablesInScope = tempScopeMap
-		tempInfoCopy.AnalysisErrors = make([]error, 0) // Reset errors for this computation
+		tempInfoPtr := info // Keep original pointer
+		// tempInfoCopy := *tempInfoPtr // Create a copy of the struct for modification - No, pass the pointer
+		tempInfoPtr.VariablesInScope = tempScopeMap
+		tempInfoPtr.AnalysisErrors = make([]error, 0) // Reset errors for this computation
 
 		// Path needed for block scopes
 		// Re-find path within computeFn as it might not be available outside
-		pathForScope, pathErr := findEnclosingPath(ctx, info.TargetAstFile, cursorPos, &tempInfoCopy, scopeLogger) // Use info's AST
+		pathForScope, pathErr := findEnclosingPath(ctx, info.TargetAstFile, cursorPos, tempInfoPtr, scopeLogger) // Use info's AST, Pass pointer
 		if pathErr != nil {
-			addAnalysisError(&tempInfoCopy, fmt.Errorf("finding enclosing path failed for scope: %w", pathErr), scopeLogger)
-		}
+			addAnalysisError(tempInfoPtr, fmt.Errorf("finding enclosing path failed for scope: %w", pathErr), scopeLogger)
+		} // Pass pointer
 
-		gatherScopeContext(ctx, pathForScope, targetPkg, info.TargetFileSet, &tempInfoCopy, scopeLogger)
+		// Pass the correct FileSet here
+		gatherScopeContext(ctx, pathForScope, targetPkg, info.TargetFileSet, tempInfoPtr, scopeLogger) // Pass pointer
 
-		if len(tempInfoCopy.AnalysisErrors) > 0 {
-			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(tempInfoCopy.AnalysisErrors...))
+		if len(tempInfoPtr.AnalysisErrors) > 0 {
+			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(tempInfoPtr.AnalysisErrors...))
 		}
 		return tempScopeMap, nil
 	}
@@ -271,23 +272,24 @@ func extractRelevantComments(
 	cacheKey := generateCacheKey("comments", info)
 	computeCommentsFn := func() ([]string, error) {
 		// Pass pointer to tempInfo
-		tempInfoPtr := info          // Keep original pointer
-		tempInfoCopy := *tempInfoPtr // Create copy
-		tempInfoCopy.CommentsNearCursor = nil
-		tempInfoCopy.AnalysisErrors = make([]error, 0)
+		tempInfoPtr := info // Keep original pointer
+		// tempInfoCopy := *tempInfoPtr // Create copy - No, pass pointer
+		tempInfoPtr.CommentsNearCursor = nil
+		tempInfoPtr.AnalysisErrors = make([]error, 0)
 
 		// Re-find path within computeFn to ensure it's correct
-		pathForComments, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, &tempInfoCopy, commentLogger)
+		pathForComments, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfoPtr, commentLogger) // Pass pointer
 		if pathErr != nil {
-			addAnalysisError(&tempInfoCopy, fmt.Errorf("finding enclosing path failed for comments: %w", pathErr), commentLogger)
-		}
+			addAnalysisError(tempInfoPtr, fmt.Errorf("finding enclosing path failed for comments: %w", pathErr), commentLogger)
+		} // Pass pointer
 
-		findRelevantComments(ctx, targetFileAST, pathForComments, cursorPos, fset, &tempInfoCopy, commentLogger)
+		// Pass the correct FileSet here
+		findRelevantComments(ctx, targetFileAST, pathForComments, cursorPos, fset, tempInfoPtr, commentLogger) // Pass pointer
 
-		if len(tempInfoCopy.AnalysisErrors) > 0 {
-			return tempInfoCopy.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(tempInfoCopy.AnalysisErrors...))
+		if len(tempInfoPtr.AnalysisErrors) > 0 {
+			return tempInfoPtr.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(tempInfoPtr.AnalysisErrors...))
 		}
-		return tempInfoCopy.CommentsNearCursor, nil
+		return tempInfoPtr.CommentsNearCursor, nil
 	}
 
 	// Get TTL from config via analyzer
@@ -336,6 +338,7 @@ func findEnclosingPath(ctx context.Context, targetFileAST *ast.File, cursorPos t
 
 // gatherScopeContext walks the enclosing path to find relevant scope information.
 // Kept as internal helper, called by GetScopeInfo implementation.
+// Accepts fset as a parameter now.
 func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *packages.Package, fset *token.FileSet, info *AstContextInfo, logger *slog.Logger) {
 	if info.VariablesInScope == nil {
 		info.VariablesInScope = make(map[string]types.Object)
@@ -362,6 +365,7 @@ func gatherScopeContext(ctx context.Context, path []ast.Node, targetPkg *package
 				if info.EnclosingBlock == nil {
 					info.EnclosingBlock = n
 				}
+				// Use the passed fset
 				posStr := getPosString(fset, n.Pos())
 				if targetPkg != nil && targetPkg.TypesInfo != nil && targetPkg.TypesInfo.Scopes != nil {
 					if scope := targetPkg.TypesInfo.Scopes[n]; scope != nil {
@@ -921,12 +925,14 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 	logger = logger.With("type", typ.String())
 	var members []MemberInfo
 	seenMembers := make(map[string]MemberKind)
+
 	msets := []*types.MethodSet{types.NewMethodSet(typ)}
 	if _, isInterface := typ.Underlying().(*types.Interface); !isInterface {
 		if ptrType := types.NewPointer(typ); ptrType != nil {
 			msets = append(msets, types.NewMethodSet(ptrType))
 		}
 	}
+
 	for _, mset := range msets {
 		if mset == nil {
 			continue
@@ -940,13 +946,16 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 			if method, ok := methodObj.(*types.Func); ok && method != nil && method.Exported() {
 				methodName := method.Name()
 				if _, exists := seenMembers[methodName]; !exists {
-					members = append(members, MemberInfo{Name: methodName, Kind: MethodMember, TypeString: types.TypeString(method.Type(), qualifier)})
+					members = append(members, MemberInfo{
+						Name: methodName, Kind: MethodMember, TypeString: types.TypeString(method.Type(), qualifier),
+					})
 					seenMembers[methodName] = MethodMember
 					logger.Debug("Added method", "name", methodName)
 				}
 			}
 		}
 	}
+
 	currentType := typ
 	if ptr, ok := typ.(*types.Pointer); ok {
 		if ptr.Elem() == nil {
@@ -960,6 +969,7 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 		logger.Debug("Cannot list members: underlying type is nil")
 		return members
 	}
+
 	if st, ok := underlying.(*types.Struct); ok {
 		logger.Debug("Type is a struct, listing fields", "num_fields", st.NumFields())
 		for i := 0; i < st.NumFields(); i++ {
@@ -967,7 +977,9 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 			if field != nil && field.Exported() {
 				fieldName := field.Name()
 				if _, exists := seenMembers[fieldName]; !exists {
-					members = append(members, MemberInfo{Name: fieldName, Kind: FieldMember, TypeString: types.TypeString(field.Type(), qualifier)})
+					members = append(members, MemberInfo{
+						Name: fieldName, Kind: FieldMember, TypeString: types.TypeString(field.Type(), qualifier),
+					})
 					seenMembers[fieldName] = FieldMember
 					logger.Debug("Added field", "name", fieldName)
 				}
@@ -980,7 +992,9 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 			if method != nil && method.Exported() {
 				methodName := method.Name()
 				if _, exists := seenMembers[methodName]; !exists {
-					members = append(members, MemberInfo{Name: methodName, Kind: MethodMember, TypeString: types.TypeString(method.Type(), qualifier)})
+					members = append(members, MemberInfo{
+						Name: methodName, Kind: MethodMember, TypeString: types.TypeString(method.Type(), qualifier),
+					})
 					seenMembers[methodName] = MethodMember
 					logger.Debug("Added interface method", "name", methodName)
 				}
@@ -989,6 +1003,7 @@ func listTypeMembers(typ types.Type, expr ast.Expr, qualifier types.Qualifier, l
 	} else {
 		logger.Debug("Type is not a struct or interface, no fields/explicit methods to list directly.", "type", fmt.Sprintf("%T", underlying))
 	}
+
 	logger.Debug("Finished listing members", "count", len(members))
 	return members
 }

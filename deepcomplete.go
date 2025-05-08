@@ -607,7 +607,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 		// Call the internal helper function that performs the analysis steps
 		// This populates the 'info' struct passed to it.
 		// NOTE: performAnalysisSteps is being refactored out.
-		// The necessary info should be populated by the Get* methods called below
+		// The necessary info should be populated by the specific Get* methods called below
 		// or implicitly by GetPromptPreamble if that's called first.
 		// analyzeStepErr := performAnalysisSteps(ctx, targetFile, targetFileAST, targetPkg, fset, line, col, a, info, analysisLogger)
 		// if analyzeStepErr != nil {
@@ -889,20 +889,20 @@ func (a *GoPackagesAnalyzer) GetScopeInfo(ctx context.Context, absFilename strin
 	computeScopeFn := func() (map[string]types.Object, error) {
 		tempScopeMap := make(map[string]types.Object)
 		// Pass pointer to tempInfo to capture errors and context
-		tempInfoPtr := tempInfo      // Keep original pointer
-		tempInfoCopy := *tempInfoPtr // Create a copy of the struct for modification
-		tempInfoCopy.VariablesInScope = tempScopeMap
-		tempInfoCopy.AnalysisErrors = make([]error, 0) // Reset errors for this computation
+		tempInfoPtr := tempInfo // Keep original pointer
+		// tempInfoCopy := *tempInfoPtr // Create a copy of the struct for modification - No, pass the pointer
+		tempInfoPtr.VariablesInScope = tempScopeMap
+		tempInfoPtr.AnalysisErrors = make([]error, 0) // Reset errors for this computation
 
-		path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, &tempInfoCopy, opLogger) // Pass pointer to copy
+		path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfoPtr, opLogger) // Pass pointer
 		if pathErr != nil {
-			addAnalysisError(&tempInfoCopy, fmt.Errorf("finding enclosing path failed: %w", pathErr), opLogger)
-		} // Pass pointer to copy
+			addAnalysisError(tempInfoPtr, fmt.Errorf("finding enclosing path failed: %w", pathErr), opLogger)
+		} // Pass pointer
 
-		gatherScopeContext(ctx, path, targetPkg, fset, &tempInfoCopy, opLogger) // Pass pointer to copy
+		gatherScopeContext(ctx, path, targetPkg, fset, tempInfoPtr, opLogger) // Pass pointer
 
-		if len(tempInfoCopy.AnalysisErrors) > 0 {
-			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(tempInfoCopy.AnalysisErrors...))
+		if len(tempInfoPtr.AnalysisErrors) > 0 {
+			return tempScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(tempInfoPtr.AnalysisErrors...))
 		}
 		return tempScopeMap, nil
 	}
@@ -940,22 +940,22 @@ func (a *GoPackagesAnalyzer) GetRelevantComments(ctx context.Context, absFilenam
 	cacheKey := generateCacheKey("comments", tempInfo)
 	computeCommentsFn := func() ([]string, error) {
 		// Pass pointer to tempInfo
-		tempInfoPtr := tempInfo      // Keep original pointer
-		tempInfoCopy := *tempInfoPtr // Create copy
-		tempInfoCopy.CommentsNearCursor = nil
-		tempInfoCopy.AnalysisErrors = make([]error, 0)
+		tempInfoPtr := tempInfo // Keep original pointer
+		// tempInfoCopy := *tempInfoPtr // Create copy - No, pass pointer
+		tempInfoPtr.CommentsNearCursor = nil
+		tempInfoPtr.AnalysisErrors = make([]error, 0)
 
-		path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, &tempInfoCopy, opLogger) // Pass pointer
+		path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfoPtr, opLogger) // Pass pointer
 		if pathErr != nil {
-			addAnalysisError(&tempInfoCopy, fmt.Errorf("finding enclosing path failed: %w", pathErr), opLogger)
+			addAnalysisError(tempInfoPtr, fmt.Errorf("finding enclosing path failed: %w", pathErr), opLogger)
 		} // Pass pointer
 
-		findRelevantComments(ctx, targetFileAST, path, cursorPos, fset, &tempInfoCopy, opLogger) // Pass pointer
+		findRelevantComments(ctx, targetFileAST, path, cursorPos, fset, tempInfoPtr, opLogger) // Pass pointer
 
-		if len(tempInfoCopy.AnalysisErrors) > 0 {
-			return tempInfoCopy.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(tempInfoCopy.AnalysisErrors...))
+		if len(tempInfoPtr.AnalysisErrors) > 0 {
+			return tempInfoPtr.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(tempInfoPtr.AnalysisErrors...))
 		}
-		return tempInfoCopy.CommentsNearCursor, nil
+		return tempInfoPtr.CommentsNearCursor, nil
 	}
 
 	comments, cacheHit, commentErr := withMemoryCache[[]string](a, cacheKey, 5, a.getConfig().MemoryCacheTTL, computeCommentsFn, opLogger)
@@ -1043,7 +1043,7 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 	}
 
 	// Need AstContextInfo shell for cache key generation and formatCursorContextSection
-	tempInfo := &AstContextInfo{FilePath: absFilename, Version: version, CursorPos: cursorPos, TargetPackage: targetPkg, TargetFileSet: fset, TargetAstFile: targetFileAST}
+	tempInfo := &AstContextInfo{FilePath: absFilename, Version: version, CursorPos: cursorPos, TargetPackage: targetPkg, TargetFileSet: fset, TargetAstFile: targetFileAST, AnalysisErrors: make([]error, 0)}
 
 	var allErrors []error
 	enclosingCtx, encErr := a.GetEnclosingContext(ctx, absFilename, version, line, col)
@@ -1061,8 +1061,15 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 
 	// Populate the parts of tempInfo needed by formatCursorContextSection
 	if targetPkg.TypesInfo != nil {
-		path, _ := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger) // Ignore error here
-		findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger)  // Populate cursor context in tempInfo
+		path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
+		if pathErr != nil {
+			addAnalysisError(tempInfo, pathErr, opLogger) // Add non-fatal error
+		} else {
+			// Pass pointer to tempInfo
+			findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger)
+		}
+		// Add any errors collected during findContextNodes
+		allErrors = append(allErrors, tempInfo.AnalysisErrors...)
 	}
 
 	var qualifier types.Qualifier
@@ -1111,6 +1118,10 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 		pkgName = "[unknown]"
 	}
 	addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(absFilename), pkgName))
+	// Add Imports (still relies on info struct for now)
+	if !limitReached {
+		formatImportsSection(&preambleBuilder, tempInfo, addToPreamble, addTruncMarker, opLogger)
+	}
 	if !limitReached {
 		formatEnclosingFuncSection(&preambleBuilder, enclosingCtx, qualifier, addToPreamble, opLogger)
 	}

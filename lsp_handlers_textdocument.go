@@ -358,7 +358,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	s.filesMu.RLock()
 	// Get file data needed for position conversion and potential content read
-	fileData, ok := s.files[uri] // Renamed 'file' to 'fileData'
+	fileData, ok := s.files[uri]
 	s.filesMu.RUnlock()
 
 	if !ok {
@@ -455,8 +455,7 @@ func (s *Server) handleCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	// Get current file content for potential edits
 	s.filesMu.RLock()
-	// fileData variable removed as it wasn't used
-	_, ok := s.files[uri]
+	_, ok := s.files[uri] // Check if file exists
 	s.filesMu.RUnlock()
 	if !ok {
 		actionLogger.Warn("CodeAction request for unknown file")
@@ -563,13 +562,17 @@ func (s *Server) handleSignatureHelp(ctx context.Context, conn *jsonrpc2.Conn, r
 	default:
 	}
 
-	if analysisErr != nil {
-		sigLogger.Warn("Analysis for signature help encountered errors", "error", analysisErr)
-		return nil, nil
+	if analysisErr != nil && !errors.Is(analysisErr, ErrAnalysisFailed) {
+		sigLogger.Warn("Analysis for signature help encountered critical errors", "error", analysisErr)
+		return nil, nil // Return nil on critical analysis errors
 	}
 	if analysisInfo == nil {
 		sigLogger.Warn("Analysis returned nil info for signature help")
 		return nil, nil
+	}
+	// Log non-fatal errors but proceed
+	if analysisErr != nil {
+		sigLogger.Warn("Analysis for signature help encountered non-fatal errors", "error", analysisErr)
 	}
 
 	// Check if the cursor is inside a call expression
@@ -580,6 +583,7 @@ func (s *Server) handleSignatureHelp(ctx context.Context, conn *jsonrpc2.Conn, r
 
 	sig := analysisInfo.CallExprFuncType
 	paramsTuple := sig.Params()
+	resultsTuple := sig.Results() // Get results as well
 
 	// Format parameters
 	var parameters []ParameterInformation
@@ -587,32 +591,42 @@ func (s *Server) handleSignatureHelp(ctx context.Context, conn *jsonrpc2.Conn, r
 		for i := 0; i < paramsTuple.Len(); i++ {
 			p := paramsTuple.At(i)
 			if p != nil {
-				// TODO: Add documentation lookup for parameters if possible
+				// Use a qualifier relative to the package where the function is defined
+				qualifier := types.RelativeTo(analysisInfo.TargetPackage.Types)
+				if p.Pkg() != nil && p.Pkg() != analysisInfo.TargetPackage.Types {
+					qualifier = types.RelativeTo(p.Pkg()) // Adjust qualifier if param is from different pkg? Less common for params.
+				}
+				paramLabel := types.TypeString(p.Type(), qualifier)
+				if p.Name() != "" {
+					paramLabel = p.Name() + " " + paramLabel
+				}
 				parameters = append(parameters, ParameterInformation{
-					Label: types.ObjectString(p, types.RelativeTo(analysisInfo.TargetPackage.Types)), // Use appropriate qualifier
+					Label: paramLabel,
+					// TODO: Add documentation lookup for parameters if possible
 				})
 			}
 		}
 	}
 
-	// Format signature label
+	// Format signature label (function name + params + results)
 	var sigLabelBuilder strings.Builder
+	// Get function name (prefer resolved object name)
+	funcName := "(unknown)"
 	if analysisInfo.IdentifierObject != nil { // Use resolved object name if available
-		sigLabelBuilder.WriteString(analysisInfo.IdentifierObject.Name())
+		funcName = analysisInfo.IdentifierObject.Name()
 	} else { // Fallback to AST name
 		switch fun := analysisInfo.CallExpr.Fun.(type) {
 		case *ast.Ident:
-			sigLabelBuilder.WriteString(fun.Name)
+			funcName = fun.Name
 		case *ast.SelectorExpr:
 			if fun.Sel != nil {
-				sigLabelBuilder.WriteString(fun.Sel.Name)
-			} else {
-				sigLabelBuilder.WriteString("(unknown)")
+				funcName = fun.Sel.Name
 			}
 		default:
-			sigLabelBuilder.WriteString("(unknown)")
+			sigLogger.Warn("Could not determine function name from AST for signature help")
 		}
 	}
+	sigLabelBuilder.WriteString(funcName)
 	sigLabelBuilder.WriteString("(")
 	for i, p := range parameters {
 		if i > 0 {
@@ -624,47 +638,56 @@ func (s *Server) handleSignatureHelp(ctx context.Context, conn *jsonrpc2.Conn, r
 		}
 	}
 	sigLabelBuilder.WriteString(")")
-	// TODO: Add result types to label
+
+	// Add results to label
+	if resultsTuple != nil && resultsTuple.Len() > 0 {
+		sigLabelBuilder.WriteString(" ")
+		if resultsTuple.Len() > 1 {
+			sigLabelBuilder.WriteString("(")
+		}
+		for i := 0; i < resultsTuple.Len(); i++ {
+			r := resultsTuple.At(i)
+			if i > 0 {
+				sigLabelBuilder.WriteString(", ")
+			}
+			if r != nil {
+				qualifier := types.RelativeTo(analysisInfo.TargetPackage.Types) // Adjust qualifier if needed
+				sigLabelBuilder.WriteString(types.TypeString(r.Type(), qualifier))
+			}
+		}
+		if resultsTuple.Len() > 1 {
+			sigLabelBuilder.WriteString(")")
+		}
+	}
 
 	sigInfo := SignatureInformation{
 		Label:      sigLabelBuilder.String(),
 		Parameters: parameters,
-		// Documentation: // TODO: Add function documentation
+		// Documentation: // TODO: Add function documentation from analysisInfo.IdentifierDefNode if available
 	}
 
 	// Determine active parameter
 	activeParam := uint32(analysisInfo.CallArgIndex)
-	// Clamp active parameter index if it's out of bounds
-	if paramsTuple == nil || activeParam >= uint32(paramsTuple.Len()) {
-		// If variadic and cursor is at or after the variadic param, keep it clamped to the last param index
-		if sig.Variadic() && paramsTuple != nil && activeParam >= uint32(paramsTuple.Len()-1) {
-			activeParam = uint32(paramsTuple.Len() - 1)
-		} else {
-			// If not variadic or before variadic param, and index is invalid, maybe set to nil?
-			// LSP spec allows nil for activeParameter. Setting to 0 might be confusing.
-			// Let's try setting it to nil if index is clearly out of bounds.
-			if paramsTuple != nil && activeParam >= uint32(paramsTuple.Len()) {
-				sigHelp := &SignatureHelp{
-					Signatures:      []SignatureInformation{sigInfo},
-					ActiveSignature: new(uint32), // Pointer to 0
-					ActiveParameter: nil,         // Indicate no specific parameter is active
-				}
-				sigLogger.Debug("Active parameter index out of bounds, setting to null")
-				return sigHelp, nil
-			}
-			// Default to 0 if clamping isn't straightforward or index is negative (shouldn't happen)
-			activeParam = 0
-			sigLogger.Debug("Clamping active parameter index", "calculated_index", analysisInfo.CallArgIndex, "num_params", paramsTuple.Len())
+	var activeParamPtr *uint32 // Use pointer to allow nil
 
-		}
+	// Clamp active parameter index if it's out of bounds
+	if paramsTuple != nil && activeParam < uint32(paramsTuple.Len()) {
+		activeParamPtr = &activeParam // Set pointer only if valid index
+	} else if sig.Variadic() && paramsTuple != nil && activeParam >= uint32(paramsTuple.Len()-1) {
+		// If variadic and cursor is at or after the variadic param, activate the last param
+		lastParamIndex := uint32(paramsTuple.Len() - 1)
+		activeParamPtr = &lastParamIndex
+	} else {
+		// Index is out of bounds and not variadic case, leave activeParameter as nil
+		sigLogger.Debug("Active parameter index out of bounds", "calculated_index", analysisInfo.CallArgIndex, "num_params", paramsTuple.Len())
 	}
 
 	sigHelp := &SignatureHelp{
 		Signatures:      []SignatureInformation{sigInfo},
 		ActiveSignature: new(uint32), // Pointer to 0 (index of the first signature)
-		ActiveParameter: &activeParam,
+		ActiveParameter: activeParamPtr,
 	}
 
-	sigLogger.Info("Signature help provided", "active_param", activeParam)
+	sigLogger.Info("Signature help provided", "active_param_index", activeParamPtr)
 	return sigHelp, nil
 }
