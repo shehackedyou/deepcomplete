@@ -151,8 +151,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		}
 		s.clientCaps = params.Capabilities
 		s.initParams = &params
-		// Pass the method-specific logger to the handler
-		return s.handleInitialize(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_lifecycle.go
+		return s.handleInitialize(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "initialized":
 		methodLogger.Info("Client initialized notification received")
@@ -160,13 +159,11 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 
 	case "shutdown":
 		methodLogger.Info("Shutdown request received")
-		// Pass the method-specific logger to the handler
-		return s.handleShutdown(ctx, conn, req, methodLogger) // Implemented in lsp_handlers_lifecycle.go
+		return s.handleShutdown(ctx, conn, req, methodLogger) // Pass method-specific logger
 
 	case "exit":
 		methodLogger.Info("Exit notification received")
-		// Pass the method-specific logger to the handler
-		return s.handleExit(ctx, conn, req, methodLogger) // Implemented in lsp_handlers_lifecycle.go
+		return s.handleExit(ctx, conn, req, methodLogger) // Pass method-specific logger
 
 	case "textDocument/didOpen":
 		var params DidOpenTextDocumentParams
@@ -174,8 +171,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didOpen params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		// Pass the method-specific logger to the handler
-		return s.handleDidOpen(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
+		return s.handleDidOpen(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "textDocument/didChange":
 		var params DidChangeTextDocumentParams
@@ -183,8 +179,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didChange params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		// Pass the method-specific logger to the handler
-		return s.handleDidChange(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
+		return s.handleDidChange(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "textDocument/didClose":
 		var params DidCloseTextDocumentParams
@@ -192,8 +187,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didClose params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		// Pass the method-specific logger to the handler
-		return s.handleDidClose(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
+		return s.handleDidClose(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "textDocument/completion":
 		var params CompletionParams
@@ -201,8 +195,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal completion params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid completion params: %v", err)}
 		}
-		// Pass the method-specific logger to the handler
-		return s.handleCompletion(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
+		return s.handleCompletion(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "textDocument/hover":
 		var params HoverParams
@@ -210,8 +203,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal hover params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid hover params: %v", err)}
 		}
-		// Pass the method-specific logger to the handler
-		return s.handleHover(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
+		return s.handleHover(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "textDocument/definition":
 		var params DefinitionParams
@@ -219,8 +211,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal definition params", "error", err)
 			return nil, &jsonrpc2.Error{Code: int64(JsonRpcInvalidParams), Message: fmt.Sprintf("Invalid definition params: %v", err)}
 		}
-		// Pass the method-specific logger to the handler
-		return s.handleDefinition(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_textdocument.go
+		return s.handleDefinition(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "workspace/didChangeConfiguration":
 		var params DidChangeConfigurationParams
@@ -228,8 +219,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 			methodLogger.Error("Failed to unmarshal didChangeConfiguration params", "error", err)
 			return nil, nil // Ignore notification errors
 		}
-		// Pass the method-specific logger to the handler
-		return s.handleDidChangeConfiguration(ctx, conn, req, params, methodLogger) // Implemented in lsp_handlers_workspace.go
+		return s.handleDidChangeConfiguration(ctx, conn, req, params, methodLogger) // Pass method-specific logger
 
 	case "$/cancelRequest":
 		var params CancelParams
@@ -319,7 +309,7 @@ func (s *Server) triggerDiagnostics(uri DocumentURI, version int, content []byte
 		diagLogger.Debug("Converting internal diagnostics to LSP format", "count", len(analysisInfo.Diagnostics))
 		for _, diag := range analysisInfo.Diagnostics {
 			// Pass diagLogger to internalRangeToLSPRange
-			lspRange, err := internalRangeToLSPRange(content, diag.Range, diagLogger)
+			lspRange, err := internalRangeToLSPRange(content, diag.Range, diagLogger) // Pass logger here
 			if err != nil {
 				diagLogger.Warn("Failed to convert diagnostic range, skipping diagnostic", "internal_range", diag.Range, "error", err, "message", diag.Message)
 				continue
@@ -398,7 +388,6 @@ func mapInternalSeverityToLSP(internalSeverity DiagnosticSeverity) LspDiagnostic
 	case SeverityHint:
 		return LspSeverityHint
 	default:
-		// Use the default logger for this package-level function
 		slog.Warn("Unknown internal diagnostic severity, defaulting to Error", "internal_severity", internalSeverity)
 		return LspSeverityError
 	}
@@ -527,7 +516,6 @@ type RequestTracker struct {
 
 // NewRequestTracker creates a new tracker.
 func NewRequestTracker() *RequestTracker {
-	// Use a default logger initially, can be replaced if needed
 	logger := slog.Default().With("component", "RequestTracker")
 	return &RequestTracker{
 		requests: make(map[jsonrpc2.ID]context.CancelFunc),
@@ -542,7 +530,6 @@ func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	// Check if already tracking to avoid overwriting
 	if _, exists := rt.requests[id]; exists {
 		rt.logger.Warn("Attempted to add already tracked request ID", "id", id)
 		return
@@ -550,17 +537,14 @@ func (rt *RequestTracker) Add(id jsonrpc2.ID, ctx context.Context) {
 	reqCtx, cancel := context.WithCancel(context.Background()) // Create derived context
 	rt.requests[id] = cancel
 	rt.logger.Debug("Added request to tracker", "id", id)
-	// Goroutine to automatically cancel and remove if the original context is done
 	go func() {
 		select {
 		case <-ctx.Done():
 			rt.logger.Debug("Original context done, cancelling tracked request", "id", id, "reason", ctx.Err())
-			cancel()      // Cancel the derived context
+			cancel()
 			rt.Remove(id) // Clean up tracker entry
 		case <-reqCtx.Done():
-			// Derived context was cancelled (likely via rt.Cancel or rt.Remove)
 			rt.logger.Debug("Tracked request context cancelled", "id", id)
-			// No need to call Remove again here, it happens in Cancel or explicit Remove
 		}
 	}()
 }
@@ -574,7 +558,7 @@ func (rt *RequestTracker) Remove(id jsonrpc2.ID) {
 	defer rt.mu.Unlock()
 	if cancel, ok := rt.requests[id]; ok {
 		rt.logger.Debug("Removing request from tracker", "id", id)
-		cancel() // Ensure cancellation is called on removal
+		cancel()
 		delete(rt.requests, id)
 	} else {
 		rt.logger.Debug("Attempted to remove untracked request ID", "id", id)
@@ -589,12 +573,11 @@ func (rt *RequestTracker) Cancel(id jsonrpc2.ID) {
 	}
 	rt.mu.Lock()
 	cancel, found := rt.requests[id]
-	rt.mu.Unlock() // Unlock before calling cancel
+	rt.mu.Unlock()
 
 	if found {
 		rt.logger.Info("Calling cancel function for request", "id", id)
 		cancel()
-		// Removal happens automatically when reqCtx is done, or explicitly via Remove
 	} else {
 		rt.logger.Debug("Cancel function not found for request ID", "id", id)
 	}
