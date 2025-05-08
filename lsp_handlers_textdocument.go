@@ -22,7 +22,6 @@ import (
 // ============================================================================
 
 // handleDidOpen handles the 'textDocument/didOpen' notification.
-// It adds the opened file to the server's state and triggers diagnostics.
 func (s *Server) handleDidOpen(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params DidOpenTextDocumentParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	version := params.TextDocument.Version
@@ -38,22 +37,18 @@ func (s *Server) handleDidOpen(ctx context.Context, conn *jsonrpc2.Conn, req *js
 	}
 	s.filesMu.Unlock()
 
-	// Validate URI before triggering diagnostics, pass logger
-	absPath, pathErr := ValidateAndGetFilePath(string(uri), openLogger) // Util func
+	absPath, pathErr := ValidateAndGetFilePath(string(uri), openLogger)
 	if pathErr != nil {
 		openLogger.Error("Invalid URI in didOpen, cannot trigger diagnostics", "error", pathErr)
 		s.sendShowMessage(MessageTypeError, fmt.Sprintf("Invalid document URI: %v", pathErr))
 		return nil, nil
 	}
 
-	// Trigger diagnostics in background, pass the specific logger
 	go s.triggerDiagnostics(uri, version, content, absPath, openLogger)
 	return nil, nil
 }
 
 // handleDidChange handles the 'textDocument/didChange' notification.
-// It updates the file content in the server's state (only Full sync supported) and triggers diagnostics.
-// It invalidates memory cache for the changed file and disk cache only if go.mod/go.sum changed.
 func (s *Server) handleDidChange(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params DidChangeTextDocumentParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	version := params.TextDocument.Version
@@ -66,8 +61,7 @@ func (s *Server) handleDidChange(ctx context.Context, conn *jsonrpc2.Conn, req *
 	newContent := []byte(params.ContentChanges[len(params.ContentChanges)-1].Text)
 	changeLogger.Info("Handling textDocument/didChange", "new_size", len(newContent))
 
-	// Validate URI before updating cache or triggering diagnostics, pass logger
-	absPath, pathErr := ValidateAndGetFilePath(string(uri), changeLogger) // Util func
+	absPath, pathErr := ValidateAndGetFilePath(string(uri), changeLogger)
 	if pathErr != nil {
 		changeLogger.Error("Invalid URI in didChange", "error", pathErr)
 		s.sendShowMessage(MessageTypeError, fmt.Sprintf("Invalid document URI: %v", pathErr))
@@ -87,16 +81,13 @@ func (s *Server) handleDidChange(ctx context.Context, conn *jsonrpc2.Conn, req *
 	} else {
 		changeLogger.Warn("Ignoring out-of-order didChange notification", "received_version", version, "current_version", currentFile.Version)
 	}
-	s.filesMu.Unlock() // Unlock before potentially long cache operations
+	s.filesMu.Unlock()
 
-	// Invalidate caches only if the file content was actually updated
 	if shouldUpdate && s.completer.analyzer != nil {
-		// Always invalidate memory cache for the specific changed file URI
 		if err := s.completer.InvalidateMemoryCacheForURI(string(uri), version); err != nil {
 			changeLogger.Warn("Failed to invalidate memory cache on didChange", "error", err)
 		}
 
-		// Invalidate disk cache (bbolt) only if go.mod or go.sum changed
 		baseName := filepath.Base(absPath)
 		if baseName == "go.mod" || baseName == "go.sum" {
 			dir := filepath.Dir(absPath)
@@ -109,14 +100,11 @@ func (s *Server) handleDidChange(ctx context.Context, conn *jsonrpc2.Conn, req *
 		}
 	}
 
-	// Trigger diagnostics even if the update was ignored (client state might need update)
-	// Pass the specific logger
 	go s.triggerDiagnostics(uri, version, newContent, absPath, changeLogger)
 	return nil, nil
 }
 
 // handleDidClose handles the 'textDocument/didClose' notification.
-// It removes the file from the server's state and clears its diagnostics.
 func (s *Server) handleDidClose(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params DidCloseTextDocumentParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	closeLogger := logger.With("uri", uri)
@@ -126,7 +114,7 @@ func (s *Server) handleDidClose(ctx context.Context, conn *jsonrpc2.Conn, req *j
 	delete(s.files, uri)
 	s.filesMu.Unlock()
 
-	s.publishDiagnostics(uri, nil, []LspDiagnostic{}, closeLogger) // Clear diagnostics, pass logger
+	s.publishDiagnostics(uri, nil, []LspDiagnostic{}, closeLogger)
 
 	if s.completer.analyzer != nil {
 		if err := s.completer.InvalidateMemoryCacheForURI(string(uri), 0); err != nil {
@@ -142,8 +130,7 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	lspPos := params.Position
 	completionLogger := logger.With("uri", uri, "lsp_line", lspPos.Line, "lsp_char", lspPos.Character, "req_id", req.ID)
 
-	// Log trigger kind if available
-	triggerKind := CompletionTriggerKindInvoked // Default
+	triggerKind := CompletionTriggerKindInvoked
 	triggerChar := ""
 	if params.Context != nil {
 		triggerKind = params.Context.TriggerKind
@@ -164,23 +151,21 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	// Convert LSP position to Go position, pass logger
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, completionLogger) // Util func
+	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, completionLogger)
 	if posErr != nil {
 		completionLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
 		return CompletionList{IsIncomplete: false, Items: []CompletionItem{}}, nil
 	}
 	completionLogger = completionLogger.With("go_line", line, "go_col", col)
 
-	// Validate URI and get absolute path, pass logger
-	absPath, pathErr := ValidateAndGetFilePath(string(uri), completionLogger) // Util func
+	absPath, pathErr := ValidateAndGetFilePath(string(uri), completionLogger)
 	if pathErr != nil {
 		completionLogger.Error("Invalid file URI", "error", pathErr)
 		return nil, fmt.Errorf("invalid file URI: %w", pathErr)
 	}
 
 	// --- Get Completion Text ---
-	completionCtx, cancelCompletion := context.WithTimeout(ctx, 10*time.Second) // Timeout for LLM call
+	completionCtx, cancelCompletion := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelCompletion()
 
 	var completionBuffer bytes.Buffer
@@ -219,17 +204,18 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 	completionLogger.Info("Completion successful", "completion_length", len(completionText))
 
 	// --- Determine Completion Kind (Best Effort) ---
-	completionKind := CompletionItemKindSnippet     // Default to Snippet
-	currentConfig := s.completer.GetCurrentConfig() // Get current config
+	completionKind := CompletionItemKindSnippet
+	currentConfig := s.completer.GetCurrentConfig()
 	if currentConfig.UseAst {
-		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second) // Shorter timeout for kind analysis
+		analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 2*time.Second)
 		defer cancelAnalysis()
-		analysisInfo, kindAnalysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, file.Version, line, col)
+		// Use GetIdentifierInfo for potentially faster kind determination
+		identInfo, kindAnalysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
 		if kindAnalysisErr != nil {
 			completionLogger.Warn("Analysis for completion kind failed, using default kind", "error", kindAnalysisErr)
-		} else if analysisInfo != nil && analysisInfo.IdentifierObject != nil {
-			completionKind = mapTypeToCompletionKind(analysisInfo.IdentifierObject) // Use refined mapping
-			completionLogger.Debug("Determined completion kind from analysis", "kind", completionKind, "identifier", analysisInfo.IdentifierObject.Name())
+		} else if identInfo != nil && identInfo.Object != nil { // Check if identifier was found
+			completionKind = mapTypeToCompletionKind(identInfo.Object) // Use refined mapping
+			completionLogger.Debug("Determined completion kind from analysis", "kind", completionKind, "identifier", identInfo.Name)
 		} else {
 			completionLogger.Debug("No specific identifier found at cursor for kind mapping, using default.")
 		}
@@ -245,7 +231,6 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 		s.clientCaps.TextDocument.Completion.CompletionItem != nil &&
 		s.clientCaps.TextDocument.Completion.CompletionItem.SnippetSupport {
 		insertTextFormat = SnippetFormat
-		// Basic snippet: just add a final tab stop
 		insertText = completionText + "${0}"
 		completionLogger.Debug("Using Snippet format for completion item")
 	} else {
@@ -254,20 +239,20 @@ func (s *Server) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	// --- Create Completion Item ---
 	item := CompletionItem{
-		Label:            strings.Split(completionText, "\n")[0], // Use first line as label
-		InsertText:       insertText,                             // Use plain text or basic snippet
+		Label:            strings.Split(completionText, "\n")[0],
+		InsertText:       insertText,
 		InsertTextFormat: insertTextFormat,
-		Kind:             completionKind,            // Use determined or default kind
-		Detail:           "DeepComplete Suggestion", // Basic detail
+		Kind:             completionKind,
+		Detail:           "DeepComplete Suggestion",
 	}
 
 	return CompletionList{
-		IsIncomplete: false, // Mark as complete
+		IsIncomplete: false,
 		Items:        []CompletionItem{item},
 	}, nil
 }
 
-// handleHover generates hover information.
+// handleHover generates hover information using the GetIdentifierInfo method.
 func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params HoverParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	lspPos := params.Position
@@ -283,59 +268,74 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, hoverLogger) // Util func
+	// Convert LSP position to Go position, pass logger
+	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, hoverLogger)
 	if posErr != nil {
 		hoverLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
-		return nil, nil
+		return nil, nil // Return nil for position conversion errors
 	}
 	hoverLogger = hoverLogger.With("go_line", line, "go_col", col)
 
-	absPath, pathErr := ValidateAndGetFilePath(string(uri), hoverLogger) // Util func
+	// Validate URI and get absolute path, pass logger
+	absPath, pathErr := ValidateAndGetFilePath(string(uri), hoverLogger)
 	if pathErr != nil {
 		hoverLogger.Error("Invalid file URI", "error", pathErr)
 		return nil, fmt.Errorf("invalid file URI: %w", pathErr)
 	}
 
-	analysisCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// Use request context `ctx` for timeout and cancellation
+	analysisCtx, cancel := context.WithTimeout(ctx, 15*time.Second) // Timeout for analysis
 	defer cancel()
 
-	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, file.Version, line, col)
+	// Use the specific GetIdentifierInfo method
+	identInfo, analysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
 
+	// Check for context cancellation *after* analysis
 	select {
 	case <-analysisCtx.Done():
 		hoverLogger.Info("Hover analysis cancelled or timed out", "error", analysisCtx.Err())
 		if errors.Is(analysisCtx.Err(), context.DeadlineExceeded) {
-			return nil, nil
+			return nil, nil // Return nil on timeout
 		}
 		return nil, &jsonrpc2.Error{Code: int64(JsonRpcRequestCancelled), Message: "Hover request cancelled"}
 	default:
 	}
 
+	// Handle analysis errors
 	if analysisErr != nil {
-		hoverLogger.Warn("Analysis for hover encountered errors", "error", analysisErr)
-		if analysisInfo == nil {
-			return nil, nil
+		// Log critical errors, but return nil hover for non-critical analysis failures
+		if !errors.Is(analysisErr, ErrAnalysisFailed) && !errors.Is(analysisErr, ErrPositionConversion) { // Don't log ErrAnalysisFailed as error here
+			hoverLogger.Error("Critical error during identifier analysis for hover", "error", analysisErr)
+		} else {
+			hoverLogger.Warn("Analysis for hover encountered non-critical errors", "error", analysisErr)
 		}
-	}
-	if analysisInfo == nil {
-		hoverLogger.Warn("Analysis returned nil info")
-		return nil, nil
+		return nil, nil // Return nil hover if analysis had issues
 	}
 
-	if analysisInfo.IdentifierAtCursor == nil || analysisInfo.IdentifierObject == nil {
+	// Check if an identifier was actually found
+	if identInfo == nil || identInfo.Object == nil {
 		hoverLogger.Debug("No identifier found at cursor position for hover")
 		return nil, nil
 	}
 
-	hoverContent := formatObjectForHover(analysisInfo.IdentifierObject, analysisInfo, hoverLogger) // From helpers_hover.go
+	// Format hover content using the retrieved IdentifierInfo
+	// Need to pass a temporary AstContextInfo shell if formatObjectForHover needs it
+	// TODO: Refactor formatObjectForHover to accept IdentifierInfo directly or reduce dependencies
+	tempAstInfo := &AstContextInfo{
+		TargetPackage:     identInfo.Pkg,
+		TargetFileSet:     identInfo.FileSet,
+		IdentifierDefNode: identInfo.DefNode, // Pass the definition node
+	}
+	hoverContent := formatObjectForHover(identInfo.Object, tempAstInfo, hoverLogger)
 	if hoverContent == "" {
-		hoverLogger.Debug("No hover content generated for identifier", "identifier", analysisInfo.IdentifierObject.Name())
+		hoverLogger.Debug("No hover content generated for identifier", "identifier", identInfo.Name)
 		return nil, nil
 	}
 
+	// Determine hover range using the identifier node from IdentifierInfo
 	var hoverRange *LSPRange
-	if analysisInfo.TargetFileSet != nil {
-		lspRange, rangeErr := nodeRangeToLSPRange(analysisInfo.TargetFileSet, analysisInfo.IdentifierAtCursor, file.Content, hoverLogger) // From lsp_protocol.go
+	if identInfo.FileSet != nil && identInfo.IdentNode != nil {
+		lspRange, rangeErr := nodeRangeToLSPRange(identInfo.FileSet, identInfo.IdentNode, identInfo.Content, hoverLogger)
 		if rangeErr == nil {
 			hoverRange = lspRange
 		} else {
@@ -343,6 +343,7 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 		}
 	}
 
+	// Determine markup kind
 	markupKind := MarkupKindPlainText
 	if s.clientCaps.TextDocument != nil && s.clientCaps.TextDocument.Hover != nil {
 		for _, kind := range s.clientCaps.TextDocument.Hover.ContentFormat {
@@ -353,14 +354,14 @@ func (s *Server) handleHover(ctx context.Context, conn *jsonrpc2.Conn, req *json
 		}
 	}
 
-	hoverLogger.Info("Hover information generated successfully", "identifier", analysisInfo.IdentifierObject.Name(), "markup", markupKind)
+	hoverLogger.Info("Hover information generated successfully", "identifier", identInfo.Name, "markup", markupKind)
 	return HoverResult{
 		Contents: MarkupContent{Kind: markupKind, Value: hoverContent},
 		Range:    hoverRange,
 	}, nil
 }
 
-// handleDefinition finds the definition location of the symbol under the cursor.
+// handleDefinition finds the definition location using the GetIdentifierInfo method.
 func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params DefinitionParams, logger *slog.Logger) (any, error) {
 	uri := params.TextDocument.URI
 	lspPos := params.Position
@@ -376,69 +377,63 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not open: %s", uri)
 	}
 
-	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, defLogger) // Util func
+	line, col, _, posErr := LspPositionToBytePosition(file.Content, lspPos, defLogger)
 	if posErr != nil {
 		defLogger.Error("Failed to convert LSP position to byte position", "error", posErr)
-		return nil, nil
+		return nil, nil // Return nil for position conversion errors
 	}
 	defLogger = defLogger.With("go_line", line, "go_col", col)
 
-	absPath, pathErr := ValidateAndGetFilePath(string(uri), defLogger) // Util func
+	absPath, pathErr := ValidateAndGetFilePath(string(uri), defLogger)
 	if pathErr != nil {
 		defLogger.Error("Invalid file URI", "error", pathErr)
 		return nil, fmt.Errorf("invalid file URI: %w", pathErr)
 	}
 
-	analysisCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// Use request context `ctx` for timeout and cancellation
+	analysisCtx, cancel := context.WithTimeout(ctx, 15*time.Second) // Timeout for analysis
 	defer cancel()
 
-	analysisInfo, analysisErr := s.completer.analyzer.Analyze(analysisCtx, absPath, file.Version, line, col)
+	// Use the specific GetIdentifierInfo method
+	identInfo, analysisErr := s.completer.analyzer.GetIdentifierInfo(analysisCtx, absPath, file.Version, line, col)
 
+	// Check for context cancellation *after* analysis
 	select {
 	case <-analysisCtx.Done():
 		defLogger.Info("Definition analysis cancelled or timed out", "error", analysisCtx.Err())
 		if errors.Is(analysisCtx.Err(), context.DeadlineExceeded) {
-			return nil, nil
+			return nil, nil // Return nil on timeout
 		}
 		return nil, &jsonrpc2.Error{Code: int64(JsonRpcRequestCancelled), Message: "Definition request cancelled"}
 	default:
 	}
 
+	// Handle analysis errors
 	if analysisErr != nil {
-		defLogger.Warn("Analysis for definition encountered errors", "error", analysisErr)
-		if analysisInfo == nil {
-			return nil, nil
+		if !errors.Is(analysisErr, ErrAnalysisFailed) && !errors.Is(analysisErr, ErrPositionConversion) {
+			defLogger.Error("Critical error during identifier analysis for definition", "error", analysisErr)
+		} else {
+			defLogger.Warn("Analysis for definition encountered non-critical errors", "error", analysisErr)
 		}
+		return nil, nil // Return nil if analysis had issues
 	}
-	if analysisInfo == nil {
-		defLogger.Warn("Analysis returned nil info")
+
+	// Check if an identifier and its definition position were found
+	if identInfo == nil || identInfo.Object == nil || !identInfo.Object.Pos().IsValid() {
+		defLogger.Debug("No identifier or valid definition position found at cursor")
 		return nil, nil
 	}
 
-	if analysisInfo.IdentifierAtCursor == nil || analysisInfo.IdentifierObject == nil {
-		defLogger.Debug("No identifier found at cursor position for definition")
-		return nil, nil
-	}
-
-	obj := analysisInfo.IdentifierObject
-	defPos := obj.Pos()
-
-	if !defPos.IsValid() {
-		defLogger.Debug("Identifier object has invalid definition position", "identifier", obj.Name())
-		return nil, nil
-	}
-
-	if analysisInfo.TargetFileSet == nil {
-		defLogger.Error("TargetFileSet is nil in analysis info, cannot get definition file")
-		return nil, nil
-	}
-
-	defFile := analysisInfo.TargetFileSet.File(defPos)
+	// Get definition position and file
+	obj := identInfo.Object
+	defPos := obj.Pos() // This is token.Pos
+	defFile := identInfo.FileSet.File(defPos)
 	if defFile == nil {
 		defLogger.Error("Could not find token.File for definition position", "identifier", obj.Name(), "pos", defPos)
 		return nil, nil
 	}
 
+	// Read content of the definition file (might be different from the source file)
 	defFileContent, readErr := os.ReadFile(defFile.Name())
 	if readErr != nil {
 		defLogger.Error("Failed to read definition file content", "path", defFile.Name(), "error", readErr)
@@ -446,12 +441,13 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, nil
 	}
 
-	location, locErr := tokenPosToLSPLocation(defFile, defPos, defFileContent, defLogger) // From lsp_protocol.go
+	// Convert the definition token.Pos to an LSP Location
+	location, locErr := tokenPosToLSPLocation(defFile, defPos, defFileContent, defLogger)
 	if locErr != nil {
 		defLogger.Error("Failed to convert definition position to LSP Location", "identifier", obj.Name(), "error", locErr)
 		return nil, nil
 	}
 
 	defLogger.Info("Definition found", "identifier", obj.Name(), "location_uri", location.URI, "location_line", location.Range.Start.Line)
-	return []Location{*location}, nil
+	return []Location{*location}, nil // Return as slice
 }

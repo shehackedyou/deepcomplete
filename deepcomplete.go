@@ -59,7 +59,8 @@ type Analyzer interface {
 	Analyze(ctx context.Context, filename string, version int, line, col int) (*AstContextInfo, error)
 
 	// GetIdentifierInfo attempts to find information about the identifier at the given position.
-	// Useful for Hover and Definition providers.
+	// Useful for Hover and Definition providers. Returns nil, nil if no identifier is found.
+	// Returns an error for loading or critical analysis issues.
 	GetIdentifierInfo(ctx context.Context, filename string, version int, line, col int) (*IdentifierInfo, error)
 
 	// GetEnclosingFuncInfo retrieves information about the function/method enclosing the position.
@@ -86,9 +87,11 @@ type IdentifierInfo struct {
 	Object     types.Object      // Resolved object (var, func, type, etc.)
 	Type       types.Type        // Resolved type
 	DefNode    ast.Node          // AST node where defined
-	DefFilePos token.Position    // Definition position
+	DefFilePos token.Position    // Definition position (requires FileSet to interpret fully)
 	FileSet    *token.FileSet    // FileSet needed for position interpretation
 	Pkg        *packages.Package // Package containing the definition (might be different from requesting file's package)
+	Content    []byte            // Content of the file where the identifier was found (needed for range conversion)
+	IdentNode  *ast.Ident        // The *ast.Ident node itself for range calculation
 }
 
 // PromptFormatter defines the interface for constructing the final prompt sent to the LLM.
@@ -652,19 +655,17 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	opLogger.Info("Starting identifier analysis")
 
 	// 1. Load Package and File AST (uses bbolt cache internally if configured)
-	// We need the AST and type info for this operation.
 	fset := token.NewFileSet()
 	targetPkg, targetFileAST, targetFile, _, loadErrors := loadPackageAndFile(ctx, absFilename, fset, opLogger)
 
 	// Check for critical load errors
-	if len(loadErrors) > 0 && targetPkg == nil { // Check if targetPkg is nil, indicating critical failure
+	if len(loadErrors) > 0 && targetPkg == nil {
 		combinedErr := errors.Join(loadErrors...)
 		opLogger.Error("Critical error loading package, cannot get identifier info", "error", combinedErr)
 		return nil, fmt.Errorf("critical package load error: %w", combinedErr)
 	}
 	if targetFile == nil || targetFileAST == nil {
 		opLogger.Error("Target file or AST is nil after loading, cannot get identifier info")
-		// Combine any load errors with this specific error
 		return nil, errors.Join(append(loadErrors, errors.New("target file or AST is nil"))...)
 	}
 	if targetPkg.TypesInfo == nil {
@@ -684,21 +685,29 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 
 	// 3. Find Path and Context Nodes (using helpers, potentially cached)
 	// Create a temporary AstContextInfo to pass to helpers
+	// Note: We don't need the full AstContextInfo here, just enough for findContextNodes
 	tempInfo := &AstContextInfo{
-		FilePath:      absFilename,
-		Version:       version,
-		CursorPos:     cursorPos,
-		TargetPackage: targetPkg,
-		TargetFileSet: fset,
-		TargetAstFile: targetFileAST,
+		FilePath:       absFilename,
+		Version:        version,
+		CursorPos:      cursorPos,
+		TargetPackage:  targetPkg, // Pass loaded package info
+		TargetFileSet:  fset,
+		TargetAstFile:  targetFileAST,
+		AnalysisErrors: make([]error, 0), // Initialize to capture errors from helpers
 	}
 
 	path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
 	if pathErr != nil {
 		opLogger.Warn("Error finding enclosing path", "error", pathErr)
-		// Continue if possible, path might be nil but maybe identifier is still found
+		// Continue if possible
 	}
-	findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger) // Populates tempInfo
+	// findContextNodes populates tempInfo.Identifier*, DefNode etc.
+	findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger)
+
+	// Log any non-fatal errors from findContextNodes
+	if len(tempInfo.AnalysisErrors) > 0 {
+		opLogger.Warn("Non-fatal errors during context node finding", "errors", errors.Join(tempInfo.AnalysisErrors...))
+	}
 
 	// 4. Extract and Return Identifier Information
 	if tempInfo.IdentifierAtCursor == nil || tempInfo.IdentifierObject == nil {
@@ -706,13 +715,22 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 		return nil, nil // Not an error, just no identifier found
 	}
 
+	// Read file content needed for range conversion later
+	fileContent, readErr := os.ReadFile(absFilename)
+	if readErr != nil {
+		opLogger.Error("Failed to read file content for identifier info", "error", readErr)
+		return nil, fmt.Errorf("failed to read file content %s: %w", absFilename, readErr)
+	}
+
 	identInfo := &IdentifierInfo{
-		Name:    tempInfo.IdentifierObject.Name(),
-		Object:  tempInfo.IdentifierObject,
-		Type:    tempInfo.IdentifierType,
-		DefNode: tempInfo.IdentifierDefNode,
-		FileSet: fset,      // Include fileset for position interpretation
-		Pkg:     targetPkg, // Include package info
+		Name:      tempInfo.IdentifierObject.Name(),
+		Object:    tempInfo.IdentifierObject,
+		Type:      tempInfo.IdentifierType,
+		DefNode:   tempInfo.IdentifierDefNode,
+		FileSet:   fset,                        // Include fileset
+		Pkg:       targetPkg,                   // Include package info
+		Content:   fileContent,                 // Include content
+		IdentNode: tempInfo.IdentifierAtCursor, // Store the identifier node
 	}
 
 	// Get definition position if available
@@ -721,7 +739,7 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	}
 
 	opLogger.Info("Identifier info retrieved successfully", "identifier", identInfo.Name)
-	return identInfo, nil // Return found info, ignore non-fatal analysis errors in tempInfo
+	return identInfo, nil // Return found info
 }
 
 // InvalidateCache removes the bbolt cached entry for a given directory.
