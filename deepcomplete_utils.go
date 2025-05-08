@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp" // Added for cleaning output
 	"strings"
 	"sync"
 	"time"
@@ -833,11 +834,10 @@ func (s *Spinner) Stop() {
 // ============================================================================
 
 type SnippetContext struct {
-	Prefix   string
-	Suffix   string
-	FullLine string
-	// Added field for fallback context when AST is disabled
-	FallbackContext string
+	Prefix          string
+	Suffix          string
+	FullLine        string
+	FallbackContext string // Added field for fallback context when AST is disabled
 }
 
 // extractSnippetContext extracts code prefix, suffix, and full line around the cursor.
@@ -886,7 +886,6 @@ func extractSnippetContext(filename string, row, col int, useAST bool, logger *s
 	lineStartPos := file.LineStart(row)
 	if !lineStartPos.IsValid() {
 		logger.Warn("Could not get start position for line, cannot extract full line", "line", row)
-		// Continue without full line if needed
 	} else {
 		startOffset := file.Offset(lineStartPos)
 		lineEndOffset := file.Size()
@@ -916,49 +915,12 @@ func extractSnippetContext(filename string, row, col int, useAST bool, logger *s
 	// --- Fallback Context if AST is Disabled ---
 	if !useAST {
 		logger.Debug("AST disabled, attempting to extract fallback context (enclosing function)")
-		// Simple heuristic: Find the 'func' keyword before the cursor
-		funcKeywordIndex := strings.LastIndex(ctx.Prefix, "\nfunc ")
-		if funcKeywordIndex == -1 { // Check from start if not found after newline
-			funcKeywordIndex = strings.Index(ctx.Prefix, "func ")
-		}
-
-		if funcKeywordIndex != -1 {
-			// Find the start of the function body '{'
-			braceIndex := strings.Index(content[funcKeywordIndex:], "{")
-			if braceIndex != -1 {
-				funcStartOffset := funcKeywordIndex + braceIndex + 1 // Start after '{'
-
-				// Find the matching '}' - This is naive and can be wrong with nested braces
-				// A simple balance counter is better than just finding the next '}'
-				balance := 1
-				funcEndOffset := -1
-				for i := funcStartOffset; i < len(content); i++ {
-					switch content[i] {
-					case '{':
-						balance++
-					case '}':
-						balance--
-						if balance == 0 {
-							funcEndOffset = i // Found matching brace
-							break
-						}
-					}
-				}
-
-				if funcEndOffset != -1 {
-					// Extract the function body (excluding braces)
-					fallback := content[funcStartOffset:funcEndOffset]
-					// Add a marker indicating it's fallback context
-					ctx.FallbackContext = "// Fallback Context (Enclosing Function Body - Approx.):\n" + fallback
-					logger.Debug("Extracted fallback function body context", "start", funcStartOffset, "end", funcEndOffset, "length", len(fallback))
-				} else {
-					logger.Warn("Could not find matching closing brace for fallback function context")
-				}
-			} else {
-				logger.Warn("Could not find opening brace '{' after 'func' keyword for fallback context")
-			}
+		body, found := findEnclosingFuncBody(contentBytes, offset)
+		if found {
+			ctx.FallbackContext = "// Fallback Context (Enclosing Function Body - Approx.):\n" + body
+			logger.Debug("Extracted fallback function body context", "length", len(body))
 		} else {
-			logger.Debug("Could not find preceding 'func' keyword for fallback context")
+			logger.Debug("Could not find enclosing function body for fallback context")
 		}
 	}
 
@@ -1033,7 +995,26 @@ func calculateCursorPos(file *token.File, line, col int, logger *slog.Logger) (t
 // Stream Processing Helpers
 // ============================================================================
 
-// streamCompletion reads the Ollama stream response and writes it to w.
+// Precompile regex for cleaning markdown code fences
+var mdCodeFenceRegex = regexp.MustCompile("(?m)^```(?:go)?\n|```$")
+
+// cleanLLMOutput removes FIM tokens and markdown code fences.
+func cleanLLMOutput(rawOutput string) string {
+	cleaned := rawOutput
+	// Remove FIM tokens
+	cleaned = strings.ReplaceAll(cleaned, FimPrefixToken, "")
+	cleaned = strings.ReplaceAll(cleaned, FimMiddleToken, "")
+	cleaned = strings.ReplaceAll(cleaned, FimSuffixToken, "")
+	cleaned = strings.ReplaceAll(cleaned, FimEOTToken, "") // Remove EOT token as well
+
+	// Remove markdown code fences (```go or ```)
+	cleaned = mdCodeFenceRegex.ReplaceAllString(cleaned, "")
+
+	// Trim leading/trailing whitespace that might remain
+	return strings.TrimSpace(cleaned)
+}
+
+// streamCompletion reads the Ollama stream response, cleans it, and writes it to w.
 func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer, logger *slog.Logger) error {
 	defer r.Close()
 	reader := bufio.NewReader(r)
@@ -1053,8 +1034,8 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer, logger 
 		line, err := reader.ReadBytes('\n')
 
 		if len(line) > 0 {
+			// Process and clean the line before writing
 			if procErr := processLine(line, w, logger); procErr != nil { // Pass logger
-				// Wrap error from processLine
 				return fmt.Errorf("processing stream line failed: %w", procErr)
 			}
 			lineCount++
@@ -1065,19 +1046,17 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer, logger 
 				logger.Debug("Stream processing finished (EOF)", "lines_processed", lineCount)
 				return nil
 			}
-			// Check context again after read error
 			select {
 			case <-ctx.Done():
-				return ctx.Err() // Return context error if cancelled during read
+				return ctx.Err()
 			default:
-				// Wrap the original read error
 				return fmt.Errorf("error reading from Ollama stream: %w", err)
 			}
 		}
 	}
 }
 
-// processLine decodes a single line from the Ollama stream and writes the content.
+// processLine decodes a single line from the Ollama stream, cleans it, and writes the content.
 func processLine(line []byte, w io.Writer, logger *slog.Logger) error {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
@@ -1090,19 +1069,22 @@ func processLine(line []byte, w io.Writer, logger *slog.Logger) error {
 	var resp OllamaResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		logger.Debug("Ignoring non-JSON line from Ollama stream", "line", string(line))
-		return nil // Don't treat as fatal, just ignore
+		return nil
 	}
 
 	if resp.Error != "" {
 		logger.Error("Ollama stream reported an error", "error", resp.Error)
-		// Return a specific error indicating it came from the stream payload
 		return fmt.Errorf("%w: %s", ErrStreamProcessing, resp.Error)
 	}
 
-	if _, err := fmt.Fprint(w, resp.Response); err != nil {
-		logger.Error("Error writing stream chunk to output", "error", err)
-		// Wrap write error
-		return fmt.Errorf("error writing to output: %w", err)
+	// Clean the response chunk before writing
+	cleanedResponse := cleanLLMOutput(resp.Response)
+
+	if len(cleanedResponse) > 0 {
+		if _, err := fmt.Fprint(w, cleanedResponse); err != nil {
+			logger.Error("Error writing cleaned stream chunk to output", "error", err)
+			return fmt.Errorf("error writing to output: %w", err)
+		}
 	}
 	return nil
 }
@@ -1129,9 +1111,7 @@ func firstN(s string, n int) string {
 // getPosString safely gets a position string or returns a placeholder.
 func getPosString(fset *token.FileSet, pos token.Pos) string {
 	if fset != nil && pos.IsValid() {
-		// Use PositionFor for more control over output format if needed
-		// return fset.PositionFor(pos, true).String() // true for adjusted position
-		return fset.Position(pos).String() // Default position string
+		return fset.Position(pos).String()
 	}
 	return fmt.Sprintf("Pos(%d)", pos)
 }
@@ -1145,7 +1125,6 @@ func findEnclosingFuncBody(content []byte, offset int) (string, bool) {
 		return "", false
 	}
 
-	// Search backwards for "func " preceded by a newline or start of file
 	searchStart := offset
 	if searchStart > len(content) {
 		searchStart = len(content)
@@ -1154,26 +1133,24 @@ func findEnclosingFuncBody(content []byte, offset int) (string, bool) {
 	funcKeywordIndex := strings.LastIndex(string(prefix), "\nfunc ")
 	if funcKeywordIndex == -1 {
 		if strings.HasPrefix(string(prefix), "func ") {
-			funcKeywordIndex = 0 // Found at the very beginning
+			funcKeywordIndex = 0
 		} else {
-			return "", false // "func " not found before cursor
+			return "", false
 		}
 	} else {
-		funcKeywordIndex++ // Adjust index to start of "func "
+		funcKeywordIndex++
 	}
 
-	// Find the opening brace '{' after the "func " keyword
 	braceSearchStart := funcKeywordIndex + len("func ")
 	if braceSearchStart >= len(content) {
-		return "", false // No content after "func "
+		return "", false
 	}
 	braceIndex := strings.Index(string(content[braceSearchStart:]), "{")
 	if braceIndex == -1 {
-		return "", false // Opening brace not found
+		return "", false
 	}
-	funcBodyStartOffset := braceSearchStart + braceIndex + 1 // Position after '{'
+	funcBodyStartOffset := braceSearchStart + braceIndex + 1
 
-	// Find the matching closing brace '}' using a balance counter
 	balance := 1
 	funcBodyEndOffset := -1
 	for i := funcBodyStartOffset; i < len(content); i++ {
@@ -1183,19 +1160,18 @@ func findEnclosingFuncBody(content []byte, offset int) (string, bool) {
 		case '}':
 			balance--
 			if balance == 0 {
-				funcBodyEndOffset = i // Found the matching brace
-				goto foundEnd         // Exit loop once matching brace is found
+				funcBodyEndOffset = i
+				goto foundEnd
 			}
 		}
 	}
 foundEnd:
 
 	if funcBodyEndOffset != -1 && funcBodyEndOffset >= funcBodyStartOffset {
-		// Ensure the cursor offset is actually within this found function body
 		if offset >= funcBodyStartOffset && offset <= funcBodyEndOffset {
 			return string(content[funcBodyStartOffset:funcBodyEndOffset]), true
 		}
 	}
 
-	return "", false // Matching brace not found or cursor not inside
+	return "", false
 }

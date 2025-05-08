@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/token"
 	"go/types"
 	"io"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/dgraph-io/ristretto"
 	"go.etcd.io/bbolt"
+	"golang.org/x/tools/go/packages" // Added for packages.Package type hint
 )
 
 // =============================================================================
@@ -53,7 +55,19 @@ type LLMClient interface {
 type Analyzer interface {
 	// Analyze performs static analysis on the given file at the specified position.
 	// Returns AstContextInfo and potentially ErrAnalysisFailed if non-fatal errors occurred.
+	// TODO: Consider deprecating in favor of more specific methods below.
 	Analyze(ctx context.Context, filename string, version int, line, col int) (*AstContextInfo, error)
+
+	// GetIdentifierInfo attempts to find information about the identifier at the given position.
+	// Useful for Hover and Definition providers.
+	GetIdentifierInfo(ctx context.Context, filename string, version int, line, col int) (*IdentifierInfo, error)
+
+	// GetEnclosingFuncInfo retrieves information about the function/method enclosing the position.
+	// GetEnclosingFuncInfo(ctx context.Context, filename string, version int, line, col int) (*EnclosingFuncInfo, error) // Example for future
+
+	// GetScopeInfo retrieves variables/types available in the scope at the position.
+	// GetScopeInfo(ctx context.Context, filename string, version int, line, col int) (*ScopeInfo, error) // Example for future
+
 	// Close cleans up any resources used by the analyzer (e.g., cache connections).
 	Close() error
 	// InvalidateCache removes cached data related to a specific directory (e.g., when go.mod changes).
@@ -64,6 +78,17 @@ type Analyzer interface {
 	MemoryCacheEnabled() bool
 	// GetMemoryCacheMetrics returns performance metrics for the in-memory cache.
 	GetMemoryCacheMetrics() *ristretto.Metrics
+}
+
+// IdentifierInfo holds information specifically about an identifier found at a position.
+type IdentifierInfo struct {
+	Name       string            // Identifier name
+	Object     types.Object      // Resolved object (var, func, type, etc.)
+	Type       types.Type        // Resolved type
+	DefNode    ast.Node          // AST node where defined
+	DefFilePos token.Position    // Definition position
+	FileSet    *token.FileSet    // FileSet needed for position interpretation
+	Pkg        *packages.Package // Package containing the definition (might be different from requesting file's package)
 }
 
 // PromptFormatter defines the interface for constructing the final prompt sent to the LLM.
@@ -101,7 +126,6 @@ func LoadConfig(logger *stdslog.Logger) (Config, error) {
 			if strings.Contains(loadErr.Error(), "parsing config file JSON") {
 				configParseError = loadErr // Store specific parse error
 			}
-			// Wrap error for context
 			loadErrors = append(loadErrors, fmt.Errorf("loading %s failed: %w", primaryPath, loadErr))
 			logger.Warn("Failed to load or merge config", "path", primaryPath, "error", loadErr)
 		} else if loaded {
@@ -158,14 +182,12 @@ func LoadConfig(logger *stdslog.Logger) (Config, error) {
 		pureDefault := getDefaultConfig()
 		if valErr := pureDefault.Validate(logger); valErr != nil {
 			logger.Error("FATAL: Default config definition is invalid", "error", valErr)
-			// Return the invalid default config but with a fatal error
 			return pureDefault, fmt.Errorf("default config definition is invalid: %w", valErr)
 		}
 		finalCfg = pureDefault
 	}
 
 	if len(loadErrors) > 0 {
-		// Wrap all accumulated non-fatal errors under ErrConfig
 		return finalCfg, fmt.Errorf("%w: %w", ErrConfig, errors.Join(loadErrors...))
 	}
 	return finalCfg, nil
@@ -186,15 +208,15 @@ type httpOllamaClient struct {
 func newHttpOllamaClient() *httpOllamaClient {
 	return &httpOllamaClient{
 		httpClient: &http.Client{
-			Timeout: 90 * time.Second, // Overall request timeout
+			Timeout: 90 * time.Second,
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
-					Timeout: 10 * time.Second, // Connection timeout
+					Timeout: 10 * time.Second,
 				}).DialContext,
 				TLSHandshakeTimeout:   10 * time.Second,
 				MaxIdleConns:          10,
 				IdleConnTimeout:       30 * time.Second,
-				ResponseHeaderTimeout: 20 * time.Second, // Timeout for receiving headers
+				ResponseHeaderTimeout: 20 * time.Second,
 			},
 		},
 	}
@@ -209,7 +231,6 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 	endpointURL := base + "/api/generate"
 	u, err := url.Parse(endpointURL)
 	if err != nil {
-		// Wrap error for context
 		return nil, fmt.Errorf("error parsing Ollama URL '%s': %w", endpointURL, err)
 	}
 
@@ -227,13 +248,11 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 	}
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		// Wrap error
 		return nil, fmt.Errorf("error marshaling JSON payload: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		// Wrap error
 		return nil, fmt.Errorf("error creating HTTP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -242,7 +261,6 @@ func (c *httpOllamaClient) GenerateStream(ctx context.Context, prompt string, co
 	logger.Debug("Sending request to Ollama", "url", endpointURL, "model", config.Model)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// --- Enhanced Error Handling ---
 		if errors.Is(err, context.Canceled) {
 			logger.Warn("Ollama request context cancelled", "url", endpointURL)
 			return nil, context.Canceled
@@ -627,6 +645,85 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	return info, analysisErr
 }
 
+// GetIdentifierInfo implements the Analyzer interface method.
+// It focuses on finding the identifier at the cursor and its related type/definition info.
+func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename string, version int, line, col int) (*IdentifierInfo, error) {
+	opLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "GetIdentifierInfo")
+	opLogger.Info("Starting identifier analysis")
+
+	// 1. Load Package and File AST (uses bbolt cache internally if configured)
+	// We need the AST and type info for this operation.
+	fset := token.NewFileSet()
+	targetPkg, targetFileAST, targetFile, _, loadErrors := loadPackageAndFile(ctx, absFilename, fset, opLogger)
+
+	// Check for critical load errors
+	if len(loadErrors) > 0 && targetPkg == nil { // Check if targetPkg is nil, indicating critical failure
+		combinedErr := errors.Join(loadErrors...)
+		opLogger.Error("Critical error loading package, cannot get identifier info", "error", combinedErr)
+		return nil, fmt.Errorf("critical package load error: %w", combinedErr)
+	}
+	if targetFile == nil || targetFileAST == nil {
+		opLogger.Error("Target file or AST is nil after loading, cannot get identifier info")
+		// Combine any load errors with this specific error
+		return nil, errors.Join(append(loadErrors, errors.New("target file or AST is nil"))...)
+	}
+	if targetPkg.TypesInfo == nil {
+		opLogger.Warn("Type info is nil, identifier resolution might fail")
+		// Continue, but resolution might not work
+	}
+
+	// 2. Calculate Cursor Position
+	cursorPos, posErr := calculateCursorPos(targetFile, line, col, opLogger)
+	if posErr != nil {
+		return nil, fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
+	}
+	if !cursorPos.IsValid() {
+		return nil, fmt.Errorf("%w: invalid cursor position calculated (Pos: %d)", ErrPositionConversion, cursorPos)
+	}
+	opLogger = opLogger.With("cursorPos", cursorPos, "cursorPosStr", fset.PositionFor(cursorPos, true).String())
+
+	// 3. Find Path and Context Nodes (using helpers, potentially cached)
+	// Create a temporary AstContextInfo to pass to helpers
+	tempInfo := &AstContextInfo{
+		FilePath:      absFilename,
+		Version:       version,
+		CursorPos:     cursorPos,
+		TargetPackage: targetPkg,
+		TargetFileSet: fset,
+		TargetAstFile: targetFileAST,
+	}
+
+	path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
+	if pathErr != nil {
+		opLogger.Warn("Error finding enclosing path", "error", pathErr)
+		// Continue if possible, path might be nil but maybe identifier is still found
+	}
+	findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger) // Populates tempInfo
+
+	// 4. Extract and Return Identifier Information
+	if tempInfo.IdentifierAtCursor == nil || tempInfo.IdentifierObject == nil {
+		opLogger.Debug("No identifier object found at cursor position")
+		return nil, nil // Not an error, just no identifier found
+	}
+
+	identInfo := &IdentifierInfo{
+		Name:    tempInfo.IdentifierObject.Name(),
+		Object:  tempInfo.IdentifierObject,
+		Type:    tempInfo.IdentifierType,
+		DefNode: tempInfo.IdentifierDefNode,
+		FileSet: fset,      // Include fileset for position interpretation
+		Pkg:     targetPkg, // Include package info
+	}
+
+	// Get definition position if available
+	if defPos := identInfo.Object.Pos(); defPos.IsValid() {
+		identInfo.DefFilePos = fset.Position(defPos) // Store token.Position
+	}
+
+	opLogger.Info("Identifier info retrieved successfully", "identifier", identInfo.Name)
+	return identInfo, nil // Return found info, ignore non-fatal analysis errors in tempInfo
+}
+
 // InvalidateCache removes the bbolt cached entry for a given directory.
 func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	logger := a.logger.With("dir", dir, "op", "InvalidateCache")
@@ -737,7 +834,7 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 	suffix := snippetCtx.Suffix
 
 	if config.UseFim {
-		template := config.FimTemplate // Use the FIM template string
+		template := config.FimTemplate
 		if len(prefix) > maxFIMPartLen {
 			logger.Warn("Truncating FIM prefix", "original_length", len(prefix), "max_length", maxFIMPartLen)
 			marker := "...(prefix truncated)"
@@ -764,15 +861,10 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				suffix = suffix[:endByte] + marker
 			}
 		}
-		// Format FIM template: substitutes %s with preamble, prefix, suffix
-		// It expects the template string to contain FimPrefixToken, FimMiddleToken, FimSuffixToken literally.
-		// We need to replace those placeholders within the template string itself, or use fmt.Sprintf correctly.
-		// The current fimPromptTemplate constant already includes the tokens.
-		// We just need to pass the arguments to fmt.Sprintf in the correct order.
-		// Order in fimPromptTemplate: CONTEXT (%s), PREFIX (%s), SUFFIX (%s)
+		// Use FIM tokens defined in types.go
 		return fmt.Sprintf(template, finalPreamble.String(), prefix, suffix)
 	} else {
-		template := config.PromptTemplate // Use the standard template string
+		template := config.PromptTemplate
 		snippet := prefix
 		if len(snippet) > maxSnippetLen {
 			logger.Warn("Truncating code snippet (prefix)", "original_length", len(snippet), "max_length", maxSnippetLen)
@@ -787,8 +879,6 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				snippet = marker + snippet[startByte:]
 			}
 		}
-		// Format non-FIM template: substitutes %s with preamble, snippet
-		// Order in promptTemplate: CONTEXT (%s), SNIPPET (%s)
 		return fmt.Sprintf(template, finalPreamble.String(), snippet)
 	}
 }
