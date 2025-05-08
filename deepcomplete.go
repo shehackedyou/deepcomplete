@@ -690,15 +690,13 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 	if logger == nil {
 		logger = stdslog.Default()
 	}
-	var finalPreamble strings.Builder // Use builder for efficient preamble construction
-	template := config.PromptTemplate
+	var finalPreamble strings.Builder
 	maxPreambleLen := config.MaxPreambleLen
 	maxSnippetLen := config.MaxSnippetLen
 	maxFIMPartLen := maxSnippetLen / 2
 
 	// --- Add Fallback Context if present ---
 	if snippetCtx.FallbackContext != "" {
-		// Apply truncation to fallback context separately if needed
 		truncatedFallback := snippetCtx.FallbackContext
 		if len(truncatedFallback) > maxPreambleLen {
 			logger.Warn("Truncating fallback context", "original_length", len(truncatedFallback), "max_length", maxPreambleLen)
@@ -732,14 +730,14 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 			truncatedPreamble = marker + truncatedPreamble[startByte:]
 		}
 	}
-	finalPreamble.WriteString(truncatedPreamble) // Append the (potentially truncated) main preamble
+	finalPreamble.WriteString(truncatedPreamble)
 
 	// --- Format Snippet based on FIM ---
 	prefix := snippetCtx.Prefix
 	suffix := snippetCtx.Suffix
 
 	if config.UseFim {
-		template = config.FimTemplate
+		template := config.FimTemplate // Use the FIM template string
 		if len(prefix) > maxFIMPartLen {
 			logger.Warn("Truncating FIM prefix", "original_length", len(prefix), "max_length", maxFIMPartLen)
 			marker := "...(prefix truncated)"
@@ -766,10 +764,15 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				suffix = suffix[:endByte] + marker
 			}
 		}
-		// Format FIM template with combined preamble, prefix, and suffix
+		// Format FIM template: substitutes %s with preamble, prefix, suffix
+		// It expects the template string to contain FimPrefixToken, FimMiddleToken, FimSuffixToken literally.
+		// We need to replace those placeholders within the template string itself, or use fmt.Sprintf correctly.
+		// The current fimPromptTemplate constant already includes the tokens.
+		// We just need to pass the arguments to fmt.Sprintf in the correct order.
+		// Order in fimPromptTemplate: CONTEXT (%s), PREFIX (%s), SUFFIX (%s)
 		return fmt.Sprintf(template, finalPreamble.String(), prefix, suffix)
 	} else {
-		// Non-FIM uses only prefix as the snippet
+		template := config.PromptTemplate // Use the standard template string
 		snippet := prefix
 		if len(snippet) > maxSnippetLen {
 			logger.Warn("Truncating code snippet (prefix)", "original_length", len(snippet), "max_length", maxSnippetLen)
@@ -784,7 +787,8 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				snippet = marker + snippet[startByte:]
 			}
 		}
-		// Format non-FIM template with combined preamble and snippet (prefix)
+		// Format non-FIM template: substitutes %s with preamble, snippet
+		// Order in promptTemplate: CONTEXT (%s), SNIPPET (%s)
 		return fmt.Sprintf(template, finalPreamble.String(), snippet)
 	}
 }
@@ -1054,10 +1058,7 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 		return fmt.Errorf("failed to extract code snippet context: %w", snippetErr)
 	}
 
-	// If AST was disabled and fallback context was generated, prepend it to the main preamble
-	// Note: The formatter now handles prepending fallback context.
-	// No change needed here for contextPreamble construction itself.
-
+	// Note: Formatter now handles prepending FallbackContext if present.
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig, opLogger)
 	opLogger.Debug("Generated prompt", "length", len(prompt))
 

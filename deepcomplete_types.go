@@ -17,12 +17,13 @@ import (
 )
 
 // =============================================================================
-// Configuration Types
+// Configuration Types & Constants
 // =============================================================================
 
 const (
 	defaultOllamaURL = "http://localhost:11434"
 	defaultModel     = "deepseek-coder-r2"
+
 	// Standard prompt template used for completions.
 	promptTemplate = `<s>[INST] <<SYS>>
 You are an expert Go programming assistant.
@@ -36,21 +37,29 @@ CONTEXT:
 
 CODE SNIPPET TO COMPLETE:
 ` + "```go\n%s\n```" + `
-[/INST]`
-	// FIM prompt template used for fill-in-the-middle tasks.
+[/INST]` // Note: LLM might still output ```go, needs cleaning.
+
+	// FIM Tokens (Used in fimPromptTemplate)
+	FimPrefixToken = "<PRE>"
+	FimSuffixToken = "<SUF>"
+	FimMiddleToken = "<MID>"
+	FimEOTToken    = "<EOT>" // End Of Text token for some models
+
+	// FIM prompt template using defined tokens.
 	fimPromptTemplate = `<s>[INST] <<SYS>>
 You are an expert Go programming assistant performing a fill-in-the-middle task.
-Analyze the provided context and the code surrounding the <MID> marker.
-Insert Go code at the <MID> marker to logically connect the <PRE>fix and <SUF>fix code blocks.
+Analyze the provided context and the code surrounding the ` + FimMiddleToken + ` marker.
+Insert Go code at the ` + FimMiddleToken + ` marker to logically connect the ` + FimPrefixToken + `fix and ` + FimSuffixToken + `fix code blocks.
 Output ONLY the raw Go code completion for the middle part, without any markdown, explanations, or introductory text.
+Do not output the surrounding ` + FimPrefixToken + ` or ` + FimSuffixToken + ` tokens.
 <</SYS>>
 
 CONTEXT:
 %s
 
 CODE TO FILL:
-<PRE>%s<MID>%s<SUF>
-[/INST]`
+` + FimPrefixToken + `%s` + FimMiddleToken + `%s` + FimSuffixToken + `
+[/INST]` // Note: LLM might still output FIM tokens, needs cleaning.
 
 	defaultMaxTokens      = 256            // Default maximum tokens for LLM response.
 	DefaultStop           = "\n"           // Default stop sequence for LLM. Exported for CLI use.
@@ -102,15 +111,15 @@ func getDefaultConfig() Config {
 		OllamaURL:      defaultOllamaURL,
 		Model:          defaultModel,
 		PromptTemplate: promptTemplate,
-		FimTemplate:    fimPromptTemplate,
+		FimTemplate:    fimPromptTemplate, // Uses constant defined above
 		MaxTokens:      defaultMaxTokens,
-		Stop:           []string{DefaultStop, "}", "//", "/*"}, // Sensible defaults
+		Stop:           []string{DefaultStop, "}", "//", "/*", FimEOTToken}, // Add FIM EOT token to default stops
 		Temperature:    defaultTemperature,
 		LogLevel:       defaultLogLevel,
-		UseAst:         true,  // Enable analysis by default
-		UseFim:         false, // FIM is off by default
-		MaxPreambleLen: 2048,  // Limit context preamble size
-		MaxSnippetLen:  2048,  // Limit code snippet size
+		UseAst:         true,
+		UseFim:         false,
+		MaxPreambleLen: 2048,
+		MaxSnippetLen:  2048,
 	}
 }
 
@@ -140,11 +149,10 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		logger.Warn("Config validation: max_tokens is not positive, applying default.", "configured_value", c.MaxTokens, "default", tempDefault.MaxTokens)
 		c.MaxTokens = tempDefault.MaxTokens
 	}
-	// Validate Temperature range [0.0, 2.0]
 	if c.Temperature < 0.0 || c.Temperature > 2.0 {
 		logger.Warn("Config validation: temperature is outside reasonable range [0.0, 2.0], applying default.", "configured_value", c.Temperature, "default", tempDefault.Temperature)
 		validationErrors = append(validationErrors, fmt.Errorf("temperature %f is outside valid range [0.0, 2.0]", c.Temperature))
-		c.Temperature = tempDefault.Temperature // Apply default if out of range
+		c.Temperature = tempDefault.Temperature
 	}
 	if c.MaxPreambleLen <= 0 {
 		logger.Warn("Config validation: max_preamble_len is not positive, applying default.", "configured_value", c.MaxPreambleLen, "default", tempDefault.MaxPreambleLen)
@@ -162,7 +170,7 @@ func (c *Config) Validate(logger *stdslog.Logger) error {
 		if err != nil {
 			logger.Warn("Config validation: Invalid log_level found, applying default.", "configured_value", c.LogLevel, "default", defaultLogLevel, "error", err)
 			validationErrors = append(validationErrors, fmt.Errorf("invalid log_level '%s': %w", c.LogLevel, err))
-			c.LogLevel = defaultLogLevel // Apply default if invalid
+			c.LogLevel = defaultLogLevel
 		}
 	}
 	if c.Stop == nil {
