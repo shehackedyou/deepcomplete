@@ -14,7 +14,8 @@ import (
 	"go/token"
 	"io"
 	"log/slog"
-	"net/http" // Needed for OllamaError status codes
+	"math/rand" // For jitter
+	"net/http"  // Needed for OllamaError status codes
 	"net/url"
 	"os"
 	"path/filepath"
@@ -41,7 +42,6 @@ var (
 
 // PrettyPrint prints colored text to stderr.
 func PrettyPrint(color, text string) {
-	// Direct printing to stderr might bypass structured logging.
 	fmt.Fprint(os.Stderr, color, text, ColorReset)
 }
 
@@ -662,6 +662,7 @@ func deleteCacheEntryByKey(db *bbolt.DB, cacheKey []byte, logger *slog.Logger) e
 // ============================================================================
 
 // retry executes an operation function with backoff and retry logic.
+// It respects the context cancellation and applies exponential backoff with jitter.
 func retry(ctx context.Context, operation func() error, maxRetries int, initialDelay time.Duration, logger *slog.Logger) error {
 	var lastErr error
 	if logger == nil {
@@ -671,50 +672,71 @@ func retry(ctx context.Context, operation func() error, maxRetries int, initialD
 	currentDelay := initialDelay
 	for i := 0; i < maxRetries; i++ {
 		attemptLogger := logger.With("attempt", i+1, "max_attempts", maxRetries)
+
+		// Check context before executing the operation
 		select {
 		case <-ctx.Done():
 			attemptLogger.Warn("Context cancelled before attempt", "error", ctx.Err())
-			return ctx.Err()
+			// Return the context error, wrapped to indicate it happened during retry setup
+			return fmt.Errorf("retry cancelled before attempt %d: %w", i+1, ctx.Err())
 		default:
 		}
 
 		lastErr = operation()
 		if lastErr == nil {
-			return nil
+			return nil // Success
 		}
 
+		// Check for non-retryable errors (including context errors from *within* the operation)
 		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
 			attemptLogger.Warn("Attempt failed due to context error. Not retrying.", "error", lastErr)
-			return lastErr
+			return lastErr // Return the original context error
 		}
 
+		// Check for specific retryable Ollama errors
 		var ollamaErr *OllamaError
 		isRetryableOllama := errors.As(lastErr, &ollamaErr) &&
 			(ollamaErr.Status == http.StatusServiceUnavailable || ollamaErr.Status == http.StatusTooManyRequests || ollamaErr.Status == http.StatusInternalServerError)
+
+		// Check for general network/connection errors (assuming ErrOllamaUnavailable wraps these)
 		isRetryableNetwork := errors.Is(lastErr, ErrOllamaUnavailable) || errors.Is(lastErr, ErrStreamProcessing)
+
 		isRetryable := isRetryableOllama || isRetryableNetwork
 
 		if !isRetryable {
 			attemptLogger.Warn("Attempt failed with non-retryable error.", "error", lastErr)
-			return lastErr
+			return lastErr // Return the original non-retryable error
 		}
 
+		// If it's the last attempt, break the loop and return the last error
 		if i == maxRetries-1 {
 			break
 		}
 
-		waitDuration := currentDelay
+		// Calculate delay with exponential backoff and jitter
+		// Jitter helps prevent thundering herd issues if multiple instances retry simultaneously.
+		jitter := time.Duration(rand.Int63n(int64(currentDelay) / 4)) // Jitter up to 25% of delay
+		waitDuration := currentDelay + jitter
 		attemptLogger.Warn("Attempt failed with retryable error. Retrying...", "error", lastErr, "delay", waitDuration)
 
+		// Wait for the duration or until the context is cancelled
 		select {
 		case <-ctx.Done():
 			attemptLogger.Warn("Context cancelled during retry wait", "error", ctx.Err())
-			return ctx.Err()
+			// Return the context error, wrapped to indicate when cancellation occurred
+			return fmt.Errorf("retry cancelled during wait after attempt %d: %w", i+1, ctx.Err())
 		case <-time.After(waitDuration):
-			// currentDelay *= 2 // Optional: Exponential backoff
+			// Exponential backoff: double the delay for the next attempt, up to a maximum
+			currentDelay *= 2
+			maxDelay := 5 * time.Second // Set a reasonable max delay
+			if currentDelay > maxDelay {
+				currentDelay = maxDelay
+			}
 		}
 	}
+	// If loop finishes, it means all retries failed
 	logger.Error("Operation failed after all retries.", "retries", maxRetries, "final_error", lastErr)
+	// Return the last error encountered, wrapped to indicate exhaustion of retries
 	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
 }
 
@@ -983,7 +1005,7 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer, logger 
 		select {
 		case <-ctx.Done():
 			logger.Warn("Context cancelled during streaming", "error", ctx.Err())
-			return ctx.Err()
+			return ctx.Err() // Return context error directly
 		default:
 		}
 
@@ -991,7 +1013,8 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer, logger 
 
 		if len(line) > 0 {
 			if procErr := processLine(line, w, logger); procErr != nil { // Pass logger
-				return procErr
+				// Wrap error from processLine
+				return fmt.Errorf("processing stream line failed: %w", procErr)
 			}
 			lineCount++
 		}
@@ -1001,10 +1024,12 @@ func streamCompletion(ctx context.Context, r io.ReadCloser, w io.Writer, logger 
 				logger.Debug("Stream processing finished (EOF)", "lines_processed", lineCount)
 				return nil
 			}
+			// Check context again after read error
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return ctx.Err() // Return context error if cancelled during read
 			default:
+				// Wrap the original read error
 				return fmt.Errorf("error reading from Ollama stream: %w", err)
 			}
 		}
@@ -1024,16 +1049,18 @@ func processLine(line []byte, w io.Writer, logger *slog.Logger) error {
 	var resp OllamaResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		logger.Debug("Ignoring non-JSON line from Ollama stream", "line", string(line))
-		return nil
+		return nil // Don't treat as fatal, just ignore
 	}
 
 	if resp.Error != "" {
 		logger.Error("Ollama stream reported an error", "error", resp.Error)
-		return fmt.Errorf("ollama stream error: %s", resp.Error)
+		// Return a specific error indicating it came from the stream payload
+		return fmt.Errorf("%w: %s", ErrStreamProcessing, resp.Error)
 	}
 
 	if _, err := fmt.Fprint(w, resp.Response); err != nil {
 		logger.Error("Error writing stream chunk to output", "error", err)
+		// Wrap write error
 		return fmt.Errorf("error writing to output: %w", err)
 	}
 	return nil
