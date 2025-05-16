@@ -566,13 +566,9 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 				if decodeErr := gob.NewDecoder(bytes.NewReader(cachedEntry.AnalysisGob)).Decode(&analysisData); decodeErr == nil {
 					info.PackageName = analysisData.PackageName
 					info.PromptPreamble = analysisData.PromptPreamble
-					// cacheHit = true // This was for preamble, but Analyze does more.
-					// For Analyze, a bbolt hit for preamble doesn't mean full analysis is cached.
 					loadDuration = time.Since(decodeStart)
 					analysisLogger.Debug("Preamble successfully decoded from bbolt cache.", "duration", loadDuration)
-					// Set cacheHit to false to force re-analysis for other parts if Analyze is called.
-					// Specific getters will handle their own caching.
-					cacheHit = false
+					cacheHit = false // For Analyze, a bbolt hit for preamble doesn't mean full analysis is cached.
 				} else {
 					analysisLogger.Warn("Failed to gob-decode cached analysis data. Treating as miss.", "error", decodeErr)
 					addAnalysisError(info, fmt.Errorf("%w: %w", ErrCacheDecode, decodeErr), analysisLogger)
@@ -607,7 +603,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	}
 	if len(loadErrors) > 0 && targetPkg == nil { // Critical load error if targetPkg is nil
 		analysisLogger.Error("Critical package load error occurred.")
-		// Defer will handle setting analysisErr based on info.AnalysisErrors
 		return info, analysisErr // Return info and allow defer to set analysisErr
 	}
 	info.TargetPackage = targetPkg
@@ -615,40 +610,30 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	// --- End Load Package Info ---
 
 	// --- Perform Analysis Steps (using loaded info) ---
-	// This section is a candidate for major refactoring. The specific Get* methods
-	// should be the primary way to obtain detailed context.
 	stepsStart := time.Now()
 	if targetFile != nil { // Ensure targetFile (token.File) is valid
-		// The call to performAnalysisSteps is becoming redundant as specific getters are enhanced.
-		// For now, it's kept to ensure existing behavior of Analyze method.
-		// TODO: Refactor Analyze to directly use specific getters or a more streamlined internal process.
 		analyzeStepErr := performAnalysisSteps(ctx, targetFile, targetFileAST, targetPkg, fset, line, col, a, info, analysisLogger)
 		if analyzeStepErr != nil {
-			// performAnalysisSteps now returns error only for fatal issues like invalid cursor.
 			analysisLogger.Error("Fatal error during performAnalysisSteps", "error", analyzeStepErr)
 			analysisErr = analyzeStepErr // Set the fatal error
 			return info, analysisErr     // Return immediately
 		}
-		// Non-fatal errors from performAnalysisSteps are added to info.AnalysisErrors within that function.
 	} else {
-		if len(loadErrors) == 0 { // Only log if no previous load error explains why targetFile is nil
+		if len(loadErrors) == 0 {
 			addAnalysisError(info, errors.New("cannot perform analysis steps: target token.File is nil"), analysisLogger)
 		}
-		// Attempt to gather package scope even if file-specific analysis fails
-		// This would typically be handled by GetScopeInfo if called directly.
 	}
 	stepsDuration = time.Since(stepsStart)
 	analysisLogger.Debug("Analysis steps completed", "duration", stepsDuration)
 	// --- End Analysis Steps ---
 
 	// --- Construct Preamble (if not loaded from bbolt cache) ---
-	if info.PromptPreamble == "" { // Only generate if not already populated (e.g., by bbolt cache)
+	if info.PromptPreamble == "" {
 		preambleStart := time.Now()
 		preamble, preambleErr := a.GetPromptPreamble(ctx, absFilename, version, line, col)
 		if preambleErr != nil {
 			analysisLogger.Error("Error getting prompt preamble", "error", preambleErr)
 			addAnalysisError(info, fmt.Errorf("failed to get prompt preamble: %w", preambleErr), analysisLogger)
-			// Use a basic fallback preamble on error
 			info.PromptPreamble = fmt.Sprintf("// File: %s\n// Package: %s\n// ERROR: Could not generate detailed preamble.\n", filepath.Base(absFilename), info.PackageName)
 		} else {
 			info.PromptPreamble = preamble
@@ -661,16 +646,12 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	// --- End Construct Preamble ---
 
 	// --- Bbolt Cache Write (if preamble was generated and no critical load errors) ---
-	// Only save if db is available, preamble was generated (not from cache hit for preamble itself),
-	// and no critical package loading errors occurred.
 	shouldSave := a.db != nil && info.PromptPreamble != "" && !cacheHit && len(loadErrors) == 0
 	if shouldSave {
 		analysisLogger.Debug("Attempting to save analysis results to bbolt cache.", "key", string(cacheKey))
 		saveStart := time.Now()
-		// Pass targetPkg to calculateInputHashes if available
 		inputHashes, hashErr := calculateInputHashes(dir, targetPkg, analysisLogger)
 		if hashErr == nil {
-			// Cache only essential data for preamble reconstruction
 			analysisDataToCache := CachedAnalysisData{PackageName: info.PackageName, PromptPreamble: info.PromptPreamble}
 			var gobBuf bytes.Buffer
 			if encodeErr := gob.NewEncoder(&gobBuf).Encode(&analysisDataToCache); encodeErr == nil {
@@ -681,7 +662,7 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 					encodedBytes := entryBuf.Bytes()
 					saveErr := a.db.Update(func(tx *bbolt.Tx) error {
 						b := tx.Bucket(cacheBucketName)
-						if b == nil { // Should not happen if initialized correctly
+						if b == nil {
 							return fmt.Errorf("%w: cache bucket %s disappeared", ErrCacheWrite, string(cacheBucketName))
 						}
 						return b.Put(cacheKey, encodedBytes)
@@ -713,7 +694,6 @@ func (a *GoPackagesAnalyzer) Analyze(ctx context.Context, absFilename string, ve
 	analysisLogger.Debug("Final Context Preamble generated", "length", len(info.PromptPreamble))
 	analysisLogger.Debug("Final Diagnostics collected", "count", len(info.Diagnostics))
 
-	// analysisErr is set by the defer func based on info.AnalysisErrors or fatal errors
 	return info, analysisErr
 }
 
@@ -723,12 +703,99 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 	opLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "GetIdentifierInfo")
 	opLogger.Info("Starting identifier analysis")
 
-	// 1. Load package and file AST
 	fset := token.NewFileSet()
 	targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, opLogger)
 
-	// Create a temporary AstContextInfo to hold intermediate analysis results for this operation.
-	// This is populated by findEnclosingPath and findContextNodes.
+	tempInfo := &AstContextInfo{
+		FilePath:       absFilename,
+		Version:        version,
+		TargetPackage:  targetPkg,
+		TargetFileSet:  fset,
+		TargetAstFile:  targetFileAST,
+		AnalysisErrors: make([]error, 0),
+		Diagnostics:    loadDiagnostics[:],
+	}
+
+	if targetPkg == nil {
+		combinedErr := errors.Join(loadErrors...)
+		opLogger.Error("Critical error loading package, cannot get identifier info", "error", combinedErr)
+		return nil, fmt.Errorf("critical package load error: %w", combinedErr)
+	}
+	if targetFile == nil || targetFileAST == nil {
+		errText := "target file AST or token.File is nil after loading"
+		opLogger.Error(errText, "targetFile_nil", targetFile == nil, "targetAST_nil", targetFileAST == nil)
+		return nil, errors.Join(append(loadErrors, errors.New(errText))...)
+	}
+	if targetPkg.TypesInfo == nil {
+		opLogger.Warn("Type info (TypesInfo) is nil for the package. Identifier resolution will likely fail or be incomplete.")
+		addAnalysisError(tempInfo, errors.New("package type information (TypesInfo) is missing"), opLogger)
+	}
+
+	cursorPos, posErr := calculateCursorPos(targetFile, line, col, opLogger)
+	if posErr != nil {
+		return nil, fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
+	}
+	if !cursorPos.IsValid() {
+		return nil, fmt.Errorf("%w: invalid cursor position calculated (Pos: %d)", ErrPositionConversion, cursorPos)
+	}
+	tempInfo.CursorPos = cursorPos
+	opLogger = opLogger.With("cursorPos", cursorPos, "cursorPosStr", fset.PositionFor(cursorPos, true).String())
+
+	path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
+	if pathErr != nil {
+		opLogger.Warn("Error finding enclosing AST path", "error", pathErr)
+		addAnalysisError(tempInfo, fmt.Errorf("finding enclosing AST path failed: %w", pathErr), opLogger)
+	}
+	findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger)
+
+	analysisProcessError := errors.Join(tempInfo.AnalysisErrors...)
+	if analysisProcessError != nil {
+		opLogger.Warn("Non-fatal errors occurred during identifier analysis steps", "errors", analysisProcessError)
+		analysisProcessError = fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisProcessError)
+	}
+
+	if tempInfo.IdentifierAtCursor == nil || tempInfo.IdentifierObject == nil {
+		opLogger.Debug("No specific identifier object found at cursor position.")
+		return nil, analysisProcessError
+	}
+
+	fileContent, readErr := os.ReadFile(absFilename)
+	if readErr != nil {
+		opLogger.Error("Failed to read file content for identifier info construction", "error", readErr)
+		finalErr := errors.Join(analysisProcessError, fmt.Errorf("failed to read file content %s: %w", absFilename, readErr))
+		return nil, finalErr
+	}
+
+	identInfo := &IdentifierInfo{
+		Name:      tempInfo.IdentifierObject.Name(),
+		Object:    tempInfo.IdentifierObject,
+		Type:      tempInfo.IdentifierType,
+		DefNode:   tempInfo.IdentifierDefNode,
+		FileSet:   fset,
+		Pkg:       targetPkg,
+		Content:   fileContent,
+		IdentNode: tempInfo.IdentifierAtCursor,
+	}
+
+	if defPos := identInfo.Object.Pos(); defPos.IsValid() {
+		identInfo.DefFilePos = fset.Position(defPos)
+	}
+
+	opLogger.Info("Identifier info retrieved successfully", "identifier", identInfo.Name)
+	return identInfo, analysisProcessError
+}
+
+// GetEnclosingContext implements the Analyzer interface method.
+// It retrieves information about the function, method, or block enclosing the cursor.
+func (a *GoPackagesAnalyzer) GetEnclosingContext(ctx context.Context, absFilename string, version int, line, col int) (*EnclosingContextInfo, error) {
+	opLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "GetEnclosingContext")
+	opLogger.Debug("Starting enclosing context analysis")
+
+	// 1. Load necessary package and AST data
+	fset := token.NewFileSet()
+	targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, opLogger)
+
+	// Initialize a temporary AstContextInfo to hold data for this operation
 	tempInfo := &AstContextInfo{
 		FilePath:       absFilename,
 		Version:        version,
@@ -739,114 +806,7 @@ func (a *GoPackagesAnalyzer) GetIdentifierInfo(ctx context.Context, absFilename 
 		Diagnostics:    loadDiagnostics[:], // Start with diagnostics from loading
 	}
 
-	if targetPkg == nil {
-		combinedErr := errors.Join(loadErrors...)
-		opLogger.Error("Critical error loading package, cannot get identifier info", "error", combinedErr)
-		// Return nil info, and the combined loading error.
-		return nil, fmt.Errorf("critical package load error: %w", combinedErr)
-	}
-	if targetFile == nil || targetFileAST == nil {
-		errText := "target file AST or token.File is nil after loading"
-		opLogger.Error(errText, "targetFile_nil", targetFile == nil, "targetAST_nil", targetFileAST == nil)
-		// Combine with existing load errors if any.
-		return nil, errors.Join(append(loadErrors, errors.New(errText))...)
-	}
-	if targetPkg.TypesInfo == nil {
-		// This is a significant issue for identifier resolution.
-		opLogger.Warn("Type info (TypesInfo) is nil for the package. Identifier resolution will likely fail or be incomplete.")
-		// Add to tempInfo's errors, it will be wrapped later if it's the only error.
-		addAnalysisError(tempInfo, errors.New("package type information (TypesInfo) is missing"), opLogger)
-	}
-
-	// 2. Calculate cursor position
-	cursorPos, posErr := calculateCursorPos(targetFile, line, col, opLogger)
-	if posErr != nil {
-		// This is a fatal error for this operation.
-		return nil, fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
-	}
-	if !cursorPos.IsValid() {
-		// Should be caught by calculateCursorPos, but double-check.
-		return nil, fmt.Errorf("%w: invalid cursor position calculated (Pos: %d)", ErrPositionConversion, cursorPos)
-	}
-	tempInfo.CursorPos = cursorPos // Store valid cursor position in tempInfo
-	opLogger = opLogger.With("cursorPos", cursorPos, "cursorPosStr", fset.PositionFor(cursorPos, true).String())
-
-	// 3. Find enclosing AST path and specific context nodes (identifier, its type, definition)
-	// findEnclosingPath and findContextNodes will populate fields in tempInfo.
-	path, pathErr := findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
-	if pathErr != nil {
-		// Add to non-fatal errors, as findContextNodes might still yield some results or partial info.
-		opLogger.Warn("Error finding enclosing AST path", "error", pathErr)
-		addAnalysisError(tempInfo, fmt.Errorf("finding enclosing AST path failed: %w", pathErr), opLogger)
-	}
-	// findContextNodes populates tempInfo.IdentifierAtCursor, tempInfo.IdentifierObject,
-	// tempInfo.IdentifierType, and calls findDefiningNode (which populates tempInfo.IdentifierDefNode).
-	findContextNodes(ctx, path, cursorPos, targetPkg, fset, a, tempInfo, opLogger)
-
-	// Combine all non-fatal errors collected so far (from loading, path finding, context node finding).
-	analysisProcessError := errors.Join(tempInfo.AnalysisErrors...)
-	if analysisProcessError != nil {
-		opLogger.Warn("Non-fatal errors occurred during identifier analysis steps", "errors", analysisProcessError)
-		// Wrap these non-fatal errors in ErrAnalysisFailed to signal partial success or warnings.
-		analysisProcessError = fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisProcessError)
-	}
-
-	// 4. Construct IdentifierInfo if an identifier was found
-	if tempInfo.IdentifierAtCursor == nil || tempInfo.IdentifierObject == nil {
-		opLogger.Debug("No specific identifier object found at cursor position.")
-		// Return nil info, but include any non-fatal analysis errors encountered.
-		return nil, analysisProcessError
-	}
-
-	// Read file content for accurate range conversion for hover/definition, if needed by consumers.
-	fileContent, readErr := os.ReadFile(absFilename)
-	if readErr != nil {
-		opLogger.Error("Failed to read file content for identifier info construction", "error", readErr)
-		// This is a more significant issue if content is needed for range conversion.
-		// Combine with existing analysis errors.
-		finalErr := errors.Join(analysisProcessError, fmt.Errorf("failed to read file content %s: %w", absFilename, readErr))
-		return nil, finalErr
-	}
-
-	identInfo := &IdentifierInfo{
-		Name:      tempInfo.IdentifierObject.Name(),
-		Object:    tempInfo.IdentifierObject,
-		Type:      tempInfo.IdentifierType,
-		DefNode:   tempInfo.IdentifierDefNode,
-		FileSet:   fset, // Provide the FileSet for interpreting positions
-		Pkg:       targetPkg,
-		Content:   fileContent,                 // Provide content for range conversions
-		IdentNode: tempInfo.IdentifierAtCursor, // The *ast.Ident node itself
-	}
-
-	// Populate definition file position if available
-	if defPos := identInfo.Object.Pos(); defPos.IsValid() {
-		identInfo.DefFilePos = fset.Position(defPos) // Get token.Position
-	}
-
-	opLogger.Info("Identifier info retrieved successfully", "identifier", identInfo.Name)
-	// Return the populated IdentifierInfo and any non-fatal analysis errors.
-	return identInfo, analysisProcessError
-}
-
-// GetEnclosingContext implements the Analyzer interface method.
-func (a *GoPackagesAnalyzer) GetEnclosingContext(ctx context.Context, absFilename string, version int, line, col int) (*EnclosingContextInfo, error) {
-	opLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "GetEnclosingContext")
-	opLogger.Debug("Starting enclosing context analysis")
-
-	fset := token.NewFileSet()
-	targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, opLogger)
-
-	tempInfo := &AstContextInfo{
-		FilePath:       absFilename,
-		Version:        version,
-		TargetPackage:  targetPkg,
-		TargetFileSet:  fset,
-		TargetAstFile:  targetFileAST,
-		AnalysisErrors: make([]error, 0),
-		Diagnostics:    loadDiagnostics[:],
-	}
-
+	// Handle critical loading errors
 	if targetPkg == nil {
 		return nil, fmt.Errorf("critical package load error: %w", errors.Join(loadErrors...))
 	}
@@ -854,57 +814,88 @@ func (a *GoPackagesAnalyzer) GetEnclosingContext(ctx context.Context, absFilenam
 		return nil, errors.Join(append(loadErrors, errors.New("target file AST or token.File is nil"))...)
 	}
 
+	// 2. Calculate cursor position
 	cursorPos, posErr := calculateCursorPos(targetFile, line, col, opLogger)
 	if posErr != nil {
 		return nil, fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
 	}
-	tempInfo.CursorPos = cursorPos
+	tempInfo.CursorPos = cursorPos // Store valid cursor position
 
-	// Use memory cache for path finding
-	cacheKey := generateCacheKey("astPath", tempInfo)
-	computePathFn := func() ([]ast.Node, error) {
-		// Pass tempInfo to findEnclosingPath so it can add errors if any occur.
-		return findEnclosingPath(ctx, targetFileAST, cursorPos, tempInfo, opLogger)
+	// 3. Find AST path and gather context using a cached computation
+	// The computePathFn will find the AST path.
+	// gatherScopeContext (called after path finding) populates EnclosingFunc, EnclosingFuncNode, etc., in tempInfo.
+	cacheKey := generateCacheKey("enclosingContext", tempInfo) // Use a specific key for this operation
+	computeEnclosingContextFn := func() (*EnclosingContextInfo, error) {
+		// This function will be wrapped by withMemoryCache.
+		// It needs to perform path finding and then call gatherScopeContext.
+
+		// Create a computation-local AstContextInfo to avoid side effects if outer tempInfo is used elsewhere.
+		// Or, ensure that tempInfo passed to gatherScopeContext is correctly scoped.
+		// For this specific getter, we are interested in fields populated by gatherScopeContext.
+		localTempInfo := &AstContextInfo{ // Create a fresh one for the computation if needed, or pass/reset parts of outer tempInfo
+			FilePath:       tempInfo.FilePath,
+			Version:        tempInfo.Version,
+			CursorPos:      tempInfo.CursorPos,
+			TargetPackage:  tempInfo.TargetPackage,
+			TargetFileSet:  tempInfo.TargetFileSet,
+			TargetAstFile:  tempInfo.TargetAstFile,
+			AnalysisErrors: make([]error, 0),
+		}
+
+		path, pathErr := findEnclosingPath(ctx, localTempInfo.TargetAstFile, localTempInfo.CursorPos, localTempInfo, opLogger)
+		if pathErr != nil {
+			// Add to localTempInfo's errors, which will be part of the returned error from computeFn
+			addAnalysisError(localTempInfo, fmt.Errorf("finding enclosing AST path failed: %w", pathErr), opLogger)
+		}
+
+		// gatherScopeContext populates EnclosingFunc, EnclosingFuncNode, ReceiverType, EnclosingBlock
+		// on the localTempInfo struct.
+		gatherScopeContext(ctx, path, localTempInfo.TargetPackage, localTempInfo.TargetFileSet, localTempInfo, opLogger)
+
+		// Construct the EnclosingContextInfo from the populated localTempInfo
+		result := &EnclosingContextInfo{
+			Func:     localTempInfo.EnclosingFunc,
+			FuncNode: localTempInfo.EnclosingFuncNode,
+			Receiver: localTempInfo.ReceiverType,
+			Block:    localTempInfo.EnclosingBlock,
+		}
+
+		// Combine any errors collected during this computation
+		computationErr := errors.Join(localTempInfo.AnalysisErrors...)
+		if computationErr != nil {
+			return result, fmt.Errorf("%w: %w", ErrAnalysisFailed, computationErr)
+		}
+		return result, nil
 	}
-	path, _, pathErr := withMemoryCache[[]ast.Node](a, cacheKey, 1, a.getConfig().MemoryCacheTTL, computePathFn, opLogger)
-	if pathErr != nil {
-		// findEnclosingPath itself doesn't add to tempInfo.AnalysisErrors.
-		// The error is returned and should be handled here.
-		addAnalysisError(tempInfo, fmt.Errorf("finding enclosing AST path failed: %w", pathErr), opLogger)
+
+	// Use withMemoryCache to get/compute the EnclosingContextInfo
+	enclosingInfo, cacheHit, combinedErr := withMemoryCache[*EnclosingContextInfo](
+		a, cacheKey, 5, a.getConfig().MemoryCacheTTL, computeEnclosingContextFn, opLogger,
+	)
+
+	if cacheHit {
+		opLogger.Debug("Enclosing context cache hit")
 	}
-
-	// gatherScopeContext populates tempInfo.EnclosingFunc, tempInfo.EnclosingFuncNode,
-	// tempInfo.ReceiverType, tempInfo.EnclosingBlock.
-	// It also collects errors in tempInfo.AnalysisErrors.
-	gatherScopeContext(ctx, path, targetPkg, fset, tempInfo, opLogger)
-
-	enclosingInfo := &EnclosingContextInfo{
-		Func:     tempInfo.EnclosingFunc,
-		FuncNode: tempInfo.EnclosingFuncNode,
-		Receiver: tempInfo.ReceiverType,
-		Block:    tempInfo.EnclosingBlock,
-	}
-
-	// Combine all non-fatal errors collected.
-	analysisProcessError := errors.Join(tempInfo.AnalysisErrors...)
-	if analysisProcessError != nil {
-		opLogger.Warn("Non-fatal errors during enclosing context analysis", "errors", analysisProcessError)
-		// Return the successfully gathered info along with wrapped non-fatal errors.
-		return enclosingInfo, fmt.Errorf("%w: %w", ErrAnalysisFailed, analysisProcessError)
+	if combinedErr != nil {
+		opLogger.Warn("Non-fatal errors during enclosing context analysis", "error", combinedErr)
+		// Return the (potentially partially filled) enclosingInfo along with the error
+		return enclosingInfo, combinedErr
 	}
 
 	return enclosingInfo, nil
 }
 
 // GetScopeInfo implements the Analyzer interface method.
+// It retrieves variables, constants, types, and functions available in the scope at the cursor.
 func (a *GoPackagesAnalyzer) GetScopeInfo(ctx context.Context, absFilename string, version int, line, col int) (*ScopeInfo, error) {
 	opLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "GetScopeInfo")
 	opLogger.Debug("Starting scope analysis")
 
+	// 1. Load necessary package and AST data
 	fset := token.NewFileSet()
 	targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, opLogger)
 
-	// Initialize tempInfo for this operation.
+	// Initialize a temporary AstContextInfo for this operation
 	tempInfo := &AstContextInfo{
 		FilePath:       absFilename,
 		Version:        version,
@@ -915,70 +906,91 @@ func (a *GoPackagesAnalyzer) GetScopeInfo(ctx context.Context, absFilename strin
 		Diagnostics:    loadDiagnostics[:],
 	}
 
+	// Handle critical loading errors
 	if targetPkg == nil {
 		return nil, fmt.Errorf("critical package load error: %w", errors.Join(loadErrors...))
 	}
-	if targetFile == nil { // targetFileAST can be nil if we only have package scope
-		return nil, errors.Join(append(loadErrors, errors.New("target token.File is nil"))...)
+	// targetFile can be nil if the file has severe parsing issues but package context is somewhat available.
+	// Scope info might still be partially obtainable from package scope.
+	if targetFile == nil {
+		opLogger.Warn("Target token.File is nil; scope info will be limited to package scope if AST-based path finding fails.")
+		// Add a non-fatal error to indicate potential incompleteness
+		addAnalysisError(tempInfo, errors.New("target token.File is nil, limiting scope analysis"), opLogger)
 	}
 
-	cursorPos, posErr := calculateCursorPos(targetFile, line, col, opLogger)
-	if posErr != nil {
-		return nil, fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
+	// 2. Calculate cursor position (only if targetFile is valid)
+	var cursorPos token.Pos = token.NoPos
+	if targetFile != nil {
+		var posErr error
+		cursorPos, posErr = calculateCursorPos(targetFile, line, col, opLogger)
+		if posErr != nil {
+			// If cursor calculation fails, we might still get package scope, but not local scopes.
+			addAnalysisError(tempInfo, fmt.Errorf("cannot calculate valid cursor position, local scope analysis will be affected: %w", posErr), opLogger)
+			// Proceed with NoPos, gatherScopeContext should handle it by primarily giving package scope.
+		}
 	}
-	tempInfo.CursorPos = cursorPos // Store valid cursor pos
+	tempInfo.CursorPos = cursorPos // Store valid or NoPos cursor position
 
-	// Use memory cache for scope extraction.
-	// The computeScopeFn will handle finding path and gathering scope.
-	cacheKey := generateCacheKey("scopeInfo", tempInfo)
+	// 3. Use memory cache for scope extraction.
+	// The computeScopeFn will find the AST path (if AST and cursor are valid) and then gather scope.
+	cacheKey := generateCacheKey("scopeInfo", tempInfo) // Key includes cursor pos, so NoPos will have a different key
 	computeScopeFn := func() (map[string]types.Object, error) {
-		// Create a fresh AstContextInfo copy for this computation to avoid shared state issues
-		// if the outer tempInfo is used elsewhere or if retries occur.
-		// However, for simplicity and if computeScopeFn is not retried by withMemoryCache,
-		// directly modifying a local copy or a sub-part of tempInfo might be okay.
-		// For now, let's use a local map and collect errors separately.
-		localScopeMap := make(map[string]types.Object)
-		var computationErrors []error
-
-		// Create a temporary AstContextInfo specifically for this computation,
-		// ensuring it has the necessary fields like FilePath, Version, CursorPos, TargetPackage, etc.
+		// Create a computation-local AstContextInfo
 		computationTempInfo := &AstContextInfo{
 			FilePath:         tempInfo.FilePath,
 			Version:          tempInfo.Version,
-			CursorPos:        tempInfo.CursorPos,
+			CursorPos:        tempInfo.CursorPos, // Use the (potentially NoPos) cursor
 			TargetPackage:    tempInfo.TargetPackage,
 			TargetFileSet:    tempInfo.TargetFileSet,
-			TargetAstFile:    tempInfo.TargetAstFile, // Needed for findEnclosingPath
-			VariablesInScope: localScopeMap,          // Use local map here
-			AnalysisErrors:   make([]error, 0),       // Fresh error slice for this computation
+			TargetAstFile:    tempInfo.TargetAstFile,        // Can be nil
+			VariablesInScope: make(map[string]types.Object), // Fresh map for this computation
+			AnalysisErrors:   make([]error, 0),
 		}
 
-		path, pathErr := findEnclosingPath(ctx, computationTempInfo.TargetAstFile, computationTempInfo.CursorPos, computationTempInfo, opLogger)
-		if pathErr != nil {
-			addAnalysisError(computationTempInfo, fmt.Errorf("finding enclosing path failed for scope: %w", pathErr), opLogger)
+		var path []ast.Node
+		var pathErr error
+		if computationTempInfo.TargetAstFile != nil && computationTempInfo.CursorPos.IsValid() {
+			path, pathErr = findEnclosingPath(ctx, computationTempInfo.TargetAstFile, computationTempInfo.CursorPos, computationTempInfo, opLogger)
+			if pathErr != nil {
+				addAnalysisError(computationTempInfo, fmt.Errorf("finding enclosing path failed for scope: %w", pathErr), opLogger)
+			}
+		} else if computationTempInfo.TargetAstFile == nil {
+			addAnalysisError(computationTempInfo, errors.New("target AST is nil, cannot find path for local scope analysis"), opLogger)
+		} else { // CursorPos is invalid
+			addAnalysisError(computationTempInfo, errors.New("cursor position invalid, cannot find path for local scope analysis"), opLogger)
 		}
 
+		// gatherScopeContext populates computationTempInfo.VariablesInScope
+		// It handles nil path or invalid cursorPos by primarily adding package scope.
 		gatherScopeContext(ctx, path, computationTempInfo.TargetPackage, computationTempInfo.TargetFileSet, computationTempInfo, opLogger)
 
-		// Collect errors from the computation's tempInfo
-		computationErrors = append(computationErrors, computationTempInfo.AnalysisErrors...)
-
-		if len(computationErrors) > 0 {
-			return localScopeMap, fmt.Errorf("errors during scope computation: %w", errors.Join(computationErrors...))
+		computationErr := errors.Join(computationTempInfo.AnalysisErrors...)
+		if computationErr != nil {
+			// Return the map (even if partially filled) and the error
+			return computationTempInfo.VariablesInScope, fmt.Errorf("errors during scope computation: %w", computationErr)
 		}
-		return localScopeMap, nil
+		return computationTempInfo.VariablesInScope, nil
 	}
 
-	scopeMap, cacheHit, scopeErr := withMemoryCache[map[string]types.Object](a, cacheKey, 10, a.getConfig().MemoryCacheTTL, computeScopeFn, opLogger)
-	if scopeErr != nil {
-		opLogger.Warn("Non-fatal errors during scope extraction", "error", scopeErr)
-		// Return the (potentially partially filled) scopeMap along with wrapped non-fatal errors.
-		return &ScopeInfo{Variables: scopeMap}, fmt.Errorf("%w: %w", ErrAnalysisFailed, scopeErr)
-	}
+	scopeMap, cacheHit, combinedErr := withMemoryCache[map[string]types.Object](
+		a, cacheKey, 10, a.getConfig().MemoryCacheTTL, computeScopeFn, opLogger,
+	)
+
 	if cacheHit {
 		opLogger.Debug("Scope info cache hit")
 	}
 
+	// Combine errors from loading/cursor calculation (in tempInfo) with errors from computation (in combinedErr)
+	finalAnalysisErrors := tempInfo.AnalysisErrors
+	if combinedErr != nil {
+		finalAnalysisErrors = append(finalAnalysisErrors, combinedErr)
+		opLogger.Warn("Non-fatal errors during scope extraction", "error", combinedErr)
+	}
+
+	finalCombinedErr := errors.Join(finalAnalysisErrors...)
+	if finalCombinedErr != nil {
+		return &ScopeInfo{Variables: scopeMap}, fmt.Errorf("%w: %w", ErrAnalysisFailed, finalCombinedErr)
+	}
 	return &ScopeInfo{Variables: scopeMap}, nil
 }
 
@@ -990,20 +1002,17 @@ func (a *GoPackagesAnalyzer) GetRelevantComments(ctx context.Context, absFilenam
 	fset := token.NewFileSet()
 	targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, opLogger)
 
-	// Initialize tempInfo for this operation.
 	tempInfo := &AstContextInfo{
 		FilePath:       absFilename,
 		Version:        version,
-		TargetPackage:  targetPkg, // Can be nil if load failed
+		TargetPackage:  targetPkg,
 		TargetFileSet:  fset,
 		TargetAstFile:  targetFileAST,
 		AnalysisErrors: make([]error, 0),
 		Diagnostics:    loadDiagnostics[:],
 	}
 
-	// Critical check: targetFileAST and targetFile are essential for comment analysis.
 	if targetFileAST == nil || targetFile == nil {
-		// Combine with existing load errors if any.
 		return nil, errors.Join(append(loadErrors, errors.New("target file AST or token.File is nil, cannot get comments"))...)
 	}
 
@@ -1011,21 +1020,19 @@ func (a *GoPackagesAnalyzer) GetRelevantComments(ctx context.Context, absFilenam
 	if posErr != nil {
 		return nil, fmt.Errorf("cannot calculate valid cursor position: %w", posErr)
 	}
-	tempInfo.CursorPos = cursorPos // Store valid cursor pos
+	tempInfo.CursorPos = cursorPos
 
 	cacheKey := generateCacheKey("comments", tempInfo)
 	computeCommentsFn := func() ([]string, error) {
-		// Similar to GetScopeInfo, use a computation-local AstContextInfo
-		// to manage errors and results for this specific cached operation.
 		computationTempInfo := &AstContextInfo{
 			FilePath:           tempInfo.FilePath,
 			Version:            tempInfo.Version,
 			CursorPos:          tempInfo.CursorPos,
-			TargetPackage:      tempInfo.TargetPackage, // Pass along for context, though not directly used by findRelevantComments
+			TargetPackage:      tempInfo.TargetPackage,
 			TargetFileSet:      tempInfo.TargetFileSet,
 			TargetAstFile:      tempInfo.TargetAstFile,
-			CommentsNearCursor: nil,              // Initialize for population
-			AnalysisErrors:     make([]error, 0), // Fresh error slice
+			CommentsNearCursor: nil,
+			AnalysisErrors:     make([]error, 0),
 		}
 
 		path, pathErr := findEnclosingPath(ctx, computationTempInfo.TargetAstFile, computationTempInfo.CursorPos, computationTempInfo, opLogger)
@@ -1035,22 +1042,28 @@ func (a *GoPackagesAnalyzer) GetRelevantComments(ctx context.Context, absFilenam
 
 		findRelevantComments(ctx, computationTempInfo.TargetAstFile, path, computationTempInfo.CursorPos, computationTempInfo.TargetFileSet, computationTempInfo, opLogger)
 
-		if len(computationTempInfo.AnalysisErrors) > 0 {
-			return computationTempInfo.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", errors.Join(computationTempInfo.AnalysisErrors...))
+		computationErr := errors.Join(computationTempInfo.AnalysisErrors...)
+		if computationErr != nil {
+			return computationTempInfo.CommentsNearCursor, fmt.Errorf("errors during comment computation: %w", computationErr)
 		}
 		return computationTempInfo.CommentsNearCursor, nil
 	}
 
 	comments, cacheHit, commentErr := withMemoryCache[[]string](a, cacheKey, 5, a.getConfig().MemoryCacheTTL, computeCommentsFn, opLogger)
+
+	finalAnalysisErrors := tempInfo.AnalysisErrors // Start with errors from loading/cursor calc
 	if commentErr != nil {
+		finalAnalysisErrors = append(finalAnalysisErrors, commentErr)
 		opLogger.Warn("Non-fatal errors during comment extraction", "error", commentErr)
-		// Return potentially partial comments along with wrapped non-fatal errors.
-		return comments, fmt.Errorf("%w: %w", ErrAnalysisFailed, commentErr)
 	}
 	if cacheHit {
 		opLogger.Debug("Relevant comments cache hit")
 	}
 
+	finalCombinedErr := errors.Join(finalAnalysisErrors...)
+	if finalCombinedErr != nil {
+		return comments, fmt.Errorf("%w: %w", ErrAnalysisFailed, finalCombinedErr)
+	}
 	return comments, nil
 }
 
@@ -1060,13 +1073,11 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 	opLogger := a.logger.With("absFile", absFilename, "version", version, "line", line, "col", col, "op", "GetPromptPreamble")
 	opLogger.Debug("Starting preamble generation")
 
-	// --- Attempt to get preamble from bbolt cache first ---
-	// This part remains as bbolt caching is for the final preamble string.
 	dir := filepath.Dir(absFilename)
 	goModHash := calculateGoModHash(dir, opLogger)
-	bboltCacheKey := []byte(dir + "::" + goModHash) // Use a distinct name for bbolt key
+	bboltCacheKey := []byte(dir + "::" + goModHash)
 	var cachedPreamble string
-	var preambleConstructionErrors []error // Collect non-fatal errors during construction
+	var preambleConstructionErrors []error
 
 	if a.db != nil {
 		dbViewErr := a.db.View(func(tx *bbolt.Tx) error {
@@ -1086,8 +1097,7 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 				opLogger.Warn("Bbolt cache data has old schema version. Ignoring.", "key", string(bboltCacheKey))
 				return nil
 			}
-			// Validate hashes before using cached preamble
-			currentHashes, hashErr := calculateInputHashes(dir, nil, opLogger) // Pkg not available yet for hash calc
+			currentHashes, hashErr := calculateInputHashes(dir, nil, opLogger)
 			if hashErr == nil && decoded.GoModHash == goModHash && compareFileHashes(currentHashes, decoded.InputFileHashes, opLogger) {
 				var analysisData CachedAnalysisData
 				if decodeErr := gob.NewDecoder(bytes.NewReader(decoded.AnalysisGob)).Decode(&analysisData); decodeErr == nil {
@@ -1110,7 +1120,6 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 	}
 
 	if cachedPreamble != "" {
-		// If errors occurred during bbolt check but preamble was found, return preamble with error
 		if len(preambleConstructionErrors) > 0 {
 			return cachedPreamble, fmt.Errorf("%w: %w", ErrAnalysisFailed, errors.Join(preambleConstructionErrors...))
 		}
@@ -1118,96 +1127,81 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 	}
 	opLogger.Debug("Preamble not found in bbolt cache or cache invalid, generating...")
 
-	// --- Load base package and file info ---
 	fset := token.NewFileSet()
 	targetPkg, targetFileAST, targetFile, loadDiagnostics, loadErrors := a.loadPackageForAnalysis(ctx, absFilename, fset, opLogger)
-	preambleConstructionErrors = append(preambleConstructionErrors, loadErrors...) // Add loading errors
+	preambleConstructionErrors = append(preambleConstructionErrors, loadErrors...)
 
-	// Critical check: If package loading fails badly, we can't proceed.
 	if targetPkg == nil {
 		return "", fmt.Errorf("critical package load error for preamble: %w", errors.Join(preambleConstructionErrors...))
 	}
-	// targetFileAST and targetFile might be nil if the file itself has severe parsing issues
-	// but the package context might still be somewhat loadable. Handle this gracefully.
 
 	var cursorPos token.Pos = token.NoPos
-	if targetFile != nil { // Only calculate cursor if targetFile is valid
+	if targetFile != nil {
 		var posErr error
 		cursorPos, posErr = calculateCursorPos(targetFile, line, col, opLogger)
 		if posErr != nil {
-			// This is a significant error for preamble context.
 			preambleConstructionErrors = append(preambleConstructionErrors, fmt.Errorf("cannot calculate valid cursor position for preamble: %w", posErr))
-			// Proceed with what we have, but preamble will be less accurate.
 		}
 	} else {
-		preambleConstructionErrors = append(preambleConstructionErrors, errors.New("target token.File is nil, cursor-specific context will be limited"))
+		preambleConstructionErrors = append(preambleConstructionErrors, errors.New("target token.File is nil, cursor-specific context will be limited for preamble"))
 	}
 
-	// --- Create AstContextInfo shell for this operation ---
-	// This info struct will be populated by various Get* methods or their internal helpers.
-	// It's also used by formatCursorContextSection.
 	tempInfo := &AstContextInfo{
 		FilePath:       absFilename,
 		Version:        version,
-		CursorPos:      cursorPos, // May be NoPos if targetFile was nil or calc failed
+		CursorPos:      cursorPos,
 		TargetPackage:  targetPkg,
 		TargetFileSet:  fset,
-		TargetAstFile:  targetFileAST, // May be nil
-		AnalysisErrors: make([]error, 0),
+		TargetAstFile:  targetFileAST,
+		AnalysisErrors: make([]error, 0), // Collect errors specifically from preamble construction steps
 		Diagnostics:    loadDiagnostics[:],
-		PackageName:    targetPkg.Name, // Populate package name
+		PackageName:    targetPkg.Name,
 	}
+	// Add initial load errors to tempInfo's errors as well, so they are part of the context for preamble formatters
+	tempInfo.AnalysisErrors = append(tempInfo.AnalysisErrors, loadErrors...)
 
-	// --- Gather context using specific Get* methods ---
 	enclosingCtx, encErr := a.GetEnclosingContext(ctx, absFilename, version, line, col)
 	if encErr != nil {
-		preambleConstructionErrors = append(preambleConstructionErrors, fmt.Errorf("enclosing context error: %w", encErr))
+		addAnalysisError(tempInfo, fmt.Errorf("preamble: enclosing context error: %w", encErr), opLogger)
 	}
 	scopeInfo, scopeErr := a.GetScopeInfo(ctx, absFilename, version, line, col)
 	if scopeErr != nil {
-		preambleConstructionErrors = append(preambleConstructionErrors, fmt.Errorf("scope info error: %w", scopeErr))
+		addAnalysisError(tempInfo, fmt.Errorf("preamble: scope info error: %w", scopeErr), opLogger)
 	}
 	comments, commentErr := a.GetRelevantComments(ctx, absFilename, version, line, col)
 	if commentErr != nil {
-		preambleConstructionErrors = append(preambleConstructionErrors, fmt.Errorf("comments error: %w", commentErr))
+		addAnalysisError(tempInfo, fmt.Errorf("preamble: comments error: %w", commentErr), opLogger)
 	}
 
-	// --- Populate cursor-specific context nodes in tempInfo for formatCursorContextSection ---
-	// This requires path finding and node identification.
 	if tempInfo.TargetAstFile != nil && tempInfo.CursorPos.IsValid() {
 		path, pathErr := findEnclosingPath(ctx, tempInfo.TargetAstFile, tempInfo.CursorPos, tempInfo, opLogger)
 		if pathErr != nil {
-			addAnalysisError(tempInfo, fmt.Errorf("finding path for cursor context failed: %w", pathErr), opLogger)
+			addAnalysisError(tempInfo, fmt.Errorf("preamble: finding path for cursor context failed: %w", pathErr), opLogger)
 		}
-		// findContextNodes populates tempInfo with CallExpr, SelectorExpr, CompositeLit, etc.
 		findContextNodes(ctx, path, tempInfo.CursorPos, tempInfo.TargetPackage, tempInfo.TargetFileSet, a, tempInfo, opLogger)
-		preambleConstructionErrors = append(preambleConstructionErrors, tempInfo.AnalysisErrors...) // Add errors from findContextNodes
 	} else if tempInfo.TargetAstFile == nil {
-		preambleConstructionErrors = append(preambleConstructionErrors, errors.New("target AST is nil, cannot determine specific cursor context nodes"))
+		addAnalysisError(tempInfo, errors.New("preamble: target AST is nil, cannot determine specific cursor context nodes"), opLogger)
 	} else if !tempInfo.CursorPos.IsValid() {
-		preambleConstructionErrors = append(preambleConstructionErrors, errors.New("cursor position invalid, cannot determine specific cursor context nodes"))
+		addAnalysisError(tempInfo, errors.New("preamble: cursor position invalid, cannot determine specific cursor context nodes"), opLogger)
 	}
+	// Errors from findContextNodes are added to tempInfo.AnalysisErrors directly.
 
-	// --- Determine Qualifier ---
 	var qualifier types.Qualifier
 	if targetPkg != nil && targetPkg.Types != nil {
 		qualifier = types.RelativeTo(targetPkg.Types)
 	} else {
-		// Fallback qualifier if package type info is unavailable
 		qualifier = func(other *types.Package) string {
 			if other != nil {
-				return other.Path() // Or other.Name()
+				return other.Path()
 			}
 			return ""
 		}
 	}
 
-	// --- Build the Preamble String ---
 	var preambleBuilder strings.Builder
-	const internalPreambleLimit = 8192 // Max size for the constructed preamble parts
+	const internalPreambleLimit = 8192
 	currentLen := 0
 	limitReached := false
-
 	addToPreamble := func(s string) bool {
 		if limitReached {
 			return false
@@ -1224,27 +1218,23 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 	addTruncMarker := func(section string) {
 		if limitReached {
 			return
-		} // Only add marker if limit wasn't already hit
+		}
 		msg := fmt.Sprintf("// ... (%s truncated)\n", section)
-		// Check if adding marker itself exceeds limit
 		if currentLen+len(msg) < internalPreambleLimit {
 			preambleBuilder.WriteString(msg)
 			currentLen += len(msg)
 		}
-		limitReached = true // Mark limit reached even if marker couldn't be added
+		limitReached = true
 	}
 
-	// Add basic file/package info
 	pkgName := tempInfo.PackageName
 	if pkgName == "" {
 		pkgName = "[unknown]"
 	}
 	addToPreamble(fmt.Sprintf("// Context: File: %s, Package: %s\n", filepath.Base(absFilename), pkgName))
 
-	// Add Imports (still relies on tempInfo.TargetAstFile.Imports for now)
-	// TODO: Potentially get imports from targetPkg.Imports if more robust
 	if tempInfo.TargetAstFile != nil && !limitReached {
-		tempInfo.Imports = tempInfo.TargetAstFile.Imports // Ensure tempInfo has imports if AST is available
+		tempInfo.Imports = tempInfo.TargetAstFile.Imports
 		formatImportsSection(&preambleBuilder, tempInfo, addToPreamble, addTruncMarker, opLogger)
 	}
 
@@ -1254,7 +1244,6 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 	if !limitReached {
 		formatCommentsSection(&preambleBuilder, comments, addToPreamble, addTruncMarker, opLogger)
 	}
-	// Pass the tempInfo containing cursor context nodes (CallExpr, SelectorExpr etc.)
 	if !limitReached {
 		formatCursorContextSection(&preambleBuilder, tempInfo, qualifier, addToPreamble, opLogger)
 	}
@@ -1264,27 +1253,24 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 
 	generatedPreamble := preambleBuilder.String()
 	if generatedPreamble == "" {
-		opLogger.Warn("Preamble generation resulted in empty string despite efforts.")
-		// Potentially add a minimal fallback if everything failed.
-		if len(preambleConstructionErrors) > 0 {
+		opLogger.Warn("Preamble generation resulted in empty string.")
+		if len(tempInfo.AnalysisErrors) > 0 || len(preambleConstructionErrors) > 0 {
 			generatedPreamble = "// Warning: Preamble generation encountered errors and resulted in empty output.\n"
 		}
 	}
 
-	// --- Save to bbolt cache if generated successfully ---
-	if generatedPreamble != "" && a.db != nil && len(loadErrors) == 0 { // Only save if no critical load errors
+	// Add all errors collected in tempInfo during preamble specific steps to the main list
+	preambleConstructionErrors = append(preambleConstructionErrors, tempInfo.AnalysisErrors...)
+
+	if generatedPreamble != "" && a.db != nil && len(loadErrors) == 0 {
 		saveStart := time.Now()
-		// Recalculate inputHashes with targetPkg if available now
 		inputHashes, hashErr := calculateInputHashes(dir, targetPkg, opLogger)
 		if hashErr == nil {
 			analysisDataToCache := CachedAnalysisData{PackageName: pkgName, PromptPreamble: generatedPreamble}
 			var gobBuf bytes.Buffer
 			if encodeErr := gob.NewEncoder(&gobBuf).Encode(&analysisDataToCache); encodeErr == nil {
 				entryToSave := CachedAnalysisEntry{
-					SchemaVersion:   cacheSchemaVersion,
-					GoModHash:       goModHash,
-					InputFileHashes: inputHashes,
-					AnalysisGob:     gobBuf.Bytes(),
+					SchemaVersion: cacheSchemaVersion, GoModHash: goModHash, InputFileHashes: inputHashes, AnalysisGob: gobBuf.Bytes(),
 				}
 				var entryBuf bytes.Buffer
 				if entryEncodeErr := gob.NewEncoder(&entryBuf).Encode(&entryToSave); entryEncodeErr == nil {
@@ -1311,7 +1297,6 @@ func (a *GoPackagesAnalyzer) GetPromptPreamble(ctx context.Context, absFilename 
 		}
 	}
 
-	// Combine all non-fatal errors from construction.
 	finalErr := errors.Join(preambleConstructionErrors...)
 	if finalErr != nil {
 		return generatedPreamble, fmt.Errorf("%w: %w", ErrAnalysisFailed, finalErr)
@@ -1350,14 +1335,12 @@ func (a *GoPackagesAnalyzer) SetMemoryCache(key string, value any, cost int64, t
 	if set {
 		a.logger.Debug("SetMemoryCache success.", "key", key, "cost", cost, "ttl", ttl)
 	} else {
-		// This can happen if item is too large vs. MaxCost or other Ristretto constraints.
 		a.logger.Warn("SetMemoryCache failed (item might be too large or other constraint).", "key", key, "cost", cost, "ttl", ttl)
 	}
 	return set
 }
 
 // InvalidateCache removes the bbolt cached entry for a given directory.
-// It specifically targets the cache key format used by GetPromptPreamble's bbolt caching.
 func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 	logger := a.logger.With("dir", dir, "op", "InvalidateCache")
 	a.mu.RLock()
@@ -1368,7 +1351,6 @@ func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 		logger.Debug("Bbolt cache invalidation skipped: DB is nil.")
 		return nil
 	}
-	// Reconstruct the bbolt cache key as used in GetPromptPreamble
 	goModHash := calculateGoModHash(dir, logger)
 	bboltCacheKey := []byte(dir + "::" + goModHash)
 
@@ -1377,10 +1359,9 @@ func (a *GoPackagesAnalyzer) InvalidateCache(dir string) error {
 }
 
 // InvalidateMemoryCacheForURI clears relevant entries from the ristretto memory cache.
-// Currently, it clears the entire memory cache due to complexity of tracking dependencies.
 func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int) error {
 	logger := a.logger.With("uri", uri, "version", version, "op", "InvalidateMemoryCacheForURI")
-	a.mu.Lock() // Use write lock to safely access and clear cache
+	a.mu.Lock()
 	memCache := a.memoryCache
 	a.mu.Unlock()
 
@@ -1388,10 +1369,8 @@ func (a *GoPackagesAnalyzer) InvalidateMemoryCacheForURI(uri string, version int
 		logger.Debug("Memory cache invalidation skipped: Cache is nil.")
 		return nil
 	}
-	// TODO: Implement more granular invalidation if feasible.
-	// For now, clearing the entire cache is a safe approach upon document change.
 	logger.Warn("Clearing entire Ristretto memory cache due to document change.", "uri", uri)
-	memCache.Clear() // Clears all items from the cache
+	memCache.Clear()
 	return nil
 }
 
@@ -1409,7 +1388,7 @@ func (a *GoPackagesAnalyzer) GetMemoryCacheMetrics() *ristretto.Metrics {
 	if a.memoryCache != nil {
 		return a.memoryCache.Metrics
 	}
-	return nil // Return nil if cache is not enabled
+	return nil
 }
 
 // --- Default Prompt Formatter ---
@@ -1428,38 +1407,31 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 	var finalPreamble strings.Builder
 	maxPreambleLen := config.MaxPreambleLen
 	maxSnippetLen := config.MaxSnippetLen
-	maxFIMPartLen := maxSnippetLen / 2 // Split snippet length for FIM prefix/suffix
+	maxFIMPartLen := maxSnippetLen / 2
 
-	// --- Add Fallback Context if present (e.g., from non-AST analysis) ---
 	if snippetCtx.FallbackContext != "" {
 		truncatedFallback := snippetCtx.FallbackContext
-		// Truncate fallback context if it exceeds maxPreambleLen
 		if len(truncatedFallback) > maxPreambleLen {
 			logger.Warn("Truncating fallback context", "original_length", len(truncatedFallback), "max_length", maxPreambleLen)
 			marker := "// ... (Fallback context truncated)\n"
-			// Truncate from the beginning to keep the most recent part
 			startByte := len(truncatedFallback) - maxPreambleLen + len(marker)
 			if startByte < 0 {
-				startByte = 0 // Ensure startByte is not negative
+				startByte = 0
 			}
-			// Ensure marker fits
 			if len(marker)+len(truncatedFallback[startByte:]) > maxPreambleLen {
-				// If marker + remaining doesn't fit, just take tail of original
 				truncatedFallback = truncatedFallback[len(truncatedFallback)-maxPreambleLen:]
 			} else {
 				truncatedFallback = marker + truncatedFallback[startByte:]
 			}
 		}
 		finalPreamble.WriteString(truncatedFallback)
-		finalPreamble.WriteString("\n---\n") // Separator between fallback and main preamble
+		finalPreamble.WriteString("\n---\n")
 	}
 
-	// --- Add Main Preamble (AST-based or default) ---
 	truncatedPreamble := contextPreamble
 	if len(truncatedPreamble) > maxPreambleLen {
 		logger.Warn("Truncating context preamble", "original_length", len(truncatedPreamble), "max_length", maxPreambleLen)
-		marker := "... (context truncated)\n" // Truncation marker
-		// Truncate from the beginning to keep the most recent part of the preamble
+		marker := "... (context truncated)\n"
 		startByte := len(truncatedPreamble) - maxPreambleLen + len(marker)
 		if startByte < 0 {
 			startByte = 0
@@ -1472,13 +1444,11 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 	}
 	finalPreamble.WriteString(truncatedPreamble)
 
-	// --- Format Snippet based on FIM ---
 	prefix := snippetCtx.Prefix
 	suffix := snippetCtx.Suffix
 
 	if config.UseFim {
 		template := config.FimTemplate
-		// Truncate FIM prefix from the beginning
 		if len(prefix) > maxFIMPartLen {
 			logger.Warn("Truncating FIM prefix", "original_length", len(prefix), "max_length", maxFIMPartLen)
 			marker := "...(prefix truncated)"
@@ -1492,7 +1462,6 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 				prefix = marker + prefix[startByte:]
 			}
 		}
-		// Truncate FIM suffix from the end
 		if len(suffix) > maxFIMPartLen {
 			logger.Warn("Truncating FIM suffix", "original_length", len(suffix), "max_length", maxFIMPartLen)
 			marker := "(suffix truncated)..."
@@ -1507,13 +1476,12 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 			}
 		}
 		return fmt.Sprintf(template, finalPreamble.String(), prefix, suffix)
-	} else { // Standard completion
+	} else {
 		template := config.PromptTemplate
-		snippet := prefix // For standard completion, only prefix is used as the snippet
+		snippet := prefix
 		if len(snippet) > maxSnippetLen {
 			logger.Warn("Truncating code snippet (prefix)", "original_length", len(snippet), "max_length", maxSnippetLen)
 			marker := "...(code truncated)\n"
-			// Truncate from the beginning
 			startByte := len(snippet) - maxSnippetLen + len(marker)
 			if startByte < 0 {
 				startByte = 0
@@ -1534,134 +1502,117 @@ func (f *templateFormatter) FormatPrompt(contextPreamble string, snippetCtx Snip
 
 // DeepCompleter orchestrates the code analysis, prompt formatting, and LLM interaction.
 type DeepCompleter struct {
-	client    LLMClient       // Interface for interacting with the LLM backend.
-	analyzer  Analyzer        // Interface for performing code analysis.
-	formatter PromptFormatter // Interface for formatting the LLM prompt.
-	config    Config          // Current active configuration
-	configMu  sync.RWMutex    // Mutex to protect concurrent access to config.
-	logger    *stdslog.Logger // Logger instance for the DeepCompleter service
+	client    LLMClient
+	analyzer  Analyzer
+	formatter PromptFormatter
+	config    Config
+	configMu  sync.RWMutex
+	logger    *stdslog.Logger
 }
 
 // NewDeepCompleter creates a new DeepCompleter service instance.
-// It loads configuration and initializes components.
 func NewDeepCompleter(logger *stdslog.Logger) (*DeepCompleter, error) {
 	if logger == nil {
 		logger = stdslog.Default()
 	}
 	serviceLogger := logger.With("service", "DeepCompleter")
 
-	// Load initial configuration
-	cfg, configErr := LoadConfig(serviceLogger) // configErr can be ErrConfig (non-fatal) or other fatal errors
+	cfg, configErr := LoadConfig(serviceLogger)
 	if configErr != nil && !errors.Is(configErr, ErrConfig) {
-		// Fatal error during initial config load (e.g., cannot determine paths, default config invalid)
 		serviceLogger.Error("Fatal error during initial config load", "error", configErr)
 		return nil, configErr
 	}
-	// Validate the loaded/defaulted config
 	if err := cfg.Validate(serviceLogger); err != nil {
 		serviceLogger.Error("Initial configuration is invalid after loading/defaults", "error", err)
-		// If validation itself returns ErrInvalidConfig, it's a structured validation failure.
-		// Otherwise, it might be an unexpected issue during validation.
 		if errors.Is(err, ErrInvalidConfig) {
 			return nil, fmt.Errorf("initial config validation failed: %w", err)
 		}
-		// Log other validation issues as warnings, but proceed if possible (Validate might fix some)
 		serviceLogger.Warn("Initial config validation reported issues", "error", err)
-		// If configErr was already ErrConfig, combine them.
 		if configErr != nil {
 			configErr = errors.Join(configErr, err)
 		} else {
-			configErr = err // Assign the validation error
+			configErr = err
 		}
 	}
 
-	// Initialize analyzer with the (potentially fixed by Validate) config
 	analyzer := NewGoPackagesAnalyzer(serviceLogger, cfg)
 	dc := &DeepCompleter{
 		client:    newHttpOllamaClient(),
 		analyzer:  analyzer,
 		formatter: newTemplateFormatter(),
-		config:    cfg, // Store the initial, validated config
+		config:    cfg,
 		logger:    serviceLogger,
 	}
 
-	// Return the DeepCompleter instance and any non-fatal ErrConfig from LoadConfig/Validate
 	if configErr != nil && errors.Is(configErr, ErrConfig) {
 		return dc, configErr
 	}
-	return dc, nil // No fatal error, and no ErrConfig, or ErrConfig was handled.
+	return dc, nil
 }
 
 // NewDeepCompleterWithConfig creates a new DeepCompleter service with a specific config.
-// This is useful for testing or specific programmatic setups.
 func NewDeepCompleterWithConfig(config Config, logger *stdslog.Logger) (*DeepCompleter, error) {
 	if logger == nil {
 		logger = stdslog.Default()
 	}
 	serviceLogger := logger.With("service", "DeepCompleter")
 
-	// Ensure default templates are set if not provided
 	if config.PromptTemplate == "" {
 		config.PromptTemplate = promptTemplate
 	}
 	if config.FimTemplate == "" {
 		config.FimTemplate = fimPromptTemplate
 	}
-	// Validate the provided config
 	if err := config.Validate(serviceLogger); err != nil {
 		return nil, fmt.Errorf("provided config validation failed: %w", err)
 	}
 
-	analyzer := NewGoPackagesAnalyzer(serviceLogger, config) // Pass validated config to analyzer
+	analyzer := NewGoPackagesAnalyzer(serviceLogger, config)
 	return &DeepCompleter{
 		client:    newHttpOllamaClient(),
 		analyzer:  analyzer,
 		formatter: newTemplateFormatter(),
-		config:    config, // Store the validated config
+		config:    config,
 		logger:    serviceLogger,
 	}, nil
 }
 
-// Close cleans up resources used by the DeepCompleter, primarily the analyzer.
+// Close cleans up resources used by the DeepCompleter.
 func (dc *DeepCompleter) Close() error {
 	dc.logger.Info("Closing DeepCompleter service")
 	if dc.analyzer != nil {
-		return dc.analyzer.Close() // Delegate closing to the analyzer
+		return dc.analyzer.Close()
 	}
 	return nil
 }
 
 // UpdateConfig atomically updates the completer's configuration.
-// It validates the new configuration before applying it.
 func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
-	// Ensure default templates are set if not provided in the update
 	if newConfig.PromptTemplate == "" {
 		newConfig.PromptTemplate = promptTemplate
 	}
 	if newConfig.FimTemplate == "" {
 		newConfig.FimTemplate = fimPromptTemplate
 	}
-	// Validate the new configuration
 	if err := newConfig.Validate(dc.logger); err != nil {
 		dc.logger.Error("Invalid configuration provided for update", "error", err)
-		return fmt.Errorf("invalid configuration update: %w", err) // Return validation error
+		return fmt.Errorf("invalid configuration update: %w", err)
 	}
 
 	dc.configMu.Lock()
-	dc.config = newConfig // Apply the new, validated config
+	dc.config = newConfig
 	dc.configMu.Unlock()
 
-	// Propagate config update to the analyzer
 	if dc.analyzer != nil {
 		dc.analyzer.UpdateConfig(newConfig)
 	}
 
 	dc.logger.Info("DeepCompleter configuration updated",
-		stdslog.Group("new_config", // Log relevant parts of the new config
+		stdslog.Group("new_config",
 			stdslog.String("ollama_url", newConfig.OllamaURL),
 			stdslog.String("model", newConfig.Model),
 			stdslog.Int("max_tokens", newConfig.MaxTokens),
-			stdslog.Any("stop", newConfig.Stop), // slog.Any for slices
+			stdslog.Any("stop", newConfig.Stop),
 			stdslog.Float64("temperature", newConfig.Temperature),
 			stdslog.String("log_level", newConfig.LogLevel),
 			stdslog.Bool("use_ast", newConfig.UseAst),
@@ -1675,12 +1626,10 @@ func (dc *DeepCompleter) UpdateConfig(newConfig Config) error {
 }
 
 // GetCurrentConfig returns a thread-safe copy of the current configuration.
-// This prevents direct modification of the internal config state.
 func (dc *DeepCompleter) GetCurrentConfig() Config {
 	dc.configMu.RLock()
 	defer dc.configMu.RUnlock()
-	cfgCopy := dc.config // Create a copy
-	// Ensure slice fields are also copied to prevent modification by reference
+	cfgCopy := dc.config
 	if cfgCopy.Stop != nil {
 		stopsCopy := make([]string, len(cfgCopy.Stop))
 		copy(stopsCopy, cfgCopy.Stop)
@@ -1689,72 +1638,67 @@ func (dc *DeepCompleter) GetCurrentConfig() Config {
 	return cfgCopy
 }
 
-// Client returns the LLMClient instance used by the completer.
+// Client returns the LLMClient instance.
 func (dc *DeepCompleter) Client() LLMClient {
 	return dc.client
 }
 
-// InvalidateAnalyzerCache provides external access to invalidate the analyzer's disk cache for a directory.
+// InvalidateAnalyzerCache provides external access to invalidate the analyzer's disk cache.
 func (dc *DeepCompleter) InvalidateAnalyzerCache(dir string) error {
 	if dc.analyzer == nil {
-		return errors.New("analyzer not initialized, cannot invalidate cache")
+		return errors.New("analyzer not initialized")
 	}
 	dc.logger.Info("Request to invalidate analyzer disk cache", "dir", dir)
 	return dc.analyzer.InvalidateCache(dir)
 }
 
-// InvalidateMemoryCacheForURI provides external access to invalidate the analyzer's memory cache for a URI.
+// InvalidateMemoryCacheForURI provides external access to invalidate the analyzer's memory cache.
 func (dc *DeepCompleter) InvalidateMemoryCacheForURI(uri string, version int) error {
 	if dc.analyzer == nil {
-		return errors.New("analyzer not initialized, cannot invalidate memory cache")
+		return errors.New("analyzer not initialized")
 	}
 	dc.logger.Info("Request to invalidate analyzer memory cache", "uri", uri, "version", version)
 	return dc.analyzer.InvalidateMemoryCacheForURI(uri, version)
 }
 
-// GetAnalyzer returns the analyzer instance, useful for direct interaction (e.g., testing).
+// GetAnalyzer returns the analyzer instance.
 func (dc *DeepCompleter) GetAnalyzer() Analyzer {
 	return dc.analyzer
 }
 
 // GetCompletion provides basic code completion for a given snippet without file context analysis.
-// This is a simpler completion path, typically for quick, non-contextual suggestions.
 func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) (string, error) {
 	opLogger := dc.logger.With("operation", "GetCompletion")
 	opLogger.Info("Handling basic completion request")
-	currentConfig := dc.GetCurrentConfig() // Get a thread-safe copy of config
+	currentConfig := dc.GetCurrentConfig()
 
-	// Basic preamble for non-AST based completion
 	contextPreamble := "// Provide Go code completion below."
 	snippetCtx := SnippetContext{Prefix: codeSnippet, Suffix: "", FullLine: ""}
 
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig, opLogger)
 	opLogger.Debug("Generated basic prompt", "length", len(prompt))
 
-	var buffer bytes.Buffer // Buffer to store completion result
-	// apiCallFunc defines the operation to be retried
+	var buffer bytes.Buffer
 	apiCallFunc := func() error {
 		select {
-		case <-ctx.Done(): // Check for context cancellation before API call
+		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		// Use a timeout for the API call itself, derived from the outer context
 		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
 		defer cancelApi()
 
 		opLogger.Debug("Calling Ollama GenerateStream for basic completion")
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig, opLogger)
 		if apiErr != nil {
-			return apiErr // Return error to be handled by retry logic
+			return apiErr
 		}
 		defer reader.Close()
 
-		// Use a timeout for processing the stream
 		streamCtx, cancelStream := context.WithTimeout(apiCtx, 50*time.Second)
 		defer cancelStream()
 
-		buffer.Reset() // Reset buffer for each attempt
+		buffer.Reset()
 		streamErr := streamCompletion(streamCtx, reader, &buffer, opLogger)
 		if streamErr != nil {
 			return fmt.Errorf("streaming completion failed: %w", streamErr)
@@ -1762,15 +1706,13 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 		return nil
 	}
 
-	// Retry the API call operation
 	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, opLogger)
 	if err != nil {
 		select {
-		case <-ctx.Done(): // Check if overall context was cancelled
+		case <-ctx.Done():
 			return "", ctx.Err()
 		default:
 		}
-		// Handle specific error types after retries
 		if errors.Is(err, ErrOllamaUnavailable) {
 			opLogger.Error("Ollama unavailable for basic completion after retries", "error", err)
 			return "", err
@@ -1796,26 +1738,24 @@ func (dc *DeepCompleter) GetCompletion(ctx context.Context, codeSnippet string) 
 func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFilename string, version int, line, col int, w io.Writer) error {
 	opLogger := dc.logger.With("operation", "GetCompletionStreamFromFile", "path", absFilename, "version", version, "line", line, "col", col)
 	currentConfig := dc.GetCurrentConfig()
-	var contextPreamble string = "// Basic file context only." // Default preamble if AST analysis fails or is disabled
-	var preambleErr error                                      // To store non-fatal errors from preamble generation
+	var contextPreamble string = "// Basic file context only."
+	var preambleErr error
 
 	if currentConfig.UseAst {
 		opLogger.Info("Analyzing context for preamble (or checking cache)")
-		preambleCtx, cancelPreamble := context.WithTimeout(ctx, 30*time.Second) // Timeout for preamble generation
+		preambleCtx, cancelPreamble := context.WithTimeout(ctx, 30*time.Second)
 		contextPreamble, preambleErr = dc.analyzer.GetPromptPreamble(preambleCtx, absFilename, version, line, col)
-		cancelPreamble() // Ensure cancel is called
+		cancelPreamble()
 
 		if preambleErr != nil && !errors.Is(preambleErr, ErrAnalysisFailed) {
-			// Fatal error during preamble generation
 			opLogger.Error("Fatal error getting prompt preamble", "error", preambleErr)
 			return fmt.Errorf("failed to get prompt preamble: %w", preambleErr)
 		}
-		if preambleErr != nil { // Non-fatal ErrAnalysisFailed
+		if preambleErr != nil {
 			opLogger.Warn("Non-fatal error getting prompt preamble", "error", preambleErr)
-			// Prepend warning to the potentially partial preamble
 			contextPreamble += fmt.Sprintf("\n// Warning: Preamble generation completed with errors: %v\n", preambleErr)
 		}
-		if contextPreamble == "" { // Fallback if preamble is empty after analysis
+		if contextPreamble == "" {
 			contextPreamble = "// Warning: Context analysis returned empty preamble.\n"
 			opLogger.Warn("Context analysis resulted in an empty preamble string.")
 		}
@@ -1823,50 +1763,43 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 		opLogger.Info("AST analysis disabled by config. Using basic preamble.")
 	}
 
-	// Extract code snippet context (prefix, suffix, etc.)
-	// Pass currentConfig.UseAst to extractSnippetContext so it knows whether to attempt fallback context
 	snippetCtx, snippetErr := extractSnippetContext(absFilename, line, col, currentConfig.UseAst, opLogger)
 	if snippetErr != nil {
 		opLogger.Error("Failed to extract code snippet context", "error", snippetErr)
 		return fmt.Errorf("failed to extract code snippet context: %w", snippetErr)
 	}
 
-	// Format the final prompt using the gathered preamble and snippet context
 	prompt := dc.formatter.FormatPrompt(contextPreamble, snippetCtx, currentConfig, opLogger)
 	opLogger.Debug("Generated prompt", "length", len(prompt))
 
-	// Define the API call operation for retry logic
 	apiCallFunc := func() error {
 		select {
-		case <-ctx.Done(): // Check for context cancellation
+		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second) // Timeout for the LLM call
+		apiCtx, cancelApi := context.WithTimeout(ctx, 60*time.Second)
 		defer cancelApi()
 		opLogger.Debug("Calling Ollama GenerateStream")
 		reader, apiErr := dc.client.GenerateStream(apiCtx, prompt, currentConfig, opLogger)
 		if apiErr != nil {
-			return apiErr // Error to be handled by retry
+			return apiErr
 		}
 		defer reader.Close()
-		// Stream the completion to the provided writer
-		streamErr := streamCompletion(apiCtx, reader, w, opLogger) // Pass apiCtx for stream processing timeout
+		streamErr := streamCompletion(apiCtx, reader, w, opLogger)
 		if streamErr != nil {
 			return fmt.Errorf("streaming completion failed: %w", streamErr)
 		}
 		return nil
 	}
 
-	// Retry the API call
 	err := retry(ctx, apiCallFunc, maxRetries, retryDelay, opLogger)
 	if err != nil {
 		select {
-		case <-ctx.Done(): // Check overall context cancellation
+		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		// Handle specific errors after retries
 		if errors.Is(err, ErrOllamaUnavailable) {
 			opLogger.Error("Ollama unavailable for stream after retries", "error", err)
 			return err
@@ -1883,7 +1816,6 @@ func (dc *DeepCompleter) GetCompletionStreamFromFile(ctx context.Context, absFil
 		return fmt.Errorf("failed to get completion stream after %d retries: %w", maxRetries, err)
 	}
 
-	// Log preamble errors even if completion succeeded, as they indicate partial context
 	if preambleErr != nil {
 		opLogger.Warn("Completion stream successful, but context analysis for preamble encountered non-fatal errors", "analysis_error", preambleErr)
 	} else {
